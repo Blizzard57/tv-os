@@ -7,15 +7,71 @@
 //!
 //! Both files are Valve's KeyValues ("VDF") format. We only ever need flat
 //! `"key" "value"` string pairs out of them, so a full VDF parser is overkill.
+//!
+//! With a Steam Web API key + SteamID in settings (the Settings panel), the
+//! source also lists the account's *entire owned library* via the Web API,
+//! merged with the installed games. Launching any of them uses steam://, so
+//! an owned-but-not-installed game prompts Steam to install it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use crate::launcher;
+use serde_json::Value;
+
 use crate::model::{Action, ContentItem, Kind, Row};
 use crate::sources::Source;
+use crate::util::percent_encode;
+use crate::{addons, launcher, settings};
 
-pub struct Steam;
+const OWNED_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Default)]
+pub struct Steam {
+    /// Owned library cached per (api_key, resolved steamid); refetched when
+    /// those change or the TTL lapses.
+    owned: Mutex<Option<OwnedCache>>,
+}
+
+struct OwnedCache {
+    creds: (String, String),
+    at: Instant,
+    items: Vec<ContentItem>,
+}
+
+impl Steam {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn owned_games(&self) -> Vec<ContentItem> {
+        let s = settings::STORE.get();
+        if s.steam_api_key.is_empty() || s.steam_id.is_empty() {
+            return Vec::new();
+        }
+        let Some(steamid) = resolve_steamid(&s.steam_api_key, &s.steam_id) else {
+            return Vec::new();
+        };
+        let creds = (s.steam_api_key.clone(), steamid.clone());
+
+        let mut cache = self.owned.lock().unwrap();
+        if let Some(c) = cache.as_ref() {
+            if c.creds == creds && c.at.elapsed() < OWNED_TTL {
+                return c.items.clone();
+            }
+        }
+        let items = fetch_owned(&creds.0, &creds.1).unwrap_or_default();
+        if !items.is_empty() {
+            *cache = Some(OwnedCache {
+                creds,
+                at: Instant::now(),
+                items: items.clone(),
+            });
+        }
+        items
+    }
+}
 
 impl Source for Steam {
     fn id(&self) -> &'static str {
@@ -23,13 +79,25 @@ impl Source for Steam {
     }
 
     fn available(&self) -> bool {
-        steam_root().is_some()
+        steam_root().is_some() || {
+            let s = settings::STORE.get();
+            !s.steam_api_key.is_empty() && !s.steam_id.is_empty()
+        }
     }
 
     fn rows(&self) -> Vec<Row> {
+        // Installed games first, then everything else the account owns;
+        // dedupe so an installed game isn't listed twice.
+        let mut items = scan();
+        for game in self.owned_games() {
+            if !items.iter().any(|i| i.id == game.id) {
+                items.push(game);
+            }
+        }
+        items.sort_by_key(|item| item.title.to_lowercase());
         vec![Row {
             title: "Games".to_string(),
-            items: scan(),
+            items,
         }]
     }
 
@@ -48,6 +116,75 @@ impl Source for Steam {
         }
         Err("could not start Steam (tried native and flatpak)".to_string())
     }
+}
+
+/// Tests the saved Steam credentials, returning the owned-game count or a
+/// human error. Used by the Settings panel's "Connect" button.
+pub fn connection_test() -> Result<usize, String> {
+    let s = settings::STORE.get();
+    if s.steam_api_key.is_empty() {
+        return Err("Enter your Steam Web API key".to_string());
+    }
+    if s.steam_id.is_empty() {
+        return Err("Enter your SteamID or profile name".to_string());
+    }
+    let steamid = resolve_steamid(&s.steam_api_key, &s.steam_id)
+        .ok_or("Could not resolve that SteamID / profile name")?;
+    let games = fetch_owned(&s.steam_api_key, &steamid).map_err(|e| {
+        format!("{e} — check the API key, and that the profile's game details are public")
+    })?;
+    Ok(games.len())
+}
+
+/// Accepts a SteamID64 as-is; otherwise treats the input as a vanity name and
+/// resolves it via the Web API.
+fn resolve_steamid(api_key: &str, input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    let candidate = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if candidate.len() == 17 && candidate.chars().all(|c| c.is_ascii_digit()) {
+        return Some(candidate.to_string());
+    }
+    let url = format!(
+        "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/?key={api_key}&vanityurl={}",
+        percent_encode(candidate)
+    );
+    let json: Value = serde_json::from_str(&addons::http_get(&url).ok()?).ok()?;
+    let response = json.get("response")?;
+    (response.get("success")?.as_i64()? == 1)
+        .then(|| response.get("steamid")?.as_str().map(String::from))
+        .flatten()
+}
+
+fn fetch_owned(api_key: &str, steamid: &str) -> Result<Vec<ContentItem>, String> {
+    let url = format!(
+        "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key={api_key}\
+         &steamid={steamid}&include_appinfo=1&include_played_free_games=1&format=json"
+    );
+    let json: Value = serde_json::from_str(&addons::http_get(&url)?)
+        .map_err(|e| format!("Steam returned invalid data: {e}"))?;
+    let games = json
+        .get("response")
+        .and_then(|r| r.get("games"))
+        .and_then(|g| g.as_array())
+        .ok_or("Steam returned no games — is the profile's game list public?")?;
+    Ok(games.iter().filter_map(owned_item).collect())
+}
+
+fn owned_item(game: &Value) -> Option<ContentItem> {
+    let appid = game.get("appid")?.as_i64()?;
+    let name = game.get("name")?.as_str()?.to_string();
+    Some(ContentItem {
+        id: format!("steam:{appid}"),
+        kind: Kind::Game,
+        title: name,
+        art: Some(art_url(appid)),
+        action: Action::Play,
+    })
+}
+
+/// Public Steam CDN poster art; the UI falls back to a placeholder on 404.
+fn art_url(appid: impl std::fmt::Display) -> String {
+    format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg")
 }
 
 fn scan() -> Vec<ContentItem> {
@@ -109,10 +246,7 @@ fn games_in(steamapps: &Path) -> Vec<ContentItem> {
             id: format!("steam:{appid}"),
             kind: Kind::Game,
             title: name,
-            // Public Steam CDN poster art; the UI falls back to a placeholder on 404.
-            art: Some(format!(
-                "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"
-            )),
+            art: Some(art_url(&appid)),
             action: Action::Play,
         })
         .collect()
@@ -221,5 +355,31 @@ mod tests {
         assert!(is_hidden("1628350", "Steam Linux Runtime 3.0 (sniper)"));
         assert!(is_hidden("2805730", "Proton 9.0"));
         assert!(!is_hidden("620", "Portal 2"));
+    }
+
+    #[test]
+    fn owned_item_maps_appid_and_art() {
+        let game = serde_json::json!({"appid": 620, "name": "Portal 2", "playtime_forever": 42});
+        let item = owned_item(&game).unwrap();
+        assert_eq!(item.id, "steam:620");
+        assert_eq!(item.title, "Portal 2");
+        assert!(item.art.unwrap().contains("/620/library_600x900.jpg"));
+        assert!(owned_item(&serde_json::json!({"appid": 620})).is_none()); // no name
+    }
+
+    #[test]
+    fn steamid64_is_used_as_is_without_network() {
+        // A 17-digit id (or a profile URL containing one) needs no API call.
+        assert_eq!(
+            resolve_steamid("anykey", "76561197960287930"),
+            Some("76561197960287930".to_string())
+        );
+        assert_eq!(
+            resolve_steamid(
+                "anykey",
+                "https://steamcommunity.com/profiles/76561197960287930/"
+            ),
+            Some("76561197960287930".to_string())
+        );
     }
 }

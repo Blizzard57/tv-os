@@ -51,12 +51,12 @@ impl Registry {
     pub fn detect() -> Self {
         Self {
             sources: vec![
-                Box::new(steam::Steam),
+                Box::new(steam::Steam::new()),
                 Box::new(epic::Epic::detect()),
                 Box::new(retro::Retro::new()),
                 Box::new(videos::Videos),
                 Box::new(stremio::Stremio::default()),
-                Box::new(tmdb::Tmdb::from_env()),
+                Box::new(tmdb::Tmdb::default()),
             ],
         }
     }

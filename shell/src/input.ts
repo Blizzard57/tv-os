@@ -17,7 +17,8 @@ export type NavAction =
   | 'confirm'
   | 'back'
   | 'theme'
-  | 'enhance';
+  | 'enhance'
+  | 'settings';
 
 const KEY_MAP: Record<string, NavAction> = {
   ArrowUp: 'up',
@@ -31,6 +32,8 @@ const KEY_MAP: Record<string, NavAction> = {
   T: 'theme',
   e: 'enhance',
   E: 'enhance',
+  s: 'settings',
+  S: 'settings',
 };
 
 // Standard-mapping gamepad button indices.
@@ -38,6 +41,7 @@ const BUTTON_A = 0;
 const BUTTON_B = 1;
 const BUTTON_X = 2; // west button: cycles the Enhance (upscaling) mode
 const BUTTON_Y = 3; // north button: toggles light/dark theme
+const BUTTON_START = 9; // menu/start button: opens Settings
 const DPAD: [number, NavAction][] = [
   [12, 'up'],
   [13, 'down'],
@@ -56,6 +60,10 @@ export function useTvInput(onAction: (action: NavAction) => void) {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // While typing in a form field (e.g. the Settings panel), let the
+      // browser handle keys normally — don't steal arrows/letters/Enter.
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       const action = KEY_MAP[e.key];
       if (action) {
         e.preventDefault();
@@ -72,6 +80,7 @@ export function useTvInput(onAction: (action: NavAction) => void) {
     let bWasDown = false;
     let xWasDown = false;
     let yWasDown = false;
+    let startWasDown = false;
     let frame = 0;
 
     const poll = (now: number) => {
@@ -98,14 +107,17 @@ export function useTvInput(onAction: (action: NavAction) => void) {
       const bDown = pad.buttons[BUTTON_B]?.pressed ?? false;
       const xDown = pad.buttons[BUTTON_X]?.pressed ?? false;
       const yDown = pad.buttons[BUTTON_Y]?.pressed ?? false;
+      const startDown = pad.buttons[BUTTON_START]?.pressed ?? false;
       if (aDown && !aWasDown) handler.current('confirm');
       if (bDown && !bWasDown) handler.current('back');
       if (xDown && !xWasDown) handler.current('enhance');
       if (yDown && !yWasDown) handler.current('theme');
+      if (startDown && !startWasDown) handler.current('settings');
       aWasDown = aDown;
       bWasDown = bDown;
       xWasDown = xDown;
       yWasDown = yDown;
+      startWasDown = startDown;
     };
     frame = requestAnimationFrame(poll);
 

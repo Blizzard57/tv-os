@@ -14,6 +14,9 @@ APPS="$HOME/.local/share/applications"
 ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
 
 echo "==> Installing application"
+# Unlink first so re-running as an update can't hit "Text file busy" while the
+# daemon is running. Config in ~/.config/tvos is untouched.
+rm -f "$BIN/tvosd" "$BIN/tvos-app"
 install -Dm755 tvosd          "$BIN/tvosd"
 install -Dm755 system/tvos-app "$BIN/tvos-app"
 rm -rf "$DATA/ui"; mkdir -p "$DATA"; cp -r ui "$DATA/ui"

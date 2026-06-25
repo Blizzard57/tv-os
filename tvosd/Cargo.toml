@@ -1,6 +1,6 @@
 [package]
 name = "tvosd"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "TV OS daemon: serves the shell UI, lists the library, launches content"
 

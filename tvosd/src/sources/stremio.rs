@@ -56,18 +56,26 @@ impl Source for Stremio {
 
     fn launch(&self, item_id: &str) -> Result<(), String> {
         let (kind, meta_id) = parse_id(item_id)?;
-        let streams = collect_streams(&addons::STORE.list(), kind, meta_id);
-        let best = streams
-            .first()
-            .ok_or("No playable stream found — install a stream addon that carries this title")?;
-        let profile = upscale::resolve(settings::STORE.get().enhance, &best.describe());
-        println!(
-            "stream pick: {} ({} candidates)",
-            best.describe(),
-            streams.len()
-        );
-        launcher::play_video(&best.url, &profile)
+        play_meta(kind, meta_id)
     }
+}
+
+/// Resolves `(kind, meta_id)` to streams via every installed stream addon,
+/// then plays the best one through the Enhance pipeline. Shared so the TMDB
+/// source can play a title once it has mapped it to an IMDb id. `kind` is the
+/// Stremio content type ("movie" / "series"); `meta_id` is usually an IMDb id.
+pub fn play_meta(kind: &str, meta_id: &str) -> Result<(), String> {
+    let streams = collect_streams(&addons::STORE.list(), kind, meta_id);
+    let best = streams
+        .first()
+        .ok_or("No playable stream found — install a stream addon that carries this title")?;
+    let profile = upscale::resolve(settings::STORE.get().enhance, &best.describe());
+    println!(
+        "stream pick: {} ({} candidates)",
+        best.describe(),
+        streams.len()
+    );
+    launcher::play_video(&best.url, &profile)
 }
 
 impl Stremio {

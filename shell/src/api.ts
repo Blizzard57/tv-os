@@ -30,8 +30,27 @@ export interface InstallJob {
 // Video upscaling preference — mirrors tvosd/src/settings.rs.
 export type EnhanceMode = 'auto' | 'quality' | 'performance' | 'off';
 
+// Mirrors tvosd/src/settings.rs (snake_case to match the wire format).
 export interface Settings {
   enhance: EnhanceMode;
+  steam_api_key: string;
+  steam_id: string;
+  tmdb_key: string;
+}
+
+export interface SteamStatus {
+  connected: boolean;
+  count?: number;
+  error?: string;
+}
+
+// A Stremio-compatible addon, as returned by /api/addons.
+export interface Addon {
+  url: string;
+  base: string;
+  name: string;
+  catalogs: { type: string; id: string; name: string }[];
+  streams: boolean;
 }
 
 export async function fetchSettings(): Promise<Settings> {
@@ -75,3 +94,18 @@ async function post(path: string, body: unknown): Promise<void> {
 export const launch = (item: ContentItem) =>
   post('/api/launch', { id: item.id, title: item.title, kind: item.kind, art: item.art });
 export const startInstall = (id: string) => post('/api/install', { id });
+
+export async function fetchSteamStatus(): Promise<SteamStatus> {
+  const res = await fetch('/api/steam/status');
+  if (!res.ok) throw new Error(`steam status failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchAddons(): Promise<Addon[]> {
+  const res = await fetch('/api/addons');
+  if (!res.ok) throw new Error(`addons request failed: ${res.status}`);
+  return res.json();
+}
+
+export const addAddon = (url: string) => post('/api/addons', { url });
+export const removeAddon = (url: string) => post('/api/addons/remove', { url });

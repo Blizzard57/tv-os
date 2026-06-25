@@ -129,7 +129,8 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
 | `POST /api/launch {"id"}` | Play/run an item (`steam:620`, `epic:Sugar`, `rom:gb/Game.gb`, `video:…`) |
 | `POST /api/install {"id"}` | Start a download job |
 | `GET /api/installs` | All jobs with status + progress |
-| `GET / PUT /api/settings` | User settings (enhance mode), persisted to `~/.config/tvos/` |
+| `GET / PUT /api/settings` | User settings (enhance, Steam creds, TMDB key), persisted to `~/.config/tvos/` |
+| `GET /api/steam/status` | Tests saved Steam creds → `{connected, count}` or `{error}` |
 | `GET / POST /api/addons` | List installed addons / install one (`{"url": "…/manifest.json"}`) |
 | `POST /api/addons/remove` | Uninstall an addon (`{"url": …}`) |
 | `GET /api/version` | Daemon version (handy for testing packages) |
@@ -204,13 +205,37 @@ Then either:
   For console-like boot, enable autologin to that session
   (System Settings → Users on KDE, or an `/etc/sddm.conf.d/` autologin entry).
 
+## Settings panel
+
+Press **S** (or the gamepad **Start** button, or click the **⚙ SETTINGS**
+chip) to open it. It's themed to the app and reachable even on a fresh, empty
+install. Four sections:
+
+- **Steam account** — paste a [Web API key](https://steamcommunity.com/dev/apikey)
+  and your SteamID64 (or just your profile name — it's resolved automatically),
+  then **Connect & sync games**. Your *entire owned library* is pulled via the
+  Steam Web API and merged with anything installed locally into the Games row;
+  pressing play launches via `steam://`, so an owned-but-uninstalled game
+  prompts Steam to install it. (Your profile's game details must be public.)
+- **Movies & TV (TMDB)** — paste a free TMDB API key to fill the Trending
+  Movies and Shows rows. Playing one maps the title to its IMDb id and resolves
+  a stream through your installed addons.
+- **Stremio addons** — paste any addon's `manifest.json` URL to install it,
+  see what's installed, and remove with one click.
+- **Appearance & playback** — theme and Enhance (upscaling) mode.
+
+Everything you launch — Steam games, addon streams, TMDB titles — is recorded
+locally and surfaces in the **Continue** and **Recommended for You** rows at the
+top of the home screen. Credentials are stored in `~/.config/tvos/settings.json`
+on your machine; nothing leaves the box.
+
 ## Addons
 
 ### Game sources
 
 | Store | What to do |
 |---|---|
-| **Steam** | Install Steam and sign in once — games are found automatically (multi-disk libraries included). |
+| **Steam** | Open Settings → Steam and connect your account (above), **or** just install Steam locally — installed games are found automatically (multi-disk libraries included). |
 | **Epic** | Install [legendary](https://github.com/derrod/legendary) (`pip install legendary-gl` or the distro package) and run `legendary auth` once. Installed games launch; owned games appear in "Ready to Install". |
 | **Retro** | Drop ROMs into `~/ROMs/<system>/` (nes, snes, gb, gbc, gba, genesis, n64, psx) **or** install from the built-in "Homebrew & Retro" row. Install RetroArch (`flatpak install flathub org.libretro.RetroArch`) and the cores you need. |
 | **More ROM catalogs** | Write a manifest like `tvosd/data/homebrew.json` and point `TVOS_ROM_SOURCES=/path/one.json,/path/two.json` at it. |
@@ -253,6 +278,7 @@ New rows appear on the next home-screen load. Notes:
 | Move | D-pad / left stick | Arrow keys |
 | Play / install | A | Enter |
 | Back | B | Esc |
+| Settings | Start | S |
 | Enhance mode | X | E |
 | Light/dark mode | Y | T |
 | A/B compare (during playback) | — | E in mpv |

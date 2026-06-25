@@ -4,6 +4,7 @@ import {
   EnhanceMode,
   InstallJob,
   Row,
+  Settings,
   fetchInstalls,
   fetchLibrary,
   fetchSettings,
@@ -13,6 +14,7 @@ import {
 } from './api';
 import { NavAction, useTvInput } from './input';
 import { MediaRow } from './MediaRow';
+import { SettingsPanel } from './SettingsPanel';
 import { Theme, applyTheme, initialTheme, otherTheme } from './theme';
 
 // Focus is simply "which row, which column". Each row remembers its own
@@ -36,13 +38,21 @@ const ENHANCE_LABELS: Record<EnhanceMode, string> = {
   off: 'Off',
 };
 
+const BLANK_SETTINGS: Settings = {
+  enhance: 'auto',
+  steam_api_key: '',
+  steam_id: '',
+  tmdb_key: '',
+};
+
 export default function App() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [focus, setFocus] = useState<Focus>({ row: 0, col: 0 });
   const [toast, setToast] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [enhance, setEnhance] = useState<EnhanceMode>('auto');
+  const [settings, setSettings] = useState<Settings>(BLANK_SETTINGS);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const { jobs, refresh: refreshJobs } = useInstallJobs(() => loadLibrary());
   const columnMemory = useRef<number[]>([]);
   const toastTimer = useRef<number>();
@@ -62,9 +72,18 @@ export default function App() {
   useEffect(() => applyTheme(theme), [theme]);
   useEffect(() => {
     fetchSettings()
-      .then((s) => setEnhance(s.enhance))
+      .then((s) => setSettings({ ...BLANK_SETTINGS, ...s }))
       .catch(() => {}); // daemon default is shown until it answers
   }, []);
+
+  // Refetch settings + library after the panel changes something, so the
+  // home screen and the Enhance chip reflect it immediately.
+  const reloadAll = useCallback(() => {
+    fetchSettings()
+      .then((s) => setSettings({ ...BLANK_SETTINGS, ...s }))
+      .catch(() => {});
+    loadLibrary();
+  }, [loadLibrary]);
 
   // Library refreshes can shrink or reorder rows (e.g. an installed game
   // moves from "Ready to Install" into "Games") — keep focus in bounds.
@@ -106,6 +125,15 @@ export default function App() {
 
   const onAction = useCallback(
     (action: NavAction) => {
+      // While the Settings panel is open it owns input; only let B/Start close it.
+      if (settingsOpen) {
+        if (action === 'back' || action === 'settings') setSettingsOpen(false);
+        return;
+      }
+      if (action === 'settings') {
+        setSettingsOpen(true);
+        return;
+      }
       if (action === 'theme') {
         const next = otherTheme(theme);
         setTheme(next);
@@ -113,10 +141,12 @@ export default function App() {
         return;
       }
       if (action === 'enhance') {
-        const next = ENHANCE_CYCLE[(ENHANCE_CYCLE.indexOf(enhance) + 1) % ENHANCE_CYCLE.length];
-        setEnhance(next);
+        const next =
+          ENHANCE_CYCLE[(ENHANCE_CYCLE.indexOf(settings.enhance) + 1) % ENHANCE_CYCLE.length];
+        const updated = { ...settings, enhance: next };
+        setSettings(updated);
         showToast(`Enhance: ${ENHANCE_LABELS[next]}`);
-        saveSettings({ enhance: next }).catch((e) => showToast(`Could not save: ${e.message}`));
+        saveSettings(updated).catch((e) => showToast(`Could not save: ${e.message}`));
         return;
       }
       if (!rows || rows.length === 0) return;
@@ -146,17 +176,52 @@ export default function App() {
         }
       });
     },
-    [rows, activate, showToast, theme, enhance],
+    [rows, activate, showToast, theme, settings, settingsOpen],
   );
   useTvInput(onAction);
 
-  if (error) return <div className="screen-message">{error}</div>;
-  if (!rows) return <div className="screen-message">Loading…</div>;
-  if (rows.length === 0) {
-    return <div className="screen-message">Nothing here yet — install a game or add videos.</div>;
-  }
+  const focusedItem: ContentItem | undefined = rows?.[focus.row]?.items[focus.col];
 
-  const focusedItem: ContentItem | undefined = rows[focus.row]?.items[focus.col];
+  // The chrome (chips, Settings) is always present so the panel is reachable
+  // even on a fresh, empty install. Only the central body changes.
+  let body;
+  if (error) {
+    body = <div className="screen-message">{error}</div>;
+  } else if (!rows) {
+    body = <div className="screen-message">Loading…</div>;
+  } else if (rows.length === 0) {
+    body = (
+      <div className="screen-message">
+        Nothing here yet — open Settings (press <span className="key">S</span> /{' '}
+        <span className="key">Start</span>) to connect Steam, add a TMDB key, or install an addon.
+      </div>
+    );
+  } else {
+    body = (
+      <>
+        <header className="hero">
+          <div className="hero-kind">{focusedItem?.kind.toUpperCase()}</div>
+          <h1 className="hero-title">{focusedItem?.title}</h1>
+          <div className="hero-hint">
+            Press <span className="key">A</span> / <span className="key">Enter</span>{' '}
+            {HERO_HINTS[focusedItem?.action ?? 'play']}
+          </div>
+        </header>
+
+        <main className="rows">
+          {rows.map((row, i) => (
+            <MediaRow
+              key={row.title}
+              row={row}
+              focusedCol={i === focus.row ? focus.col : null}
+              restingCol={columnMemory.current[i] ?? 0}
+              jobs={jobs}
+            />
+          ))}
+        </main>
+      </>
+    );
+  }
 
   return (
     <div className="app">
@@ -168,33 +233,31 @@ export default function App() {
         />
       )}
 
-      <div className="status-chip" title="Press E / X to change">
-        ENHANCE · {ENHANCE_LABELS[enhance].toUpperCase()}
+      <div className="status-chips">
+        <button
+          className="status-chip status-chip-button"
+          onClick={() => setSettingsOpen(true)}
+          title="Settings (Start / S)"
+        >
+          ⚙ SETTINGS
+        </button>
+        <div className="status-chip" title="Press E / X to change">
+          ENHANCE · {ENHANCE_LABELS[settings.enhance].toUpperCase()}
+        </div>
       </div>
 
-      <header className="hero">
-        <div className="hero-kind">{focusedItem?.kind.toUpperCase()}</div>
-        <h1 className="hero-title">{focusedItem?.title}</h1>
-        <div className="hero-hint">
-          Press <span className="key">A</span> / <span className="key">Enter</span>{' '}
-          {HERO_HINTS[focusedItem?.action ?? 'play']}
-        </div>
-      </header>
-
-      <main className="rows">
-        {rows.map((row, i) => (
-          <MediaRow
-            key={row.title}
-            row={row}
-            focusedCol={i === focus.row ? focus.col : null}
-            restingCol={columnMemory.current[i] ?? 0}
-            jobs={jobs}
-          />
-        ))}
-      </main>
+      {body}
 
       <DownloadsPanel jobs={jobs} />
       {toast && <div className="toast">{toast}</div>}
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          reload={reloadAll}
+          theme={theme}
+          onToggleTheme={() => setTheme((t) => otherTheme(t))}
+        />
+      )}
     </div>
   );
 }

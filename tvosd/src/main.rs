@@ -59,6 +59,7 @@ async fn main() {
         .route("/api/install", post(post_install))
         .route("/api/installs", get(get_installs))
         .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/steam/status", get(get_steam_status))
         .route("/api/addons", get(get_addons).post(post_addon))
         .route("/api/addons/remove", post(post_addon_remove))
         .route("/api/version", get(get_version))
@@ -132,6 +133,17 @@ async fn put_settings(
         .set(new)
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Tests the saved Steam credentials; runs on a blocking thread (network).
+async fn get_steam_status() -> Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(sources::steam::connection_test)
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    Json(match result {
+        Ok(count) => serde_json::json!({ "connected": true, "count": count }),
+        Err(error) => serde_json::json!({ "connected": false, "error": error }),
+    })
 }
 
 async fn get_addons() -> Json<Vec<addons::Addon>> {

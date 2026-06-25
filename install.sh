@@ -43,6 +43,10 @@ say "Building shell UI"
 ( cd shell && npm ci && npm run build )
 
 say "Installing application"
+# Unlink first so re-running this as an update can't hit "Text file busy" if
+# the daemon is still running — the live process keeps its old inode, the next
+# launch picks up the new binary. Your config in ~/.config/tvos is untouched.
+rm -f "$BIN/tvosd" "$BIN/tvos-app"
 install -Dm755 tvosd/target/release/tvosd "$BIN/tvosd"
 install -Dm755 system/tvos-app           "$BIN/tvos-app"
 rm -rf "$DATA/ui"; mkdir -p "$DATA"; cp -r shell/dist "$DATA/ui"
