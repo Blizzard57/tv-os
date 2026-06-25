@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "shell",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "shell", "run", "dev"],
+      "port": 5173
+    },
+    {
+      "name": "nexus-ui",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "7432", "--directory", "/Users/blizzard/Documents/Projects/tv_os/ui-prototype"],
+      "port": 7432
+    }
+  ]
+}

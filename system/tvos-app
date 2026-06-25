@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# TV OS — application launcher.
+#
+# Default: opens TV OS in its own desktop window, like any other app (this is
+# what the app-menu entry runs). The daemon is started for you and stopped
+# when you close the window.
+#
+#   tvos-app          windowed app
+#   tvos-app --tv     fullscreen 10-foot mode wrapped in gamescope
+#                     (controller / FSR / HDR), if gamescope is installed
+set -euo pipefail
+
+URL="http://127.0.0.1:8484"
+TVOSD="${TVOSD:-$HOME/.local/bin/tvosd}"
+[ -x "$TVOSD" ] || TVOSD="$(command -v tvosd || echo "$TVOSD")"
+PROFILE_DIR="$HOME/.local/share/tvos/browser"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/tvosd.log"
+
+tv_mode=0
+[ "${1:-}" = "--tv" ] && tv_mode=1
+
+# Point the daemon at whichever UI directory exists (user app or system pkg).
+if [ -z "${TVOS_UI_DIR:-}" ]; then
+  for d in "$HOME/.local/share/tvos/ui" /usr/share/tvos/ui /usr/local/share/tvos/ui; do
+    [ -d "$d" ] && { export TVOS_UI_DIR="$d"; break; }
+  done
+fi
+
+# 1. Start the daemon unless one is already serving (e.g. a second window).
+started=0
+if ! curl -fsS "$URL/api/version" >/dev/null 2>&1; then
+  "$TVOSD" >"$LOG" 2>&1 &
+  daemon_pid=$!
+  started=1
+fi
+cleanup() { [ "$started" = 1 ] && kill "${daemon_pid:-}" 2>/dev/null || true; }
+trap cleanup EXIT
+
+for _ in $(seq 1 50); do
+  curl -fsS "$URL/api/version" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+
+# 2. Find a Chromium-family browser (best for the Gamepad API + app windows).
+pick_browser() {
+  local b f
+  for b in chromium chromium-browser google-chrome google-chrome-stable \
+           brave brave-browser vivaldi-stable microsoft-edge-stable; do
+    command -v "$b" >/dev/null 2>&1 && { BROWSER=("$b"); return 0; }
+  done
+  for f in org.chromium.Chromium com.brave.Browser com.google.Chrome; do
+    flatpak info "$f" >/dev/null 2>&1 && { BROWSER=(flatpak run "$f"); return 0; }
+  done
+  return 1
+}
+if ! pick_browser; then
+  echo "TV OS: no Chromium-family browser found." >&2
+  echo "Install one:  sudo pacman -S chromium" >&2
+  exit 1
+fi
+
+# A dedicated profile keeps TV OS its own window (never hands off to your
+# everyday browser) so closing the window actually quits the app.
+COMMON=(
+  --app="$URL"
+  --class=tvos
+  --user-data-dir="$PROFILE_DIR"
+  --no-first-run
+  --no-default-browser-check
+  --disable-session-crashed-bubble
+  --password-store=basic
+  --ozone-platform-hint=auto
+)
+
+# 3. Launch. Foreground so window-close runs the cleanup trap.
+if [ "$tv_mode" = 1 ]; then
+  if command -v gamescope >/dev/null 2>&1; then
+    gamescope -f -- "${BROWSER[@]}" "${COMMON[@]}" --start-fullscreen
+  else
+    echo "TV OS: gamescope not installed; opening a fullscreen window instead." >&2
+    "${BROWSER[@]}" "${COMMON[@]}" --start-fullscreen
+  fi
+else
+  "${BROWSER[@]}" "${COMMON[@]}"
+fi

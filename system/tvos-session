@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Entry point for the "TV OS" login session.
+#
+# gamescope is the display server for the whole session; tvos-shell runs
+# inside it and starts everything else. When the shell exits, the session
+# ends and the login manager takes over again.
+#
+# Can also be run from a normal desktop for testing — gamescope nests.
+# Set TVOS_WINDOWED=1 to get a 1920x1080 window instead of fullscreen.
+set -euo pipefail
+
+if [ "${TVOS_WINDOWED:-0}" = "1" ]; then
+  ARGS=(-W 1920 -H 1080)
+else
+  ARGS=(-f)
+fi
+
+exec gamescope "${ARGS[@]}" -- /usr/local/bin/tvos-shell

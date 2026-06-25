@@ -1,0 +1,29 @@
+{
+  "name": "Built-in homebrew",
+  "items": [
+    {
+      "title": "Nova the Squirrel",
+      "system": "nes",
+      "filename": "Nova the Squirrel.nes",
+      "url": "https://github.com/NovaSquirrel/NovaTheSquirrel/releases/download/v1.0.6a/nova.nes"
+    },
+    {
+      "title": "Celeste Classic",
+      "system": "gba",
+      "filename": "Celeste Classic.gba",
+      "url": "https://github.com/JeffRuLz/Celeste-Classic-GBA/releases/download/v1.2/Celeste.Classic.v1.2.Homebrew.gba"
+    },
+    {
+      "title": "uCity",
+      "system": "gbc",
+      "filename": "uCity.gbc",
+      "url": "https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc"
+    },
+    {
+      "title": "Libbet and the Magic Floor",
+      "system": "gb",
+      "filename": "Libbet and the Magic Floor.gb",
+      "url": "https://github.com/pinobatch/libbet/releases/download/v0.08/libbet.gb"
+    }
+  ]
+}

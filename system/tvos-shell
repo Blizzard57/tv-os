@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Runs INSIDE gamescope (started by tvos-session). Starts the daemon in the
+# background, then runs the kiosk browser as the session's foreground app.
+#
+# Because tvosd is started here, everything it launches (Steam, mpv) inherits
+# gamescope's display and appears on the TV in front of the shell.
+set -euo pipefail
+
+URL="http://127.0.0.1:8484"
+
+"$HOME/.local/bin/tvosd" &
+TVOSD_PID=$!
+trap 'kill "$TVOSD_PID" 2>/dev/null || true' EXIT
+
+# Give the daemon a moment to come up before pointing the browser at it.
+for _ in $(seq 1 50); do
+  if curl -fsS "$URL/api/library" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+
+# Find a Chromium-family browser for the kiosk UI.
+if command -v chromium >/dev/null 2>&1; then
+  BROWSER=(chromium)
+elif command -v chromium-browser >/dev/null 2>&1; then
+  BROWSER=(chromium-browser)
+elif command -v google-chrome >/dev/null 2>&1; then
+  BROWSER=(google-chrome)
+elif flatpak info org.chromium.Chromium >/dev/null 2>&1; then
+  BROWSER=(flatpak run org.chromium.Chromium)
+else
+  echo "tvos-shell: no Chromium-family browser found." >&2
+  echo "Install one, e.g.: flatpak install flathub org.chromium.Chromium" >&2
+  exit 1
+fi
+
+exec "${BROWSER[@]}" \
+  --kiosk "$URL" \
+  --no-first-run \
+  --disable-session-crashed-bubble \
+  --password-store=basic \
+  --ozone-platform=x11

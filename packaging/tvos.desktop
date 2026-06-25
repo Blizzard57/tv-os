@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=TV OS
+GenericName=Media & Game Center
+Comment=All your games, movies and shows in one couch interface
+Exec=/usr/bin/tvos-app
+Icon=tvos
+Terminal=false
+Type=Application
+Categories=Game;AudioVideo;
+Keywords=games;steam;emulator;retro;movies;tv;stremio;
+StartupWMClass=tvos

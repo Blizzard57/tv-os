@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=TV OS
+Comment=Boot-to-TV shell (gamescope session)
+Exec=/usr/local/bin/tvos-session
+Type=Application
