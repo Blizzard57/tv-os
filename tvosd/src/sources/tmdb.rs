@@ -94,6 +94,21 @@ impl Source for Tmdb {
     }
 }
 
+/// Maps a `tmdb:…` item id to `(stremio_kind, imdb_id)` for the meta/stream
+/// resolvers — the shared bridge from TMDB browsing to Stremio addons.
+pub fn resolve_imdb(item_id: &str) -> Result<(String, String), String> {
+    let key = settings::STORE.get().tmdb_key;
+    let key = if key.is_empty() {
+        std::env::var("TVOS_TMDB_KEY").map_err(|_| "Set a TMDB API key in Settings".to_string())?
+    } else {
+        key
+    };
+    let (media, tmdb_id) = parse_id(item_id)?;
+    let imdb = imdb_id(&key, media, tmdb_id).ok_or("Couldn't find this title's IMDb id on TMDB")?;
+    let kind = if media == "tv" { "series" } else { "movie" };
+    Ok((kind.to_string(), imdb))
+}
+
 /// "tmdb:movie:603" → ("movie", "603"); "tmdb:tv:1399" → ("tv", "1399").
 fn parse_id(item_id: &str) -> Result<(&str, &str), String> {
     let mut parts = item_id.splitn(3, ':');

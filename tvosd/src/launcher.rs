@@ -15,28 +15,12 @@ static PLAYER: Mutex<Option<Child>> = Mutex::new(None);
 /// Plays `target` fullscreen in mpv with the resolved enhance profile.
 pub fn play_video(target: &str, profile: &Profile) -> Result<(), String> {
     let mut player = PLAYER.lock().unwrap();
-    if let Some(mut old) = player.take() {
-        let _ = old.kill();
-        let _ = old.wait();
-    }
+    stop(&mut player);
 
     let mut cmd = Command::new("mpv");
-    cmd.args(["--fs", "--no-terminal", "--force-window=immediate"]);
-    cmd.args(&profile.args);
-    if profile
-        .args
-        .iter()
-        .any(|a| a.starts_with("--glsl-shaders="))
-    {
-        if let Some(script) = ensure_toggle_script() {
-            cmd.arg(format!("--script={}", script.display()));
-        }
-    }
+    cmd.args(mpv_args(profile));
     cmd.arg(target);
-    println!(
-        "playing [{}] {target} args={:?}",
-        profile.name, profile.args
-    );
+    println!("playing [{}] {target}", profile.name);
 
     let child = cmd
         .stdin(Stdio::null())
@@ -46,6 +30,100 @@ pub fn play_video(target: &str, profile: &Profile) -> Result<(), String> {
         .map_err(|e| format!("could not start mpv: {e}"))?;
     *player = Some(child);
     Ok(())
+}
+
+/// Opens a link (a WatchHub service, an addon's /configure page) in the
+/// system's default handler — the browser, or the streaming service's app.
+pub fn open_external(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    spawn_detached(opener, &[url]).map_err(|e| format!("could not open link: {e}"))
+}
+
+/// Streams a torrent magnet into our mpv (keeping the upscaler) by piping
+/// webtorrent-cli's output into the player. For full seeking, configure the
+/// addon (e.g. Torrentio) with a debrid service so it returns direct URLs,
+/// which take the `play_video` path instead.
+pub fn play_torrent(magnet: &str, file_idx: Option<i64>, profile: &Profile) -> Result<(), String> {
+    if !command_exists("webtorrent") {
+        return Err(
+            "Torrent playback needs webtorrent-cli (`npm install -g webtorrent-cli`), \
+             or configure the addon with a debrid service (e.g. RealDebrid) for direct streams."
+                .to_string(),
+        );
+    }
+    let mut player = PLAYER.lock().unwrap();
+    stop(&mut player);
+
+    let select = file_idx
+        .map(|i| format!("--select {i}"))
+        .unwrap_or_default();
+    let mpv = mpv_args(profile)
+        .iter()
+        .map(|a| sh_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // webtorrent streams to stdout; mpv reads it from stdin ("-").
+    let pipeline = format!(
+        "webtorrent download {} {select} --stdout 2>/dev/null | mpv {mpv} -",
+        sh_quote(magnet)
+    );
+    println!("playing [torrent {}] {}", profile.name, magnet);
+
+    let child = Command::new("bash")
+        .arg("-c")
+        .arg(&pipeline)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start torrent stream: {e}"))?;
+    *player = Some(child);
+    Ok(())
+}
+
+/// mpv flags for a profile: fullscreen, the enhance args, and the A/B toggle
+/// script when a shader chain is active.
+fn mpv_args(profile: &Profile) -> Vec<String> {
+    let mut args: Vec<String> = ["--fs", "--no-terminal", "--force-window=immediate"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(profile.args.iter().cloned());
+    if profile
+        .args
+        .iter()
+        .any(|a| a.starts_with("--glsl-shaders="))
+    {
+        if let Some(script) = ensure_toggle_script() {
+            args.push(format!("--script={}", script.display()));
+        }
+    }
+    args
+}
+
+fn stop(player: &mut Option<Child>) {
+    if let Some(mut old) = player.take() {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+}
+
+fn command_exists(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Single-quotes a string for safe inclusion in a `bash -c` pipeline.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Writes the embedded A/B-comparison mpv script next to the UI data so it

@@ -7,6 +7,7 @@ import {
   fetchAddons,
   fetchSettings,
   fetchSteamStatus,
+  openUrl,
   removeAddon,
   saveSettings,
 } from './api';
@@ -215,7 +216,11 @@ function AddonSection({
       <h2>Stremio addons</h2>
       <p className="settings-muted">
         Paste any Stremio addon's manifest URL — e.g.
-        https://v3-cinemeta.strem.io/manifest.json
+        https://v3-cinemeta.strem.io/manifest.json,
+        https://torrentio.strem.fun/manifest.json, or
+        https://watchhub.strem.io/manifest.json. For Torrentio with a debrid
+        service (RealDebrid etc.), open Configure, set it up, and paste the
+        configured manifest URL it gives you.
       </p>
       <Field label="Manifest URL">
         <input
@@ -241,11 +246,19 @@ function AddonSection({
                 <div className="settings-muted addon-meta">
                   {a.catalogs.length} catalog{a.catalogs.length === 1 ? '' : 's'}
                   {a.streams ? ' · streams' : ''}
+                  {a.meta ? ' · meta' : ''}
                 </div>
               </div>
-              <button className="btn" onClick={() => remove(a)}>
-                Remove
-              </button>
+              <div className="addon-buttons">
+                {a.configure_url && (
+                  <button className="btn" onClick={() => openUrl(a.configure_url!).catch(() => {})}>
+                    Configure
+                  </button>
+                )}
+                <button className="btn" onClick={() => remove(a)}>
+                  Remove
+                </button>
+              </div>
             </li>
           ))}
         </ul>

@@ -118,6 +118,51 @@ impl Source for Steam {
     }
 }
 
+/// Store-page summary for a game's details page (public Steam storefront API,
+/// no key needed). Best-effort — returns None if the call fails.
+pub fn store_meta(appid: &str) -> Option<crate::media::Meta> {
+    let url = format!("https://store.steampowered.com/api/appdetails?appids={appid}&l=english");
+    parse_store_meta(appid, &addons::http_get(&url).ok()?)
+}
+
+fn parse_store_meta(appid: &str, json: &str) -> Option<crate::media::Meta> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let data = value.get(appid)?.get("data")?;
+    Some(crate::media::Meta {
+        id: format!("steam:{appid}"),
+        kind: "game".to_string(),
+        title: data
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        poster: Some(art_url(appid)),
+        background: data
+            .get("background_raw")
+            .and_then(|b| b.as_str())
+            .map(String::from),
+        description: data
+            .get("short_description")
+            .and_then(|d| d.as_str())
+            .filter(|d| !d.is_empty())
+            .map(String::from),
+        genres: data
+            .get("genres")
+            .and_then(|g| g.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| {
+                        g.get("description")
+                            .and_then(|d| d.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
 /// Tests the saved Steam credentials, returning the owned-game count or a
 /// human error. Used by the Settings panel's "Connect" button.
 pub fn connection_test() -> Result<usize, String> {
@@ -365,6 +410,22 @@ mod tests {
         assert_eq!(item.title, "Portal 2");
         assert!(item.art.unwrap().contains("/620/library_600x900.jpg"));
         assert!(owned_item(&serde_json::json!({"appid": 620})).is_none()); // no name
+    }
+
+    #[test]
+    fn parses_steam_store_meta() {
+        let json = r#"{"620": {"success": true, "data": {
+            "name": "Portal 2",
+            "short_description": "The acclaimed sequel.",
+            "background_raw": "https://x/bg.jpg",
+            "genres": [{"description": "Action"}, {"description": "Puzzle"}]
+        }}}"#;
+        let m = parse_store_meta("620", json).unwrap();
+        assert_eq!(m.id, "steam:620");
+        assert_eq!(m.title, "Portal 2");
+        assert_eq!(m.description.as_deref(), Some("The acclaimed sequel."));
+        assert_eq!(m.genres, vec!["Action", "Puzzle"]);
+        assert!(parse_store_meta("620", r#"{"620": {"success": false}}"#).is_none());
     }
 
     #[test]

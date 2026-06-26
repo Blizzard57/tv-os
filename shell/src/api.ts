@@ -19,6 +19,42 @@ export interface Row {
   items: ContentItem[];
 }
 
+// Details-page metadata — mirrors tvosd/src/media.rs.
+export interface Episode {
+  id: string;
+  title: string;
+  season: number;
+  episode: number;
+  overview?: string;
+  thumbnail?: string;
+  released?: string;
+}
+
+export interface Meta {
+  id: string;
+  kind: string; // movie | series | game
+  title: string;
+  poster?: string;
+  background?: string;
+  logo?: string;
+  description?: string;
+  release_info?: string;
+  rating?: string;
+  runtime?: string;
+  genres: string[];
+  episodes: Episode[];
+}
+
+export type StreamKind = 'direct' | 'youtube' | 'external' | 'torrent';
+
+export interface Stream {
+  kind: StreamKind;
+  url: string;
+  name: string;
+  title: string;
+  file_idx?: number;
+}
+
 export interface InstallJob {
   id: string;
   title: string;
@@ -51,6 +87,8 @@ export interface Addon {
   name: string;
   catalogs: { type: string; id: string; name: string }[];
   streams: boolean;
+  meta: boolean;
+  configure_url?: string;
 }
 
 export async function fetchSettings(): Promise<Settings> {
@@ -109,3 +147,24 @@ export async function fetchAddons(): Promise<Addon[]> {
 
 export const addAddon = (url: string) => post('/api/addons', { url });
 export const removeAddon = (url: string) => post('/api/addons/remove', { url });
+export const openUrl = (url: string) => post('/api/open', { url });
+
+export async function fetchMeta(id: string): Promise<Meta> {
+  const res = await fetch(`/api/meta?id=${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(`meta request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchStreams(id: string): Promise<Stream[]> {
+  const res = await fetch(`/api/streams?id=${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(`streams request failed: ${res.status}`);
+  return res.json();
+}
+
+// Plays a chosen stream; sends the item so the daemon records it for the
+// recommender (with the title/art shown on the details page).
+export const playStream = (stream: Stream, item: ContentItem) =>
+  post('/api/play', {
+    stream,
+    item: { id: item.id, title: item.title, kind: item.kind, art: item.art },
+  });

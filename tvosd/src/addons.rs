@@ -26,6 +26,11 @@ pub struct Addon {
     pub catalogs: Vec<Catalog>,
     /// True if the addon serves the `stream` resource.
     pub streams: bool,
+    /// True if the addon serves the `meta` resource (e.g. Cinemeta).
+    pub meta: bool,
+    /// A /configure page, if the addon advertises one (debrid keys, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configure_url: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -125,15 +130,28 @@ fn parse_manifest(url: &str, manifest: &Value) -> Option<Addon> {
     manifest.get("id")?.as_str()?;
     let name = manifest.get("name")?.as_str()?.to_string();
 
-    let streams = manifest
-        .get("resources")
-        .and_then(|r| r.as_array())
-        .is_some_and(|resources| {
-            resources.iter().any(|r| {
-                r.as_str() == Some("stream")
-                    || r.get("name").and_then(|n| n.as_str()) == Some("stream")
+    let has_resource = |name: &str| {
+        manifest
+            .get("resources")
+            .and_then(|r| r.as_array())
+            .is_some_and(|resources| {
+                resources.iter().any(|r| {
+                    r.as_str() == Some(name) || r.get("name").and_then(|n| n.as_str()) == Some(name)
+                })
             })
-        });
+    };
+    let streams = has_resource("stream");
+    let meta = has_resource("meta");
+
+    // A configurable addon advertises behaviorHints.configurable and serves a
+    // /configure page where the user sets options (e.g. debrid keys).
+    let base = url.trim_end_matches("/manifest.json").to_string();
+    let configurable = manifest
+        .get("behaviorHints")
+        .and_then(|h| h.get("configurable"))
+        .and_then(|c| c.as_bool())
+        .unwrap_or(false);
+    let configure_url = configurable.then(|| format!("{base}/configure"));
 
     let catalogs = manifest
         .get("catalogs")
@@ -159,10 +177,12 @@ fn parse_manifest(url: &str, manifest: &Value) -> Option<Addon> {
 
     Some(Addon {
         url: url.to_string(),
-        base: url.trim_end_matches("/manifest.json").to_string(),
+        base,
         name,
         catalogs,
         streams,
+        meta,
+        configure_url,
     })
 }
 

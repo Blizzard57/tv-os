@@ -7,7 +7,7 @@
 # This builds the daemon + UI and installs a real, pacman-managed package
 # (uninstall with: sudo pacman -R tvos).
 pkgname=tvos
-pkgver=0.7.0
+pkgver=0.8.0
 pkgrel=1
 pkgdesc="Couch interface for all your games, movies and shows"
 arch=('x86_64')
@@ -17,6 +17,7 @@ depends=('gcc-libs')
 optdepends=(
   'chromium: app window (or any Chromium-family browser)'
   'mpv: video playback with the Enhance upscaler'
+  'webtorrent-cli: torrent stream playback (Torrentio without debrid)'
   'gamescope: big-screen / controller mode (tvos-app --tv)'
   'ffmpeg: source-resolution probing for upscaling'
   'steam: Steam games'

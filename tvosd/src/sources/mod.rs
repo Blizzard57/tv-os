@@ -18,6 +18,25 @@ use serde::Serialize;
 use crate::install::InstallManager;
 use crate::model::Row;
 
+/// Maps a streamable item id to `(stremio_kind, stream_id)` for the details
+/// endpoints. Handles `strm:` directly and `tmdb:` via a TMDB→IMDb lookup.
+pub fn resolve_video(item_id: &str) -> Result<(String, String), String> {
+    match item_id.split(':').next().unwrap_or_default() {
+        "strm" => {
+            let mut parts = item_id.splitn(3, ':');
+            parts.next();
+            let kind = parts.next().filter(|s| !s.is_empty());
+            let id = parts.next().filter(|s| !s.is_empty());
+            match (kind, id) {
+                (Some(k), Some(i)) => Ok((k.to_string(), i.to_string())),
+                _ => Err(format!("bad stream id '{item_id}'")),
+            }
+        }
+        "tmdb" => tmdb::resolve_imdb(item_id),
+        _ => Err(format!("'{item_id}' is not a streamable item")),
+    }
+}
+
 pub trait Source: Send + Sync {
     /// Stable identifier, also the id prefix this source owns ("epic" → "epic:…").
     fn id(&self) -> &'static str;

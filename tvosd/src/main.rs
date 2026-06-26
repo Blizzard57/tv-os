@@ -16,6 +16,7 @@
 mod addons;
 mod install;
 mod launcher;
+mod media;
 mod model;
 mod recommend;
 mod settings;
@@ -26,7 +27,7 @@ mod util;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -62,6 +63,10 @@ async fn main() {
         .route("/api/steam/status", get(get_steam_status))
         .route("/api/addons", get(get_addons).post(post_addon))
         .route("/api/addons/remove", post(post_addon_remove))
+        .route("/api/meta", get(get_meta))
+        .route("/api/streams", get(get_streams))
+        .route("/api/play", post(post_play))
+        .route("/api/open", post(post_open))
         .route("/api/version", get(get_version))
         .fallback_service(serve_ui)
         .with_state(app);
@@ -218,5 +223,105 @@ async fn post_install(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     result
         .map(|()| StatusCode::ACCEPTED)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+#[derive(Deserialize)]
+struct IdQuery {
+    id: String,
+}
+
+/// Details-page metadata: description, background, and (for series) the full
+/// episode list. Video items resolve through stream addons (Cinemeta etc.);
+/// Steam games use the public storefront API; others return a minimal stub.
+async fn get_meta(Query(q): Query<IdQuery>) -> Json<media::Meta> {
+    let meta = tokio::task::spawn_blocking(move || meta_for(&q.id))
+        .await
+        .unwrap_or_default();
+    Json(meta)
+}
+
+fn meta_for(id: &str) -> media::Meta {
+    let prefix = id.split(':').next().unwrap_or_default();
+    match prefix {
+        "strm" | "tmdb" => sources::resolve_video(id)
+            .ok()
+            .and_then(|(kind, sid)| sources::stremio::meta(&kind, &sid))
+            .unwrap_or_else(|| media::Meta {
+                id: id.to_string(),
+                kind: if id.contains(":tv:") || id.contains(":series:") {
+                    "series".to_string()
+                } else {
+                    "movie".to_string()
+                },
+                ..Default::default()
+            }),
+        "steam" => {
+            sources::steam::store_meta(id.trim_start_matches("steam:")).unwrap_or(media::Meta {
+                id: id.to_string(),
+                kind: "game".to_string(),
+                ..Default::default()
+            })
+        }
+        other => media::Meta {
+            id: id.to_string(),
+            kind: if other == "video" { "movie" } else { "game" }.to_string(),
+            ..Default::default()
+        },
+    }
+}
+
+/// All streams for a video item / episode, ranked best-first.
+async fn get_streams(Query(q): Query<IdQuery>) -> Json<Vec<media::Stream>> {
+    let streams = tokio::task::spawn_blocking(move || match sources::resolve_video(&q.id) {
+        Ok((kind, id)) => sources::stremio::streams(&kind, &id),
+        Err(_) => Vec::new(),
+    })
+    .await
+    .unwrap_or_default();
+    Json(streams)
+}
+
+#[derive(Deserialize)]
+struct PlayRequest {
+    stream: media::Stream,
+    /// Item details, recorded for the recommender on a successful play.
+    item: Option<ItemMeta>,
+}
+
+#[derive(Deserialize)]
+struct ItemMeta {
+    id: String,
+    title: String,
+    kind: model::Kind,
+    art: Option<String>,
+}
+
+/// Plays a stream the user picked on the details page.
+async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCode, String)> {
+    let stream = req.stream;
+    let result = tokio::task::spawn_blocking(move || sources::stremio::play_stream(&stream))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if result.is_ok() {
+        if let Some(item) = req.item {
+            recommend::LOG.record(model::ContentItem {
+                id: item.id,
+                kind: item.kind,
+                title: item.title,
+                art: item.art,
+                action: model::Action::Play,
+            });
+        }
+    }
+    result
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+/// Opens a URL with the system handler — an addon's /configure page, etc.
+async fn post_open(Json(req): Json<AddonRequest>) -> Result<StatusCode, (StatusCode, String)> {
+    launcher::open_external(&req.url)
+        .map(|()| StatusCode::NO_CONTENT)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
 }

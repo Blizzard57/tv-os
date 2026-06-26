@@ -133,6 +133,10 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
 | `GET /api/steam/status` | Tests saved Steam creds → `{connected, count}` or `{error}` |
 | `GET / POST /api/addons` | List installed addons / install one (`{"url": "…/manifest.json"}`) |
 | `POST /api/addons/remove` | Uninstall an addon (`{"url": …}`) |
+| `GET /api/meta?id=` | Details-page metadata: summary + episode list (series) |
+| `GET /api/streams?id=` | Every source for a title/episode (direct, torrent, external, youtube) |
+| `POST /api/play` | Play a chosen `{stream, item}` |
+| `POST /api/open {"url"}` | Open a link with the system (WatchHub apps, addon Configure pages) |
 | `GET /api/version` | Daemon version (handy for testing packages) |
 
 `POST /api/launch` optionally takes `title`, `kind`, `art` alongside `id`;
@@ -142,11 +146,10 @@ always sends them).
 ## What's deliberately still open
 
 Profiles ("who's watching"), HDMI-CEC power sync, the phone companion app,
-the in-UI addon browser with on-screen keyboard, series episode picker, the
-aggregated store pages + checkout webview, and the VapourSynth/TensorRT
-upscaling backend. Each slots behind an existing seam (the `Source` trait,
-the Enhance resolver, the recommender's row contract) — none require
-rearchitecting.
+an on-screen keyboard for controller-only text entry, the aggregated store
+pages + checkout webview, and the VapourSynth/TensorRT upscaling backend.
+Each slots behind an existing seam (the `Source` trait, the Enhance resolver,
+the recommender's row contract) — none require rearchitecting.
 
 Item ids are launchable strings whose prefix names the owning source — the
 HTTP addon protocol generalizes exactly this in a later phase.
@@ -258,13 +261,31 @@ curl -X POST http://127.0.0.1:8484/api/addons/remove \
      -H 'Content-Type: application/json' -d '{"url": "…"}'
 ```
 
-New rows appear on the next home-screen load. Notes:
+…or just paste the URL into **Settings → Stremio addons**. New rows appear on
+the next home-screen load. All four stream types are supported:
 
-- **Catalog-only addons** (like Cinemeta) give you rows to browse; you also
-  need at least one **stream-capable** addon to actually play those titles.
-- Torrent-only streams are skipped by design. Addons that resolve to direct
-  HTTP(S) URLs (including debrid-backed ones) play fine. What you install is
-  your responsibility — stick to addons that serve content legally.
+| Stream type | Example addon | How it plays |
+|---|---|---|
+| Direct / debrid URL | Torrentio + RealDebrid, others | our mpv + the Enhance upscaler (full seeking) |
+| Torrent (magnet) | **Torrentio** (no debrid) | streamed via `webtorrent-cli` → mpv. Install it: `npm install -g webtorrent-cli` |
+| External link | **WatchHub** | opens the streaming service's app/site (Netflix, SkyShowtime…) |
+| YouTube | trailers, channels | mpv via yt-dlp |
+
+Notes:
+
+- **Catalog-only addons** (like Cinemeta) give you rows to browse and the
+  episode lists / summaries; you also need a **stream-capable** addon
+  (Torrentio, WatchHub, …) to play. Cinemeta also powers the details page.
+- **Details page**: pressing A on any entry opens a summary page — poster,
+  description, genres, rating. Series show a **season/episode list** you
+  launch individually; movies and episodes show a **picker of every source**
+  (Torrentio qualities + WatchHub apps), each launchable on its own.
+- **Configuring addons**: in Settings, a configurable addon (e.g. Torrentio)
+  shows a **Configure** button that opens its setup page — add a debrid key
+  there, then paste the configured manifest URL it gives you. Debrid streams
+  come back as direct URLs (full seeking + upscaler).
+- What you install is your responsibility — stick to addons that serve
+  content legally.
 - Try it end-to-end with the bundled sample addon:
   `python3 tools/sample-addon.py &` then install
   `http://127.0.0.1:7100/manifest.json` — a "Blender Films" row appears and

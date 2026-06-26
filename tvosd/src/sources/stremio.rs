@@ -1,10 +1,14 @@
-//! Streams via installed Stremio-compatible addons (see addons.rs).
+//! Stremio-compatible addons: catalogs, rich metadata (with episode lists),
+//! and every kind of stream they return.
 //!
-//! Catalogs become home rows; pressing play asks every stream-capable addon
-//! for streams, ranks them, and plays the best in mpv through the Enhance
-//! pipeline. The ranker prefers direct HTTPS streams and higher resolutions;
-//! torrent-only entries (infoHash without a url) are skipped — there is no
-//! torrent engine, debrid-backed addons hand out direct URLs instead.
+//! Streams come in four shapes and we support them all:
+//!   - `url`         → direct/debrid stream, played in our mpv + upscaler
+//!   - `ytId`        → YouTube, played via mpv's yt-dlp hook
+//!   - `externalUrl` → a link to a service/app (WatchHub) → opened with the system
+//!   - `infoHash`    → a BitTorrent magnet (Torrentio) → streamed via a torrent helper
+//!
+//! The details page lists them all and lets the user pick; `play_meta` is the
+//! auto-pick fallback used when something is launched without opening details.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -13,6 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::addons::{self, Addon};
+use crate::media::{Episode, Meta, Stream, StreamKind};
 use crate::model::{Action, ContentItem, Kind, Row};
 use crate::sources::Source;
 use crate::util::percent_encode;
@@ -21,6 +26,15 @@ use crate::{launcher, settings, upscale};
 const CATALOG_TTL: Duration = Duration::from_secs(600);
 const ROW_LIMIT: usize = 25;
 const CATALOGS_PER_ADDON: usize = 2;
+
+/// A few well-known public trackers added to every magnet so a torrent can
+/// find peers even when the addon supplies none.
+const DEFAULT_TRACKERS: [&str; 4] = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+];
 
 #[derive(Default)]
 pub struct Stremio {
@@ -60,22 +74,84 @@ impl Source for Stremio {
     }
 }
 
-/// Resolves `(kind, meta_id)` to streams via every installed stream addon,
-/// then plays the best one through the Enhance pipeline. Shared so the TMDB
-/// source can play a title once it has mapped it to an IMDb id. `kind` is the
-/// Stremio content type ("movie" / "series"); `meta_id` is usually an IMDb id.
-pub fn play_meta(kind: &str, meta_id: &str) -> Result<(), String> {
-    let streams = collect_streams(&addons::STORE.list(), kind, meta_id);
-    let best = streams
-        .first()
+// ---- Public resolver API used by the details endpoints (main.rs) ----
+
+/// Full metadata (incl. episode list) from the first meta-capable addon that
+/// answers. `kind` is "movie" / "series"; `id` is an IMDb-style id.
+pub fn meta(kind: &str, id: &str) -> Option<Meta> {
+    for addon in addons::STORE.list().iter().filter(|a| a.meta) {
+        let url = format!(
+            "{}/meta/{}/{}.json",
+            addon.base,
+            percent_encode(kind),
+            percent_encode(id)
+        );
+        if let Ok(json) = addons::http_get(&url) {
+            if let Some(meta) = parse_meta(&json) {
+                return Some(meta);
+            }
+        }
+    }
+    None
+}
+
+/// Every stream from every stream-capable addon, ranked best-first. `id` is a
+/// movie id (`tt…`) or an episode id (`tt…:S:E`).
+pub fn streams(kind: &str, id: &str) -> Vec<Stream> {
+    let mut all: Vec<Stream> = addons::STORE
+        .list()
+        .iter()
+        .filter(|a| a.streams)
+        .filter_map(|addon| {
+            let url = format!(
+                "{}/stream/{}/{}.json",
+                addon.base,
+                percent_encode(kind),
+                percent_encode(id)
+            );
+            addons::http_get(&url).ok().map(|json| parse_streams(&json))
+        })
+        .flatten()
+        .collect();
+    rank(&mut all);
+    all
+}
+
+/// Launches a stream the user (or the auto-picker) chose.
+pub fn play_stream(stream: &Stream) -> Result<(), String> {
+    match stream.kind {
+        StreamKind::Direct | StreamKind::Youtube => {
+            let profile = upscale::resolve(settings::STORE.get().enhance, &describe(stream));
+            launcher::play_video(&stream.url, &profile)
+        }
+        StreamKind::External => launcher::open_external(&stream.url),
+        StreamKind::Torrent => {
+            let profile = upscale::resolve(settings::STORE.get().enhance, &describe(stream));
+            launcher::play_torrent(&stream.url, stream.file_idx, &profile)
+        }
+    }
+}
+
+/// Auto-pick: best playable stream for `(kind, id)`. Used by Source::launch
+/// (the quick path). Prefers a directly-playable stream; for a bare series id
+/// it falls back to the first episode.
+pub fn play_meta(kind: &str, id: &str) -> Result<(), String> {
+    let mut found = streams(kind, id);
+    if found.is_empty() && kind == "series" && !id.contains(':') {
+        found = streams(kind, &format!("{id}:1:1"));
+    }
+    let pick = found
+        .iter()
+        .find(|s| matches!(s.kind, StreamKind::Direct | StreamKind::Youtube))
+        .or_else(|| found.iter().find(|s| s.kind == StreamKind::Torrent))
+        .or_else(|| found.first())
         .ok_or("No playable stream found — install a stream addon that carries this title")?;
-    let profile = upscale::resolve(settings::STORE.get().enhance, &best.describe());
     println!(
-        "stream pick: {} ({} candidates)",
-        best.describe(),
-        streams.len()
+        "auto-pick: [{:?}] {}",
+        pick.kind,
+        pick.name.replace('\n', " ")
     );
-    launcher::play_video(&best.url, &profile)
+    play_stream(pick)
 }
 
 impl Stremio {
@@ -112,87 +188,180 @@ fn parse_id(item_id: &str) -> Result<(&str, &str), String> {
     }
 }
 
-/// A playable candidate after filtering and ranking.
-#[derive(Debug, PartialEq)]
-struct Candidate {
-    url: String,
-    label: String,
+/// Hint text the upscale resolver reads (resolution, anime tags…).
+fn describe(stream: &Stream) -> String {
+    format!("{} {} {}", stream.name, stream.title, stream.url)
 }
 
-impl Candidate {
-    /// Text the upscale resolver can read hints (1080p, anime tags…) from.
-    fn describe(&self) -> String {
-        format!("{} {}", self.label, self.url)
-    }
-}
+// ---- Parsing ----
 
-/// Asks every stream-capable addon, merges and ranks. For a bare series id,
-/// falls back to its first episode — proper episode browsing is a later phase.
-fn collect_streams(installed: &[Addon], kind: &str, meta_id: &str) -> Vec<Candidate> {
-    let mut all = Vec::new();
-    for addon in installed.iter().filter(|a| a.streams) {
-        let mut ids = vec![meta_id.to_string()];
-        if kind == "series" && !meta_id.contains(':') {
-            ids.push(format!("{meta_id}:1:1"));
-        }
-        for id in ids {
-            let url = format!(
-                "{}/stream/{}/{}.json",
-                addon.base,
-                percent_encode(kind),
-                percent_encode(&id)
-            );
-            if let Ok(json) = addons::http_get(&url) {
-                all.extend(parse_streams(&json));
-                if !all.is_empty() {
-                    break; // got streams for the bare id; skip the fallback
-                }
-            }
-        }
-    }
-    rank(&mut all);
-    all
-}
-
-fn parse_streams(json: &str) -> Vec<Candidate> {
+fn parse_streams(json: &str) -> Vec<Stream> {
     let Ok(value) = serde_json::from_str::<Value>(json) else {
         return Vec::new();
     };
     let Some(streams) = value.get("streams").and_then(|s| s.as_array()) else {
         return Vec::new();
     };
-    streams.iter().filter_map(candidate).collect()
+    streams.iter().filter_map(parse_stream).collect()
 }
 
-/// Direct URLs play as-is; YouTube ids go through mpv's yt-dlp hook.
-/// infoHash-only (torrent) entries are not playable here and are dropped.
-fn candidate(stream: &Value) -> Option<Candidate> {
-    let label = ["name", "title", "description"]
-        .iter()
-        .filter_map(|k| stream.get(k).and_then(|v| v.as_str()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let url = if let Some(url) = stream.get("url").and_then(|u| u.as_str()) {
-        url.to_string()
-    } else if let Some(yt) = stream.get("ytId").and_then(|y| y.as_str()) {
-        format!("https://www.youtube.com/watch?v={yt}")
+fn parse_stream(v: &Value) -> Option<Stream> {
+    let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
+    let name = str_of("name").unwrap_or_default();
+    let title = str_of("title")
+        .or_else(|| str_of("description"))
+        .unwrap_or_default();
+
+    let (kind, url, file_idx) = if let Some(url) = str_of("url") {
+        (StreamKind::Direct, url, None)
+    } else if let Some(yt) = str_of("ytId") {
+        (
+            StreamKind::Youtube,
+            format!("https://www.youtube.com/watch?v={yt}"),
+            None,
+        )
+    } else if let Some(ext) = str_of("externalUrl") {
+        (StreamKind::External, ext, None)
+    } else if let Some(hash) = str_of("infoHash") {
+        let file_idx = v.get("fileIdx").and_then(|x| x.as_i64());
+        let dn = if name.is_empty() { &title } else { &name };
+        (
+            StreamKind::Torrent,
+            build_magnet(&hash, dn, v.get("sources")),
+            file_idx,
+        )
     } else {
         return None;
     };
-    Some(Candidate { url, label })
+
+    Some(Stream {
+        kind,
+        url,
+        name: if name.is_empty() {
+            "Source".to_string()
+        } else {
+            name
+        },
+        title,
+        file_idx,
+    })
 }
 
-/// Best first: resolution read from the label, then https over http.
-fn rank(streams: &mut [Candidate]) {
+/// Builds a magnet URI from an infoHash, the display name, the addon's tracker
+/// `sources`, and a handful of default public trackers.
+fn build_magnet(info_hash: &str, name: &str, sources: Option<&Value>) -> String {
+    let mut magnet = format!("magnet:?xt=urn:btih:{info_hash}");
+    let clean_name = name.replace('\n', " ");
+    if !clean_name.is_empty() {
+        magnet.push_str(&format!("&dn={}", percent_encode(&clean_name)));
+    }
+    if let Some(list) = sources.and_then(|s| s.as_array()) {
+        for tr in list
+            .iter()
+            .filter_map(|s| s.as_str())
+            .filter_map(|s| s.strip_prefix("tracker:"))
+        {
+            magnet.push_str(&format!("&tr={}", percent_encode(tr)));
+        }
+    }
+    for tr in DEFAULT_TRACKERS {
+        magnet.push_str(&format!("&tr={}", percent_encode(tr)));
+    }
+    magnet
+}
+
+/// Orders the details-page list: resolution desc, then directly-playable
+/// sources ahead of torrents/externals.
+fn rank(streams: &mut [Stream]) {
     streams.sort_by_key(|s| {
-        let text = s.describe().to_lowercase();
+        let text = describe(s).to_lowercase();
         let height = [2160, 1440, 1080, 720, 480]
             .into_iter()
             .find(|h| text.contains(&format!("{h}p")) || text.contains(&format!("{h}i")))
             .unwrap_or(0);
-        let https = i32::from(s.url.starts_with("https://"));
-        std::cmp::Reverse(height * 10 + https)
+        let kind_rank = match s.kind {
+            StreamKind::Direct => 3,
+            StreamKind::Torrent => 2,
+            StreamKind::Youtube => 1,
+            StreamKind::External => 0,
+        };
+        std::cmp::Reverse((height, kind_rank))
     });
+}
+
+fn parse_meta(json: &str) -> Option<Meta> {
+    let value = serde_json::from_str::<Value>(json).ok()?;
+    let m = value.get("meta")?;
+    let str_of = |k: &str| m.get(k).and_then(|x| x.as_str()).map(String::from);
+    let kind = str_of("type").unwrap_or_else(|| "movie".to_string());
+
+    let genres = m
+        .get("genres")
+        .and_then(|g| g.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut episodes: Vec<Episode> = m
+        .get("videos")
+        .and_then(|v| v.as_array())
+        .map(|vids| vids.iter().filter_map(parse_episode).collect())
+        .unwrap_or_default();
+    episodes.sort_by_key(|e| (e.season, e.episode));
+
+    Some(Meta {
+        id: str_of("id").unwrap_or_default(),
+        kind,
+        title: str_of("name").unwrap_or_default(),
+        poster: str_of("poster"),
+        background: str_of("background"),
+        logo: str_of("logo"),
+        description: str_of("description").or_else(|| str_of("overview")),
+        release_info: str_of("releaseInfo").or_else(|| str_of("year")),
+        rating: str_of("imdbRating"),
+        runtime: str_of("runtime"),
+        genres,
+        episodes,
+    })
+}
+
+fn parse_episode(v: &Value) -> Option<Episode> {
+    let id = v.get("id")?.as_str()?.to_string();
+    let season = v.get("season").and_then(|x| x.as_i64()).unwrap_or(0);
+    let episode = v
+        .get("episode")
+        .or_else(|| v.get("number"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let title = v
+        .get("name")
+        .or_else(|| v.get("title"))
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("Episode {episode}"));
+    Some(Episode {
+        id,
+        title,
+        season,
+        episode,
+        overview: v
+            .get("overview")
+            .or_else(|| v.get("description"))
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        thumbnail: v
+            .get("thumbnail")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        released: v
+            .get("released")
+            .or_else(|| v.get("firstAired"))
+            .and_then(|x| x.as_str())
+            .map(String::from),
+    })
 }
 
 fn parse_catalog(json: &str) -> Vec<ContentItem> {
@@ -250,36 +419,79 @@ mod tests {
     }
 
     #[test]
-    fn streams_drop_torrents_and_map_youtube() {
+    fn parses_every_stream_kind() {
+        // Shapes taken from real Torrentio / WatchHub / direct responses.
         let json = r#"{"streams": [
-            {"infoHash": "abcd", "title": "Torrent 2160p"},
-            {"ytId": "xyz", "title": "Trailer"},
-            {"url": "https://cdn/movie-1080p.mp4", "name": "CDN 1080p"}
+            {"name": "CDN 1080p", "url": "https://cdn/m-1080p.mp4"},
+            {"name": "Torrentio\n4k", "title": "Movie.2160p.mkv\n👤 89", "infoHash": "ABC123",
+             "fileIdx": 2, "sources": ["tracker:udp://t.example:1337/announce", "dht:xyz"]},
+            {"name": "Netflix", "externalUrl": "https://www.netflix.com/title/1"},
+            {"name": "Trailer", "ytId": "dQw4"}
         ]}"#;
-        let mut streams = parse_streams(json);
-        assert_eq!(streams.len(), 2); // torrent dropped
-        rank(&mut streams);
-        assert_eq!(streams[0].url, "https://cdn/movie-1080p.mp4"); // 1080p beats unlabeled
+        let s = parse_streams(json);
+        assert_eq!(s.len(), 4);
+        let by = |k: StreamKind| s.iter().find(|x| x.kind == k).unwrap();
+        assert_eq!(by(StreamKind::Direct).url, "https://cdn/m-1080p.mp4");
+        assert_eq!(
+            by(StreamKind::External).url,
+            "https://www.netflix.com/title/1"
+        );
+        assert_eq!(
+            by(StreamKind::Youtube).url,
+            "https://www.youtube.com/watch?v=dQw4"
+        );
+        let torrent = by(StreamKind::Torrent);
+        assert_eq!(torrent.file_idx, Some(2));
+        assert!(torrent.url.starts_with("magnet:?xt=urn:btih:ABC123"));
+        assert!(torrent.url.contains("tracker.opentrackr.org")); // default tracker added
+        assert!(torrent.url.contains("t.example")); // addon-supplied tracker kept
     }
 
     #[test]
-    fn ranking_prefers_resolution_then_https() {
+    fn ranking_prefers_resolution_then_direct() {
+        let mk = |kind, name: &str| Stream {
+            kind,
+            url: "x".into(),
+            name: name.into(),
+            title: String::new(),
+            file_idx: None,
+        };
         let mut streams = vec![
-            Candidate {
-                url: "http://a/720.mkv".into(),
-                label: "720p".into(),
-            },
-            Candidate {
-                url: "https://b/2160.mkv".into(),
-                label: "4K 2160p".into(),
-            },
-            Candidate {
-                url: "https://c/1080.mkv".into(),
-                label: "FHD 1080p".into(),
-            },
+            mk(StreamKind::Torrent, "720p"),
+            mk(StreamKind::Torrent, "2160p"),
+            mk(StreamKind::Direct, "1080p"),
+            mk(StreamKind::Direct, "2160p"),
         ];
         rank(&mut streams);
-        let order: Vec<&str> = streams.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(order, vec!["4K 2160p", "FHD 1080p", "720p"]);
+        let order: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
+        // 2160p direct, then 2160p torrent, then 1080p direct, then 720p torrent.
+        assert_eq!(order, vec!["2160p", "2160p", "1080p", "720p"]);
+        assert_eq!(streams[0].kind, StreamKind::Direct);
+    }
+
+    #[test]
+    fn parses_series_meta_with_sorted_episodes() {
+        let json = r#"{"meta": {
+            "id": "tt1", "type": "series", "name": "Show",
+            "poster": "p.jpg", "description": "A show.", "genres": ["Drama", "Sci-Fi"],
+            "videos": [
+                {"id": "tt1:1:2", "name": "Second", "season": 1, "episode": 2},
+                {"id": "tt1:1:1", "name": "Pilot", "season": 1, "number": 1, "overview": "start"}
+            ]
+        }}"#;
+        let meta = parse_meta(json).unwrap();
+        assert_eq!(meta.title, "Show");
+        assert_eq!(meta.genres, vec!["Drama", "Sci-Fi"]);
+        assert_eq!(meta.episodes.len(), 2);
+        assert_eq!(meta.episodes[0].id, "tt1:1:1"); // sorted
+        assert_eq!(meta.episodes[0].title, "Pilot");
+        assert_eq!(meta.episodes[1].episode, 2);
+    }
+
+    #[test]
+    fn garbage_inputs_are_safe() {
+        assert!(parse_streams("oops").is_empty());
+        assert!(parse_meta("oops").is_none());
+        assert!(parse_catalog("oops").is_empty());
     }
 }

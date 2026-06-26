@@ -8,10 +8,9 @@ import {
   fetchInstalls,
   fetchLibrary,
   fetchSettings,
-  launch,
   saveSettings,
-  startInstall,
 } from './api';
+import { DetailsPage } from './DetailsPage';
 import { NavAction, useTvInput } from './input';
 import { MediaRow } from './MediaRow';
 import { SettingsPanel } from './SettingsPanel';
@@ -23,12 +22,6 @@ interface Focus {
   row: number;
   col: number;
 }
-
-const HERO_HINTS: Record<ContentItem['action'], string> = {
-  play: 'to play',
-  install: 'to install',
-  none: '— not playable yet',
-};
 
 const ENHANCE_CYCLE: EnhanceMode[] = ['auto', 'quality', 'performance', 'off'];
 const ENHANCE_LABELS: Record<EnhanceMode, string> = {
@@ -53,9 +46,12 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [settings, setSettings] = useState<Settings>(BLANK_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [detailsItem, setDetailsItem] = useState<ContentItem | null>(null);
   const { jobs, refresh: refreshJobs } = useInstallJobs(() => loadLibrary());
   const columnMemory = useRef<number[]>([]);
   const toastTimer = useRef<number>();
+  // DetailsPage registers its nav handler here; App forwards input while open.
+  const detailsActionRef = useRef<((a: NavAction) => void) | null>(null);
   // Mirror of `focus` for event handlers: 'confirm' must read the current
   // position without doing side effects inside a setState updater (React
   // double-invokes updaters in dev to assert purity).
@@ -102,32 +98,22 @@ export default function App() {
     toastTimer.current = window.setTimeout(() => setToast(null), 3000);
   }, []);
 
-  const activate = useCallback(
-    (item: ContentItem) => {
-      switch (item.action) {
-        case 'play':
-          showToast(`Launching ${item.title}…`);
-          launch(item).catch((e) => showToast(`Could not launch: ${e.message}`));
-          break;
-        case 'install':
-          showToast(`Downloading ${item.title}…`);
-          startInstall(item.id)
-            .then(refreshJobs)
-            .catch((e) => showToast(`Could not install: ${e.message}`));
-          break;
-        case 'none':
-          showToast('Not playable yet — stream sources arrive in a later phase');
-          break;
-      }
-    },
-    [showToast, refreshJobs],
-  );
+  // Refreshes background data after a play/install (recommender rows, jobs).
+  const onPlayed = useCallback(() => {
+    reloadAll();
+    refreshJobs();
+  }, [reloadAll, refreshJobs]);
 
   const onAction = useCallback(
     (action: NavAction) => {
       // While the Settings panel is open it owns input; only let B/Start close it.
       if (settingsOpen) {
         if (action === 'back' || action === 'settings') setSettingsOpen(false);
+        return;
+      }
+      // While the details page is open it owns input (it closes itself on back).
+      if (detailsItem) {
+        detailsActionRef.current?.(action);
         return;
       }
       if (action === 'settings') {
@@ -153,7 +139,7 @@ export default function App() {
       if (action === 'confirm') {
         const f = focusRef.current;
         const item = rows[f.row]?.items[f.col];
-        if (item) activate(item);
+        if (item) setDetailsItem(item); // open the details page for every entry
         return;
       }
       if (action === 'back') return;
@@ -176,7 +162,7 @@ export default function App() {
         }
       });
     },
-    [rows, activate, showToast, theme, settings, settingsOpen],
+    [rows, showToast, theme, settings, settingsOpen, detailsItem],
   );
   useTvInput(onAction);
 
@@ -203,8 +189,7 @@ export default function App() {
           <div className="hero-kind">{focusedItem?.kind.toUpperCase()}</div>
           <h1 className="hero-title">{focusedItem?.title}</h1>
           <div className="hero-hint">
-            Press <span className="key">A</span> / <span className="key">Enter</span>{' '}
-            {HERO_HINTS[focusedItem?.action ?? 'play']}
+            Press <span className="key">A</span> / <span className="key">Enter</span> to open
           </div>
         </header>
 
@@ -250,6 +235,14 @@ export default function App() {
 
       <DownloadsPanel jobs={jobs} />
       {toast && <div className="toast">{toast}</div>}
+      {detailsItem && (
+        <DetailsPage
+          item={detailsItem}
+          onClose={() => setDetailsItem(null)}
+          onPlayed={onPlayed}
+          actionRef={detailsActionRef}
+        />
+      )}
       {settingsOpen && (
         <SettingsPanel
           onClose={() => setSettingsOpen(false)}
