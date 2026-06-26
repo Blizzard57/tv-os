@@ -85,11 +85,17 @@ pub fn play_torrent(magnet: &str, file_idx: Option<i64>, profile: &Profile) -> R
     let mut player = PLAYER.lock().unwrap();
     stop(&mut player);
 
+    // Download to a predictable, disk-backed cache dir. webtorrent otherwise
+    // writes to the working dir or /tmp (often a small tmpfs), which fills up
+    // fast on big torrents — a common cause of "no space" failures.
+    let cache = torrent_cache();
+    let _ = std::fs::create_dir_all(&cache);
+
     // `webtorrent <magnet> --mpv` (download is the default command). With a
     // file index, --select streams that file; without it webtorrent picks the
     // largest playable file automatically.
     let mut cmd = Command::new(&webtorrent);
-    cmd.arg(magnet).arg("--mpv");
+    cmd.arg(magnet).arg("--mpv").arg("--out").arg(&cache);
     if let Some(i) = file_idx {
         cmd.args(["--select", &i.to_string()]);
     }
@@ -121,6 +127,12 @@ fn prepare_mpv_home(profile: &Profile) -> PathBuf {
     let has_uosc = scripts.join("uosc/main.lua").exists();
     let mut conf = String::from(BASE_MPV_CONF);
     conf.push_str(if has_uosc { "osc=no\n" } else { "osc=yes\n" });
+    // A real log file (mpv writes nothing to a suppressed terminal) so the
+    // actual reason a stream fails is always visible.
+    conf.push_str(&format!(
+        "log-file=\"{}\"\n",
+        home.join("mpv.log").display()
+    ));
     // Turn the resolved profile's "--key=value" mpv flags into config lines so
     // they apply to webtorrent's mpv too (which we can't pass args to).
     for arg in &profile.args {
@@ -137,6 +149,14 @@ fn mpv_home() -> PathBuf {
         return PathBuf::from(dir);
     }
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/tvos/mpv")
+}
+
+/// Where webtorrent downloads torrent data (disk-backed, easy to clear).
+fn torrent_cache() -> PathBuf {
+    if let Ok(dir) = std::env::var("TVOS_TORRENT_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/tvos/torrents")
 }
 
 /// Truncates and opens the per-playback log (player stderr) for diagnosis.

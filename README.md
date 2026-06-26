@@ -301,6 +301,19 @@ Notes:
   plays through the upscaler. The script is ~80 lines and is the template
   for writing your own addon.
 
+### Playback troubleshooting
+
+- **A stream won't play** → read `~/.local/share/tvos/mpv/mpv.log` (mpv's own
+  log) and `~/.local/share/tvos/mpv/play.log` (webtorrent's output). The
+  daemon also prints a `playing […]` line per launch.
+- **"No space" / nothing plays** → check `df -h`; free up disk. Torrents
+  download to `~/.cache/tvos/torrents` (override with `TVOS_TORRENT_DIR`) —
+  clear it with `rm -rf ~/.cache/tvos/torrents/*` to reclaim space.
+- **Torrents need peers** → an unhealthy torrent (few seeders) may stall;
+  pick another source, or use a debrid-configured addon for direct URLs.
+- Requires `mpv` installed (`sudo pacman -S mpv`); torrents also need
+  `webtorrent-cli` (`npm install -g webtorrent-cli`).
+
 ## Controls
 
 | Action | Gamepad | Keyboard / remote |
