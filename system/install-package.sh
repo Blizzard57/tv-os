@@ -42,6 +42,9 @@ update-desktop-database "$APPS" 2>/dev/null || true
 echo "==> Fetching upscaling shaders (best effort)"
 ./system/get-shaders.sh || echo "    shader download failed — re-run system/get-shaders.sh later"
 
+echo "==> Installing the mpv player UI (best effort)"
+./system/get-player.sh || echo "    player UI download failed — mpv's built-in OSC will be used; re-run system/get-player.sh later"
+
 echo
 echo "Done — launch 'TV OS' from your application menu, or run: tvos-app"
 echo "    Big-screen / controller mode:  tvos-app --tv"

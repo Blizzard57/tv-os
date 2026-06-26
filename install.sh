@@ -73,6 +73,9 @@ gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || tr
 say "Fetching upscaling shaders (best effort)"
 ./system/get-shaders.sh || warn "shader download failed — re-run system/get-shaders.sh later"
 
+say "Installing the mpv player UI (best effort)"
+./system/get-player.sh || warn "player UI download failed — mpv's built-in OSC will be used; re-run system/get-player.sh later"
+
 case ":$PATH:" in
   *":$BIN:"*) ;;
   *) warn "add $BIN to your PATH to run 'tvos-app' from a terminal";;

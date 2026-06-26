@@ -63,6 +63,14 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
     `tvosd/data/homebrew.json`) — the seed of the plan's ROM-source addons.
   - **Videos** — files in `~/Videos` plus built-in sample streams, played
     fullscreen in mpv through the Enhance pipeline (below).
+- **Player** — video plays in mpv dressed up as a real 10-foot player:
+  `system/get-player.sh` installs **uosc** (a modern, Stremio-like on-screen
+  UI — seek bar, subtitle/audio/chapter menus, settings) and **thumbfast**
+  (hover/seek thumbnail previews). It's driven by a private `MPV_HOME` that
+  tvosd writes a fresh `mpv.conf` into on every play (good streaming cache,
+  subtitle defaults, and the resolved Enhance shaders), so the same player +
+  upscaler apply to direct streams *and* torrents. Without uosc, mpv's
+  built-in OSC is used, so there's always a seek bar.
 - **Enhance — content-aware upscaling** (phase 4): every video launch goes
   through a resolver that picks the best mpv chain from the user's mode
   (**Auto / Quality / Performance / Off**, cycled with X / E, shown in the
@@ -117,6 +125,7 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
 | `system/package.sh` | Builds the self-contained distributable package |
 | `tvosd/src/settings.rs` | Persisted user settings (single store shared across the daemon) |
 | `system/get-shaders.sh` | Fetches Anime4K v4 + FSRCNNX shader packs |
+| `system/get-player.sh` | Installs the mpv player UI (uosc + thumbfast) |
 | `shell/` | React UI: rows, focus engine, input, theming, downloads panel |
 | `system/` | Session scripts, SDDM/wayland session files, installer |
 
@@ -267,7 +276,7 @@ the next home-screen load. All four stream types are supported:
 | Stream type | Example addon | How it plays |
 |---|---|---|
 | Direct / debrid URL | Torrentio + RealDebrid, others | our mpv + the Enhance upscaler (full seeking) |
-| Torrent (magnet) | **Torrentio** (no debrid) | streamed via `webtorrent-cli` → mpv. Install it: `npm install -g webtorrent-cli` |
+| Torrent (magnet) | **Torrentio** (no debrid) | streamed via `webtorrent-cli`'s `--mpv` mode (seekable, with the upscaler). Install it: `npm install -g webtorrent-cli` — tvosd finds it even off-PATH |
 | External link | **WatchHub** | opens the streaming service's app/site (Netflix, SkyShowtime…) |
 | YouTube | trailers, channels | mpv via yt-dlp |
 
