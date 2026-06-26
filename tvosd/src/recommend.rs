@@ -25,6 +25,13 @@ const ROW_SIZE: usize = 12;
 const HALF_LIFE_DAYS: f32 = 14.0;
 const SAME_DAYPART_BOOST: f32 = 1.5;
 
+/// Cap on how many events we keep — in memory and on disk. The daemon runs for
+/// weeks on a TV box and every launch appended an event forever, so both the
+/// in-memory `Vec` (cloned on every /api/library call) and events.jsonl grew
+/// without bound. The newest `MAX_EVENTS` are far more than the recommender's
+/// recency-weighted scoring can use, so older ones are dropped.
+const MAX_EVENTS: usize = 5_000;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Event {
     pub ts: u64,
@@ -41,35 +48,66 @@ pub struct EventLog {
 impl EventLog {
     fn load() -> Self {
         let path = config_dir().join("events.jsonl");
-        let events = std::fs::read_to_string(&path)
+        let mut events: Vec<Event> = std::fs::read_to_string(&path)
             .map(|text| {
                 text.lines()
                     .filter_map(|line| serde_json::from_str(line).ok())
                     .collect()
             })
             .unwrap_or_default();
+        trim(&mut events);
         Self {
             path,
             events: Mutex::new(events),
         }
     }
 
-    /// Appends a launch event (in memory + one JSON line on disk).
+    /// Appends a launch event (in memory + on disk), keeping both bounded to
+    /// the newest `MAX_EVENTS`. Within the cap this is a cheap one-line append;
+    /// only when the cap is exceeded do we drop the oldest and rewrite the file
+    /// so it stays in lockstep with memory.
     pub fn record(&self, item: ContentItem) {
         let event = Event { ts: now(), item };
-        if let Ok(line) = serde_json::to_string(&event) {
-            if let Some(dir) = self.path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-            {
-                let _ = writeln!(file, "{line}");
+        let mut events = self.events.lock().unwrap();
+        events.push(event.clone());
+        if events.len() > MAX_EVENTS {
+            trim(&mut events);
+            self.rewrite(&events);
+        } else {
+            self.append(&event);
+        }
+    }
+
+    /// Appends a single event as one JSON line.
+    fn append(&self, event: &Event) {
+        let Ok(line) = serde_json::to_string(event) else {
+            return;
+        };
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    /// Rewrites the whole (already-capped) log, discarding dropped events.
+    fn rewrite(&self, events: &[Event]) {
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut buf = String::new();
+        for event in events {
+            if let Ok(line) = serde_json::to_string(event) {
+                buf.push_str(&line);
+                buf.push('\n');
             }
         }
-        self.events.lock().unwrap().push(event);
+        let _ = std::fs::write(&self.path, buf);
     }
 
     /// The personalized home rows. Empty rows are dropped by the caller.
@@ -85,6 +123,13 @@ impl EventLog {
                 items: recommended_items(&events, now()),
             },
         ]
+    }
+}
+
+/// Drops the oldest events so at most `MAX_EVENTS` (the newest) remain.
+fn trim(events: &mut Vec<Event>) {
+    if events.len() > MAX_EVENTS {
+        events.drain(0..events.len() - MAX_EVENTS);
     }
 }
 
@@ -208,6 +253,27 @@ mod tests {
             .map(|i| i.id)
             .collect();
         assert_eq!(ids[0], "morning");
+    }
+
+    #[test]
+    fn event_log_is_capped_in_memory_and_on_disk() {
+        let dir = std::env::temp_dir().join(format!("tvos-events-{}", std::process::id()));
+        std::env::set_var("TVOS_CONFIG_DIR", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let log = EventLog::load();
+        for n in 0..(MAX_EVENTS + 250) {
+            log.record(ev(&format!("item{n}"), n as u64).item);
+        }
+
+        // Memory is bounded to the newest MAX_EVENTS…
+        assert_eq!(log.events.lock().unwrap().len(), MAX_EVENTS);
+        // …and so is the file the next boot would load.
+        let on_disk = EventLog::load().events.lock().unwrap().len();
+        assert_eq!(on_disk, MAX_EVENTS);
+
+        std::env::remove_var("TVOS_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -42,7 +42,11 @@ body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family: 'Inter Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-feature-settings: 'cv11', 'ss01'; /* nicer single-storey a, stylistic set */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  letter-spacing: -0.01em;
   overflow: hidden;
   cursor: none; /* pointer devices are not part of this UI */
 }
@@ -539,6 +543,14 @@ body {
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
 
+.details-kind {
+  font-size: 13px;
+  letter-spacing: 3px;
+  font-weight: 800;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
 .details-title {
   font-size: 46px;
   font-weight: 800;
@@ -549,7 +561,76 @@ body {
 .details-sub {
   color: var(--text-dim);
   font-size: 16px;
+  margin-bottom: 14px;
+}
+
+.details-credits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 22px;
+  font-size: 15px;
   margin-bottom: 16px;
+}
+
+.details-credit-label {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
+
+.details-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.details-tag {
+  padding: 5px 12px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+}
+
+/* ---- Screenshots gallery ---- */
+
+.shots {
+  margin-top: 36px;
+}
+
+.shots-head {
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+.shots-strip {
+  display: flex;
+  gap: 16px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  scrollbar-width: none;
+}
+
+.shots-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.shot {
+  flex: 0 0 auto;
+  width: 460px;
+  height: 259px; /* 16:9 */
+  object-fit: cover;
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
 }
 
 .details-desc {

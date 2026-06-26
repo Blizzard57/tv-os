@@ -118,7 +118,7 @@ impl Retro {
             for path in extra.split(',').filter(|p| !p.is_empty()) {
                 match std::fs::read_to_string(path) {
                     Ok(text) => catalog.extend(parse_manifest(&text)),
-                    Err(e) => eprintln!("rom source {path}: {e}"),
+                    Err(e) => crate::log_warn!("rom source {path}: {e}"),
                 }
             }
         }

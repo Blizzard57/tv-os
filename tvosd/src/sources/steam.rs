@@ -145,22 +145,131 @@ fn parse_store_meta(appid: &str, json: &str) -> Option<crate::media::Meta> {
             .get("short_description")
             .and_then(|d| d.as_str())
             .filter(|d| !d.is_empty())
+            .map(clean_html),
+        // Release year/date, e.g. "12 Mar, 2020".
+        release_info: data
+            .get("release_date")
+            .and_then(|r| r.get("date"))
+            .and_then(|d| d.as_str())
+            .filter(|d| !d.is_empty())
             .map(String::from),
-        genres: data
-            .get("genres")
-            .and_then(|g| g.as_array())
+        // Metacritic score (the details page shows it as "Metacritic NN").
+        rating: data
+            .get("metacritic")
+            .and_then(|m| m.get("score"))
+            .and_then(|s| s.as_i64())
+            .map(|s| s.to_string()),
+        developer: first_of(data.get("developers")),
+        publisher: first_of(data.get("publishers")),
+        genres: names(data.get("genres")),
+        // Feature categories: Single-player, Co-op, Full controller support…
+        tags: data
+            .get("categories")
+            .and_then(|c| c.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|g| {
-                        g.get("description")
-                            .and_then(|d| d.as_str())
-                            .map(String::from)
-                    })
+                    .filter_map(|c| c.get("description").and_then(|d| d.as_str()))
+                    .filter(|d| !d.is_empty())
+                    .take(6)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // A handful of large screenshots for the gallery.
+        screenshots: data
+            .get("screenshots")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.get("path_full").and_then(|p| p.as_str()))
+                    .take(8)
+                    .map(String::from)
                     .collect()
             })
             .unwrap_or_default(),
         ..Default::default()
     })
+}
+
+/// Steam store text is HTML-ish (entities like `&quot;`, the odd `<br>`).
+/// Strip tags and decode the common entities so it reads as plain prose.
+fn clean_html(s: &str) -> String {
+    let mut stripped = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => stripped.push(c),
+            _ => {}
+        }
+    }
+    decode_entities(&stripped)
+}
+
+/// Decodes the handful of HTML entities Steam descriptions actually use, plus
+/// numeric (`&#39;` / `&#x2026;`) ones.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        if let Some(semi) = after.find(';').filter(|&p| p <= 10) {
+            let decoded = match &after[1..semi] {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                "hellip" => Some('…'),
+                "mdash" => Some('—'),
+                "ndash" => Some('–'),
+                "reg" => Some('®'),
+                "trade" => Some('™'),
+                "copy" => Some('©'),
+                num => num.strip_prefix('#').and_then(|n| {
+                    let cp = match n.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => n.parse::<u32>().ok(),
+                    };
+                    cp.and_then(char::from_u32)
+                }),
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = &after[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// First string of a JSON string-array (developers/publishers), if any.
+fn first_of(array: Option<&Value>) -> Option<String> {
+    array?
+        .as_array()?
+        .iter()
+        .find_map(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// The `description` field of every object in a JSON array (genres/categories).
+fn names(array: Option<&Value>) -> Vec<String> {
+    array
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| g.get("description").and_then(|d| d.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Tests the saved Steam credentials, returning the owned-game count or a
@@ -416,16 +525,42 @@ mod tests {
     fn parses_steam_store_meta() {
         let json = r#"{"620": {"success": true, "data": {
             "name": "Portal 2",
-            "short_description": "The acclaimed sequel.",
+            "short_description": "The &quot;acclaimed&quot; <b>sequel</b>.",
             "background_raw": "https://x/bg.jpg",
-            "genres": [{"description": "Action"}, {"description": "Puzzle"}]
+            "developers": ["Valve"],
+            "publishers": ["Valve"],
+            "release_date": {"coming_soon": false, "date": "18 Apr, 2011"},
+            "metacritic": {"score": 95},
+            "genres": [{"description": "Action"}, {"description": "Puzzle"}],
+            "categories": [{"description": "Single-player"}, {"description": "Co-op"},
+                           {"description": "Full controller support"}],
+            "screenshots": [
+                {"id": 0, "path_full": "https://x/ss0.jpg"},
+                {"id": 1, "path_full": "https://x/ss1.jpg"}
+            ]
         }}}"#;
         let m = parse_store_meta("620", json).unwrap();
         assert_eq!(m.id, "steam:620");
         assert_eq!(m.title, "Portal 2");
-        assert_eq!(m.description.as_deref(), Some("The acclaimed sequel."));
+        assert_eq!(m.description.as_deref(), Some("The \"acclaimed\" sequel."));
         assert_eq!(m.genres, vec!["Action", "Puzzle"]);
+        assert_eq!(m.developer.as_deref(), Some("Valve"));
+        assert_eq!(m.publisher.as_deref(), Some("Valve"));
+        assert_eq!(m.release_info.as_deref(), Some("18 Apr, 2011"));
+        assert_eq!(m.rating.as_deref(), Some("95"));
+        assert_eq!(m.tags, vec!["Single-player", "Co-op", "Full controller support"]);
+        assert_eq!(m.screenshots, vec!["https://x/ss0.jpg", "https://x/ss1.jpg"]);
         assert!(parse_store_meta("620", r#"{"620": {"success": false}}"#).is_none());
+    }
+
+    #[test]
+    fn cleans_html_from_store_text() {
+        assert_eq!(
+            clean_html("Build &amp; battle &mdash; it&#39;s a &quot;classic&quot;<br>now"),
+            "Build & battle — it's a \"classic\"now"
+        );
+        assert_eq!(clean_html("plain text"), "plain text");
+        assert_eq!(clean_html("100% &amp; rising"), "100% & rising");
     }
 
     #[test]

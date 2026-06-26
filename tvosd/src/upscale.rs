@@ -33,6 +33,69 @@ pub struct Profile {
     pub args: Vec<String>,
 }
 
+/// One switchable upscaler option for the player's realtime menu.
+pub struct Preset {
+    pub name: String,
+    pub hint: String,
+    /// ':'-joined absolute shader paths; empty string means "off".
+    pub shaders: String,
+}
+
+/// The named upscaler presets, in menu order: (label, hint, anime?, mode).
+const PRESET_DEFS: [(&str, &str, bool, EnhanceMode); 4] = [
+    ("Anime — Quality", "Anime4K Mode A (HQ)", true, EnhanceMode::Quality),
+    ("Anime — Fast", "Anime4K (light)", true, EnhanceMode::Performance),
+    ("Live Action — Quality", "FSRCNNX x2 16", false, EnhanceMode::Quality),
+    ("Live Action — Fast", "FSRCNNX x2 8", false, EnhanceMode::Performance),
+];
+
+/// Every upscaler the in-player menu can switch to live: "Off" first, then each
+/// preset whose shaders are actually present on disk (so the menu never offers
+/// a chain that would fail).
+pub fn presets() -> Vec<Preset> {
+    let dir = shader_dir();
+    let mut out = vec![Preset {
+        name: "Off".to_string(),
+        hint: "Original — mpv scalers only".to_string(),
+        shaders: String::new(),
+    }];
+    for (name, hint, anime, mode) in PRESET_DEFS {
+        let chain = shader_chain(&dir, mode, anime);
+        if !chain.is_empty() {
+            out.push(Preset {
+                name: name.to_string(),
+                hint: hint.to_string(),
+                shaders: join_paths(&chain),
+            });
+        }
+    }
+    out
+}
+
+/// The preset name the auto-resolver picks for `target` — what the player
+/// starts on and marks active in the menu.
+pub fn active_preset(mode: EnhanceMode, target: &str) -> String {
+    let mode = effective(mode, gpu());
+    if mode == EnhanceMode::Off || source_height(target).is_some_and(|h| h >= 2160) {
+        return "Off".to_string();
+    }
+    let anime = looks_like_anime(target);
+    PRESET_DEFS
+        .iter()
+        .find(|(_, _, a, m)| *a == anime && *m == mode)
+        .map(|(name, ..)| name.to_string())
+        .unwrap_or_else(|| "Off".to_string())
+}
+
+/// Joins shader paths the way mpv's glsl-shaders list expects.
+fn join_paths(chain: &[PathBuf]) -> String {
+    chain
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 pub fn resolve(mode: EnhanceMode, target: &str) -> Profile {
     let mode = effective(mode, gpu());
     if mode == EnhanceMode::Off {
@@ -64,12 +127,7 @@ pub fn resolve(mode: EnhanceMode, target: &str) -> Profile {
 
     let mut args = scaler_args();
     if !chain.is_empty() {
-        let joined = chain
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(":");
-        args.push(format!("--glsl-shaders={joined}"));
+        args.push(format!("--glsl-shaders={}", join_paths(&chain)));
     }
     Profile { name, args }
 }

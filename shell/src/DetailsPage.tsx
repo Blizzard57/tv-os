@@ -42,6 +42,7 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
   const [status, setStatus] = useState<string | null>(null);
 
   const series = (meta?.kind ?? item.kind) === 'series';
+  const isGame = (meta?.kind ?? item.kind) === 'game';
 
   // Load metadata, then decide the opening stage.
   useEffect(() => {
@@ -194,12 +195,41 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
             <img className="details-poster" src={meta?.poster || item.art} alt={title} />
           )}
           <div className="details-info">
+            <div className="details-kind">{(meta?.kind ?? item.kind).toUpperCase()}</div>
             <h1 className="details-title">{title}</h1>
             <div className="details-sub">
-              {[meta?.release_info, meta?.runtime, meta?.rating && `★ ${meta.rating}`, meta?.genres?.slice(0, 3).join(', ')]
+              {[
+                meta?.release_info,
+                meta?.runtime,
+                meta?.rating && (isGame ? `Metacritic ${meta.rating}` : `★ ${meta.rating}`),
+                meta?.genres?.slice(0, 3).join(', '),
+              ]
                 .filter(Boolean)
                 .join('  ·  ')}
             </div>
+            {(meta?.developer || meta?.publisher) && (
+              <div className="details-credits">
+                {meta?.developer && (
+                  <span>
+                    <span className="details-credit-label">Developer</span> {meta.developer}
+                  </span>
+                )}
+                {meta?.publisher && meta.publisher !== meta.developer && (
+                  <span>
+                    <span className="details-credit-label">Publisher</span> {meta.publisher}
+                  </span>
+                )}
+              </div>
+            )}
+            {!!meta?.tags?.length && (
+              <div className="details-tags">
+                {meta.tags.map((t) => (
+                  <span key={t} className="details-tag">
+                    {t}
+                  </span>
+                ))}
+              </div>
+            )}
             {meta?.description && <p className="details-desc">{meta.description}</p>}
             {!meta && <p className="details-desc">Loading…</p>}
           </div>
@@ -279,6 +309,17 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
                     {s.title && <div className="stream-detail">{s.title.split('\n').join('  ')}</div>}
                   </div>
                 </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {!!meta?.screenshots?.length && (
+          <div className="shots">
+            <div className="shots-head">Screenshots</div>
+            <div className="shots-strip">
+              {meta.screenshots.map((src) => (
+                <img key={src} className="shot" src={src} alt="" loading="lazy" />
               ))}
             </div>
           </div>

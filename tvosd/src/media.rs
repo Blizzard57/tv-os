@@ -23,7 +23,19 @@ pub struct Meta {
     pub rating: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Studio that made it (games: developer). Empty for most video.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub developer: Option<String>,
+    /// Who released it (games: publisher).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
     pub genres: Vec<String>,
+    /// Short feature/category tags (games: Single-player, Co-op, Controller…).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Screenshot/preview image URLs — the gallery on the details page.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<String>,
     /// Episodes for a series; empty for movies and games.
     pub episodes: Vec<Episode>,
 }

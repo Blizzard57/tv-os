@@ -34,8 +34,9 @@ impl Source for Videos {
 
     fn launch(&self, item_id: &str) -> Result<(), String> {
         let target = item_id.strip_prefix("video:").unwrap_or_default();
-        let profile = upscale::resolve(settings::STORE.get().enhance, target);
-        launcher::play_video(target, &profile)
+        let mode = settings::STORE.get().enhance;
+        let profile = upscale::resolve(mode, target);
+        launcher::play_video(target, &profile, mode, target)
     }
 }
 

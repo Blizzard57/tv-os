@@ -16,6 +16,7 @@
 mod addons;
 mod install;
 mod launcher;
+mod logging;
 mod media;
 mod model;
 mod recommend;
@@ -45,6 +46,7 @@ type Shared = Arc<App>;
 
 #[tokio::main]
 async fn main() {
+    logging::init();
     let app = Arc::new(App {
         sources: sources::Registry::detect(),
         installs: install::InstallManager::default(),
@@ -74,7 +76,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(LISTEN_ADDR)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {LISTEN_ADDR}: {e}"));
-    println!(
+    log_info!(
         "tvosd listening on http://{LISTEN_ADDR} (ui: {})",
         ui_dir.display()
     );
@@ -198,6 +200,9 @@ async fn post_launch(
     let result = tokio::task::spawn_blocking(move || app.sources.launch(&id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Err(e) = &result {
+        log_error!("launch '{}' failed: {e}", req.id);
+    }
     if result.is_ok() {
         if let (Some(title), Some(kind)) = (req.title, req.kind) {
             recommend::LOG.record(model::ContentItem {
@@ -303,6 +308,9 @@ async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCo
     let result = tokio::task::spawn_blocking(move || sources::stremio::play_stream(&stream))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Err(e) = &result {
+        log_error!("play failed: {e}");
+    }
     if result.is_ok() {
         if let Some(item) = req.item {
             recommend::LOG.record(model::ContentItem {

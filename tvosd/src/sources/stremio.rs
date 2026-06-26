@@ -119,15 +119,17 @@ pub fn streams(kind: &str, id: &str) -> Vec<Stream> {
 
 /// Launches a stream the user (or the auto-picker) chose.
 pub fn play_stream(stream: &Stream) -> Result<(), String> {
+    let mode = settings::STORE.get().enhance;
+    let hint = describe(stream);
     match stream.kind {
         StreamKind::Direct | StreamKind::Youtube => {
-            let profile = upscale::resolve(settings::STORE.get().enhance, &describe(stream));
-            launcher::play_video(&stream.url, &profile)
+            let profile = upscale::resolve(mode, &hint);
+            launcher::play_video(&stream.url, &profile, mode, &hint)
         }
         StreamKind::External => launcher::open_external(&stream.url),
         StreamKind::Torrent => {
-            let profile = upscale::resolve(settings::STORE.get().enhance, &describe(stream));
-            launcher::play_torrent(&stream.url, stream.file_idx, &profile)
+            let profile = upscale::resolve(mode, &hint);
+            launcher::play_torrent(&stream.url, stream.file_idx, &profile, mode, &hint)
         }
     }
 }
@@ -146,7 +148,7 @@ pub fn play_meta(kind: &str, id: &str) -> Result<(), String> {
         .or_else(|| found.iter().find(|s| s.kind == StreamKind::Torrent))
         .or_else(|| found.first())
         .ok_or("No playable stream found — install a stream addon that carries this title")?;
-    println!(
+    crate::log_info!(
         "auto-pick: [{:?}] {}",
         pick.kind,
         pick.name.replace('\n', " ")
@@ -325,6 +327,7 @@ fn parse_meta(json: &str) -> Option<Meta> {
         runtime: str_of("runtime"),
         genres,
         episodes,
+        ..Default::default()
     })
 }
 

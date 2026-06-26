@@ -1,18 +1,26 @@
 //! Process helpers for launching content.
 //!
-//! Video plays in mpv, but configured to look and behave like a real player:
-//! we point mpv at a private config dir (MPV_HOME) that carries the uosc UI +
-//! thumbfast thumbnails (installed by system/get-player.sh) and a freshly
-//! written mpv.conf holding the resolved Enhance shader chain. Because the
-//! config travels via MPV_HOME, *every* mpv launch picks it up — including the
-//! one webtorrent-cli spawns for torrents — so torrents get the same player
-//! and upscaler, with seeking, via webtorrent's built-in HTTP server.
+//! Video plays in libmpv — the same engine Stremio uses — skinned with uosc for
+//! a modern, minimal, controller-friendly UI. We point mpv at a private config
+//! dir (MPV_HOME) that tvosd fully provisions from its bundled, editable player
+//! (see tvosd/player/): the uosc UI, thumbfast thumbnails, our controller +
+//! upscaler scripts, an input map, and a freshly written mpv.conf holding the
+//! resolved Enhance shader chain. Because everything travels via MPV_HOME, *any*
+//! mpv launch picks it up — including the one webtorrent-cli spawns for torrents
+//! — so torrents get the same player, UI, and realtime upscaler too.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
+use include_dir::{include_dir, Dir};
+
+use crate::settings::EnhanceMode;
 use crate::upscale::Profile;
+
+/// The bundled player (uosc + thumbfast + our controller/upscaler scripts and
+/// config), embedded so the daemon always provisions a complete, working uosc.
+static PLAYER_FILES: Dir = include_dir!("$CARGO_MANIFEST_DIR/player");
 
 /// The currently playing player process, if any. Starting a new video stops
 /// the previous one so two windows never fight over the screen.
@@ -34,6 +42,8 @@ slang=en,eng
 alang=en,eng
 sub-auto=fuzzy
 sub-font-size=42
+# Clean, widely-installed UI/subtitle font (uosc text follows osd-font).
+osd-font=Noto Sans
 volume=100
 volume-max=130
 # Smooth streaming of remote sources.
@@ -45,18 +55,23 @@ network-timeout=60
 ytdl-format=bestvideo[height<=?2160]+bestaudio/best
 ";
 
-pub fn play_video(target: &str, profile: &Profile) -> Result<(), String> {
-    let home = prepare_mpv_home(profile);
+pub fn play_video(
+    target: &str,
+    profile: &Profile,
+    mode: EnhanceMode,
+    hint: &str,
+) -> Result<(), String> {
+    let home = prepare_mpv_home(profile, mode, hint);
     let mut player = PLAYER.lock().unwrap();
     stop(&mut player);
 
-    println!("playing [{}] {target}", profile.name);
+    crate::log_info!("playing [{}] mpv {target}", profile.name);
     let child = Command::new("mpv")
         .env("MPV_HOME", &home)
         .args(["--no-terminal", target])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(play_log(&home))
+        .stdout(crate::logging::child_output())
+        .stderr(crate::logging::child_output())
         .spawn()
         .map_err(|e| format!("could not start mpv: {e}"))?;
     *player = Some(child);
@@ -76,12 +91,18 @@ pub fn open_external(url: &str) -> Result<(), String> {
 
 /// Streams a torrent magnet in mpv (with the upscaler + UI) via webtorrent-cli's
 /// `--mpv` mode, which serves the torrent over local HTTP so seeking works.
-pub fn play_torrent(magnet: &str, file_idx: Option<i64>, profile: &Profile) -> Result<(), String> {
+pub fn play_torrent(
+    magnet: &str,
+    file_idx: Option<i64>,
+    profile: &Profile,
+    mode: EnhanceMode,
+    hint: &str,
+) -> Result<(), String> {
     let webtorrent = resolve_webtorrent().ok_or(
         "Torrent playback needs webtorrent-cli. Install it with `npm install -g webtorrent-cli`, \
          or configure the addon with a debrid service (e.g. RealDebrid) for direct streams.",
     )?;
-    let home = prepare_mpv_home(profile);
+    let home = prepare_mpv_home(profile, mode, hint);
     let mut player = PLAYER.lock().unwrap();
     stop(&mut player);
 
@@ -94,45 +115,125 @@ pub fn play_torrent(magnet: &str, file_idx: Option<i64>, profile: &Profile) -> R
     // `webtorrent <magnet> --mpv` (download is the default command). With a
     // file index, --select streams that file; without it webtorrent picks the
     // largest playable file automatically.
+    //
+    // --keep-seeding is essential: by default webtorrent-cli QUITS as soon as it
+    // considers the download "done", which closes the local HTTP server out from
+    // under mpv. mpv, mid-read, then aborts with "http: Immediate exit requested"
+    // and quits — the exact symptom of "streams don't launch". It bit hardest
+    // when partial data was already cached (the file finishes seconds in) or the
+    // file was small. Keeping it seeding leaves the server up for the whole
+    // playback; webtorrent still exits when mpv itself closes.
     let mut cmd = Command::new(&webtorrent);
-    cmd.arg(magnet).arg("--mpv").arg("--out").arg(&cache);
+    cmd.arg(magnet)
+        .arg("--mpv")
+        .arg("--keep-seeding")
+        // --quiet drops webtorrent's once-a-second full-screen progress redraw,
+        // which otherwise floods the shared log file (mpv's own log-file keeps
+        // the rich playback diagnostics, and webtorrent still prints errors).
+        .arg("--quiet")
+        .arg("--out")
+        .arg(&cache);
     if let Some(i) = file_idx {
         cmd.args(["--select", &i.to_string()]);
     }
     // webtorrent spawns mpv; MPV_HOME makes that mpv use our UI + shaders.
-    println!("playing [torrent {}] via {webtorrent}", profile.name);
+    // Both webtorrent's and mpv's output go to the persistent log so a failed
+    // torrent (no peers, no space, missing mpv) leaves a visible reason — the
+    // old code discarded webtorrent's stdout entirely, which is exactly why
+    // failures looked like "nothing happened".
+    crate::log_info!(
+        "playing [torrent {}] via {webtorrent}: {magnet}",
+        profile.name
+    );
     let child = cmd
         .env("MPV_HOME", &home)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(play_log(&home))
+        .stdout(crate::logging::child_output())
+        .stderr(crate::logging::child_output())
         .spawn()
         .map_err(|e| format!("could not start torrent stream: {e}"))?;
     *player = Some(child);
     Ok(())
 }
 
-/// Writes mpv.conf for this playback into our MPV_HOME and returns it. Keeps
-/// the always-on Enhance A/B toggle script in place; uses uosc if installed
-/// (get-player.sh), else mpv's built-in OSC so there's always a seek bar.
-fn prepare_mpv_home(profile: &Profile) -> PathBuf {
+/// Sets up MPV_HOME for this playback and returns it: provisions the bundled
+/// player, writes mpv.conf with the resolved shader chain, and writes the
+/// upscaler menu's preset list. Idempotent.
+fn prepare_mpv_home(profile: &Profile, mode: EnhanceMode, hint: &str) -> PathBuf {
     let home = mpv_home();
-    let scripts = home.join("scripts");
-    let _ = std::fs::create_dir_all(&scripts);
-    let _ = std::fs::write(
-        scripts.join("enhance-toggle.lua"),
-        include_str!("../data/enhance-toggle.lua"),
-    );
+    provision_player(&home);
+    write_mpv_conf(&home, profile);
+    write_upscalers(&home, mode, hint);
+    home
+}
 
-    let has_uosc = scripts.join("uosc/main.lua").exists();
+/// Player bundle version. Bump it to ship new defaults: on the next launch the
+/// bundled files are rewritten *once*. Otherwise the daemon never touches them
+/// again, so anything you edit under MPV_HOME stays edited (no rebuild needed),
+/// and deleting a file restores its shipped default on the next launch.
+const PLAYER_VERSION: &str = "3";
+
+/// Installs the bundled player into MPV_HOME so uosc is *always* the UI. The
+/// entire player tree (uosc + its lib/elements/intl, thumbfast, our scripts and
+/// config) is extracted. Each file is (re)written only when missing or when
+/// PLAYER_VERSION changes, which makes MPV_HOME the live, editable surface: edit
+/// script-opts/uosc.conf, input.conf, scripts/*.lua there and they take effect
+/// on the next play; delete one to restore its shipped default.
+fn provision_player(home: &Path) {
+    let _ = std::fs::create_dir_all(home);
+    let stamp = home.join(".player-version");
+    let refresh = std::fs::read_to_string(&stamp).unwrap_or_default().trim() != PLAYER_VERSION;
+
+    extract_dir(&PLAYER_FILES, home, refresh);
+
+    // A user override that we create once and then never touch — put personal
+    // mpv tweaks here; the generated mpv.conf includes it last so they win.
+    let user_conf = home.join("user.conf");
+    if !user_conf.exists() {
+        let _ = std::fs::write(
+            &user_conf,
+            "# TV OS — your personal mpv overrides. Never overwritten by tvosd.\n\
+             # Anything here wins over the generated mpv.conf. e.g.:\n\
+             #   osd-font=Inter\n#   volume=80\n",
+        );
+    }
+
+    if refresh {
+        // Superseded by upscaler.lua / the complete uosc — clear stale files.
+        let _ = std::fs::remove_file(home.join("scripts/enhance-toggle.lua"));
+        let _ = std::fs::remove_file(home.join("enhance-toggle.lua"));
+        let _ = std::fs::remove_file(home.join(".uosc-version")); // old stamp name
+        let _ = std::fs::write(&stamp, PLAYER_VERSION);
+    }
+}
+
+/// Recursively writes an embedded dir under `dest`, creating parents. A file is
+/// written when `refresh` is set or it doesn't exist yet (so user edits stick).
+fn extract_dir(dir: &Dir, dest: &Path, refresh: bool) {
+    for file in dir.files() {
+        let path = dest.join(file.path());
+        if refresh || !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, file.contents());
+        }
+    }
+    for sub in dir.dirs() {
+        extract_dir(sub, dest, refresh);
+    }
+}
+
+/// Writes the per-playback mpv.conf: base 10-foot settings, uosc as the UI,
+/// gamepad input on, a real log file, and the resolved Enhance shader chain.
+fn write_mpv_conf(home: &Path, profile: &Profile) {
     let mut conf = String::from(BASE_MPV_CONF);
-    conf.push_str(if has_uosc { "osc=no\n" } else { "osc=yes\n" });
+    conf.push_str("osc=no\n"); // uosc is the UI
+    conf.push_str("osd-bar=no\n");
+    conf.push_str("input-gamepad=yes\n"); // controller.lua maps the buttons
     // A real log file (mpv writes nothing to a suppressed terminal) so the
     // actual reason a stream fails is always visible.
-    conf.push_str(&format!(
-        "log-file=\"{}\"\n",
-        home.join("mpv.log").display()
-    ));
+    conf.push_str(&format!("log-file=\"{}\"\n", home.join("mpv.log").display()));
     // Turn the resolved profile's "--key=value" mpv flags into config lines so
     // they apply to webtorrent's mpv too (which we can't pass args to).
     for arg in &profile.args {
@@ -140,8 +241,27 @@ fn prepare_mpv_home(profile: &Profile) -> PathBuf {
             conf.push_str(&format!("{key}=\"{value}\"\n"));
         }
     }
+    // User overrides win — included last so they override anything above.
+    conf.push_str(&format!("include=\"{}\"\n", home.join("user.conf").display()));
     let _ = std::fs::write(home.join("mpv.conf"), conf);
-    home
+}
+
+/// Writes the preset list the in-player upscaler menu reads, marking the one the
+/// resolver chose as active. Switching between them is live (no reload).
+fn write_upscalers(home: &Path, mode: EnhanceMode, hint: &str) {
+    let presets = crate::upscale::presets();
+    let mut active = crate::upscale::active_preset(mode, hint);
+    if !presets.iter().any(|p| p.name == active) {
+        active = "Off".to_string();
+    }
+    let json = serde_json::json!({
+        "active": active,
+        "presets": presets
+            .iter()
+            .map(|p| serde_json::json!({ "name": p.name, "hint": p.hint, "shaders": p.shaders }))
+            .collect::<Vec<_>>(),
+    });
+    let _ = std::fs::write(home.join("upscalers.json"), json.to_string());
 }
 
 fn mpv_home() -> PathBuf {
@@ -157,13 +277,6 @@ fn torrent_cache() -> PathBuf {
         return PathBuf::from(dir);
     }
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/tvos/torrents")
-}
-
-/// Truncates and opens the per-playback log (player stderr) for diagnosis.
-fn play_log(home: &std::path::Path) -> Stdio {
-    std::fs::File::create(home.join("play.log"))
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null())
 }
 
 /// Finds the webtorrent binary on PATH, or in the usual npm-global locations
@@ -233,7 +346,7 @@ mod tests {
     use crate::upscale::Profile;
 
     #[test]
-    fn mpv_conf_has_ui_and_shaders() {
+    fn provisions_player_and_writes_conf() {
         let dir = std::env::temp_dir().join(format!("tvos-mpvhome-{}", std::process::id()));
         std::env::set_var("TVOS_MPV_HOME", &dir);
         let profile = Profile {
@@ -243,12 +356,26 @@ mod tests {
                 "--glsl-shaders=/a.glsl:/b.glsl".into(),
             ],
         };
-        prepare_mpv_home(&profile);
+        prepare_mpv_home(&profile, EnhanceMode::Off, "Movie.1080p.mkv");
+
         let conf = std::fs::read_to_string(dir.join("mpv.conf")).unwrap();
         assert!(conf.contains("fullscreen=yes"));
-        assert!(conf.contains("osc=")); // a seek bar is always configured
+        assert!(conf.contains("osc=no")); // uosc is the UI
+        assert!(conf.contains("input-gamepad=yes")); // controller support
         assert!(conf.contains("glsl-shaders=\"/a.glsl:/b.glsl\""));
-        assert!(dir.join("scripts/enhance-toggle.lua").exists());
+
+        // The bundled player is installed and is the default.
+        assert!(dir.join("scripts/uosc/main.lua").exists());
+        assert!(dir.join("scripts/upscaler.lua").exists());
+        assert!(dir.join("scripts/controller.lua").exists());
+        assert!(dir.join("input.conf").exists());
+        assert!(dir.join("fonts/uosc_icons.otf").exists());
+
+        // The upscaler menu has its preset list, with a valid active preset.
+        let upscalers = std::fs::read_to_string(dir.join("upscalers.json")).unwrap();
+        assert!(upscalers.contains("\"active\":\"Off\""));
+        assert!(upscalers.contains("\"presets\""));
+
         std::env::remove_var("TVOS_MPV_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }

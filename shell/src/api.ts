@@ -41,7 +41,11 @@ export interface Meta {
   release_info?: string;
   rating?: string;
   runtime?: string;
+  developer?: string;
+  publisher?: string;
   genres: string[];
+  tags?: string[];
+  screenshots?: string[];
   episodes: Episode[];
 }
 
