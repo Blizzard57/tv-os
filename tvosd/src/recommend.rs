@@ -1,9 +1,12 @@
 //! Local recommender — no cloud, no accounts. Every launch is appended to an
-//! event log (~/.config/tvos/events.jsonl); the home screen gets two ranked
-//! rows out of it:
+//! event log (~/.config/tvos/events.jsonl); the home screen gets its
+//! "continue" rows out of it:
 //!
-//!   Continue             — most recent distinct items, newest first; mixes
-//!                          games and video (the cross-domain row from PLAN.md)
+//!   Continue Watching    — most recent distinct movies/shows/games, newest
+//!                          first (the cross-domain row from PLAN.md)
+//!   Continue on YouTube  — the same, but for YouTube clips, kept in their own
+//!                          row so a binge of shorts doesn't bury the film or
+//!                          game you were half-way through
 //!   Recommended for You  — frequency × recency decay (half-life 14 days),
 //!                          boosted when an item is usually used in the same
 //!                          part of day as right now
@@ -22,8 +25,6 @@ use crate::model::{ContentItem, Row};
 use crate::settings::config_dir;
 
 const ROW_SIZE: usize = 12;
-const HALF_LIFE_DAYS: f32 = 14.0;
-const SAME_DAYPART_BOOST: f32 = 1.5;
 
 /// Cap on how many events we keep — in memory and on disk. The daemon runs for
 /// weeks on a TV box and every launch appended an event forever, so both the
@@ -110,19 +111,30 @@ impl EventLog {
         let _ = std::fs::write(&self.path, buf);
     }
 
-    /// The personalized home rows. Empty rows are dropped by the caller.
+    /// The "Continue" home rows — most recent distinct items, newest first,
+    /// split so YouTube gets its own row (see [`continue_rows`]). Actual
+    /// *recommendations* of new titles come from the TMDB recommender (see
+    /// sources::tmdb::for_you), seeded by [`recent_items`].
     pub fn rows(&self) -> Vec<Row> {
-        let events = self.events.lock().unwrap().clone();
-        vec![
-            Row {
-                title: "Continue".to_string(),
-                items: continue_items(&events),
-            },
-            Row {
-                title: "Recommended for You".to_string(),
-                items: recommended_items(&events, now()),
-            },
-        ]
+        let events = self.events.lock().unwrap();
+        continue_rows(&events)
+    }
+
+    /// The newest distinct items (newest first), used to seed recommendations.
+    pub fn recent_items(&self, n: usize) -> Vec<ContentItem> {
+        let events = self.events.lock().unwrap();
+        let mut seen = Vec::new();
+        let mut items = Vec::new();
+        for event in events.iter().rev() {
+            if !seen.contains(&event.item.id) {
+                seen.push(event.item.id.clone());
+                items.push(event.item.clone());
+            }
+            if items.len() == n {
+                break;
+            }
+        }
+        items
     }
 }
 
@@ -133,56 +145,49 @@ fn trim(events: &mut Vec<Event>) {
     }
 }
 
-/// Most recent distinct items, newest first.
-fn continue_items(events: &[Event]) -> Vec<ContentItem> {
+/// The Continue rows: most recent distinct items, newest first, with YouTube
+/// clips split into their own row so they don't crowd out the movie, show or
+/// game you were part-way through. Empty rows are simply omitted.
+fn continue_rows(events: &[Event]) -> Vec<Row> {
     let mut seen = Vec::new();
-    let mut items = Vec::new();
+    let mut main: Vec<ContentItem> = Vec::new();
+    let mut youtube: Vec<ContentItem> = Vec::new();
     for event in events.iter().rev() {
-        if !seen.contains(&event.item.id) {
-            seen.push(event.item.id.clone());
-            items.push(event.item.clone());
+        if seen.contains(&event.item.id) {
+            continue;
         }
-        if items.len() == ROW_SIZE {
+        seen.push(event.item.id.clone());
+        let bucket = if is_youtube(&event.item) {
+            &mut youtube
+        } else {
+            &mut main
+        };
+        if bucket.len() < ROW_SIZE {
+            bucket.push(event.item.clone());
+        }
+        if main.len() >= ROW_SIZE && youtube.len() >= ROW_SIZE {
             break;
         }
     }
-    items
-}
-
-/// Frequency × recency decay × daypart affinity, excluding the single most
-/// recent item (it leads the Continue row already).
-fn recommended_items(events: &[Event], now: u64) -> Vec<ContentItem> {
-    let skip = events.last().map(|e| e.item.id.clone());
-    let mut scored: Vec<(f32, ContentItem)> = Vec::new();
-    for event in events {
-        if Some(&event.item.id) == skip.as_ref() {
-            continue;
-        }
-        let age_days = now.saturating_sub(event.ts) as f32 / 86_400.0;
-        let mut weight = 0.5f32.powf(age_days / HALF_LIFE_DAYS);
-        if daypart(event.ts) == daypart(now) {
-            weight *= SAME_DAYPART_BOOST;
-        }
-        match scored.iter_mut().find(|(_, item)| item.id == event.item.id) {
-            Some((score, item)) => {
-                *score += weight;
-                *item = event.item.clone(); // keep the freshest metadata
-            }
-            None => scored.push((weight, event.item.clone())),
-        }
+    let mut rows = Vec::new();
+    if !main.is_empty() {
+        rows.push(Row {
+            title: "Continue Watching".to_string(),
+            items: main,
+        });
     }
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    scored
-        .into_iter()
-        .take(ROW_SIZE)
-        .map(|(_, item)| item)
-        .collect()
+    if !youtube.is_empty() {
+        rows.push(Row {
+            title: "Continue on YouTube".to_string(),
+            items: youtube,
+        });
+    }
+    rows
 }
 
-/// Six-hour buckets of the (UTC) day — only used relatively, so the missing
-/// timezone offset cancels out.
-fn daypart(ts: u64) -> u64 {
-    (ts / 3600) % 24 / 6
+/// YouTube items own the `yt:` id prefix (see sources::youtube).
+fn is_youtube(item: &ContentItem) -> bool {
+    item.id.starts_with("yt:")
 }
 
 fn now() -> u64 {
@@ -210,49 +215,43 @@ mod tests {
         }
     }
 
-    const DAY: u64 = 86_400;
+    fn row_ids(rows: &[Row], title: &str) -> Vec<String> {
+        rows.iter()
+            .find(|r| r.title == title)
+            .map(|r| r.items.iter().map(|i| i.id.clone()).collect())
+            .unwrap_or_default()
+    }
 
     #[test]
     fn continue_is_recent_distinct_newest_first() {
         let events = vec![ev("a", 1), ev("b", 2), ev("a", 3), ev("c", 4)];
-        let ids: Vec<String> = continue_items(&events).into_iter().map(|i| i.id).collect();
-        assert_eq!(ids, ["c", "a", "b"]);
+        let rows = continue_rows(&events);
+        assert_eq!(row_ids(&rows, "Continue Watching"), ["c", "a", "b"]);
     }
 
     #[test]
-    fn frequency_beats_a_single_old_event() {
-        let now = 100 * DAY;
-        // "often" launched 3 times this week; "once" a month ago; "latest" is
-        // the most recent event and therefore excluded.
+    fn continue_splits_youtube_into_its_own_row() {
         let events = vec![
-            ev("once", now - 30 * DAY),
-            ev("often", now - 6 * DAY),
-            ev("often", now - 4 * DAY),
-            ev("often", now - 2 * DAY),
-            ev("latest", now - 1),
+            ev("strm:movie:tt1", 1),
+            ev("yt:aaa", 2),
+            ev("steam:620", 3),
+            ev("yt:bbb", 4),
         ];
-        let ids: Vec<String> = recommended_items(&events, now)
-            .into_iter()
-            .map(|i| i.id)
-            .collect();
-        assert_eq!(ids, ["often", "once"]);
+        let rows = continue_rows(&events);
+        // YouTube clips never appear in the main Continue row…
+        assert_eq!(
+            row_ids(&rows, "Continue Watching"),
+            ["steam:620", "strm:movie:tt1"]
+        );
+        // …they get their own row, newest first.
+        assert_eq!(row_ids(&rows, "Continue on YouTube"), ["yt:bbb", "yt:aaa"]);
     }
 
     #[test]
-    fn same_daypart_wins_over_other_daypart() {
-        let now = 100 * DAY; // daypart 0
-        let same = now - DAY; // same daypart, yesterday
-        let other = now - DAY + 12 * 3600; // 12h later = daypart 2
-        let events = vec![
-            ev("evening", other),
-            ev("morning", same),
-            ev("latest", now - 1),
-        ];
-        let ids: Vec<String> = recommended_items(&events, now)
-            .into_iter()
-            .map(|i| i.id)
-            .collect();
-        assert_eq!(ids[0], "morning");
+    fn continue_omits_empty_rows() {
+        let rows = continue_rows(&[ev("yt:only", 1)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Continue on YouTube");
     }
 
     #[test]
@@ -274,15 +273,5 @@ mod tests {
 
         std::env::remove_var("TVOS_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn most_recent_item_is_left_to_continue_row() {
-        let events = vec![ev("a", 1), ev("b", 2)];
-        let ids: Vec<String> = recommended_items(&events, 100)
-            .into_iter()
-            .map(|i| i.id)
-            .collect();
-        assert_eq!(ids, ["a"]); // "b" is the most recent → excluded
     }
 }

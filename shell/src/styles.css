@@ -10,31 +10,54 @@
   box-sizing: border-box;
 }
 
+/* Form controls don't inherit fonts by default — without this, buttons and
+   inputs silently render in the browser's system font instead of Inter. */
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
 :root {
   color-scheme: dark;
-  --bg: #0b0d12;
-  --text: #f2f4f8;
-  --text-dim: #8b93a3;
-  --accent: #4f8cff;
-  --surface: #1a1e28;
-  --surface-2: #232936;
-  --overlay: rgba(20, 24, 33, 0.92);
-  --overlay-border: rgba(255, 255, 255, 0.12);
+  /* Near-black with a violet undertone; every neutral leans the same way so
+     the purple accent feels native, not painted on. */
+  --bg: #0b0a12;
+  --text: #f4f3f8;
+  --text-dim: #928fa6;
+  --accent: #8b5cf6;
+  --accent-glow: rgba(139, 92, 246, 0.35);
+  --surface: #17151f;
+  --surface-2: #23202f;
+  --overlay: rgba(23, 21, 31, 0.72);
+  --overlay-border: rgba(244, 243, 248, 0.1);
+  --panel: rgba(11, 10, 18, 0.88);
+  --scrim: rgba(9, 8, 14, 0.93);
   --ambient-filter: blur(60px) brightness(0.35) saturate(1.2);
-  --card-radius: 12px;
+  --card-radius: 14px;
+  /* Sidebar rail wash + display-title shadow — both must invert with the
+     theme (a hardcoded dark gradient smudges a light background). */
+  --rail: linear-gradient(to right, rgba(0, 0, 0, 0.35), transparent);
+  --title-shadow: 0 2px 24px rgba(0, 0, 0, 0.25);
 }
 
 [data-theme='light'] {
   color-scheme: light;
-  --bg: #f3f4f7;
-  --text: #15181e;
-  --text-dim: #5b6372;
-  --accent: #2f6fe4;
-  --surface: #e3e6ec;
-  --surface-2: #d3d8e1;
-  --overlay: rgba(255, 255, 255, 0.93);
-  --overlay-border: rgba(0, 0, 0, 0.12);
+  --bg: #f6f5fa;
+  --text: #17151f;
+  --text-dim: #5f5b70;
+  --accent: #7c3aed; /* deeper violet holds contrast on light */
+  --accent-glow: rgba(124, 58, 237, 0.28);
+  --surface: #e9e7f1;
+  --surface-2: #dcd8e9;
+  --overlay: rgba(255, 255, 255, 0.8);
+  --overlay-border: rgba(23, 21, 31, 0.12);
+  --panel: rgba(246, 245, 250, 0.9);
+  --scrim: rgba(240, 238, 247, 0.94);
   --ambient-filter: blur(70px) brightness(1.45) saturate(0.9) opacity(0.45);
+  --rail: linear-gradient(to right, rgba(23, 21, 31, 0.07), transparent);
+  --title-shadow: none;
 }
 
 html,
@@ -42,13 +65,34 @@ body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: 'Inter Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  font-feature-settings: 'cv11', 'ss01'; /* nicer single-storey a, stylistic set */
+  /* One typeface everywhere: bundled Inter as static weight files (the
+     variable font renders heavy display weights badly on Linux Chromium),
+     default letterforms, so every install looks identical. */
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.011em; /* Inter's recommended tracking at UI sizes */
   overflow: hidden;
   cursor: none; /* pointer devices are not part of this UI */
+}
+
+/* Display titles: Bold (700) from a real static file — never a synthesized
+   or interpolated weight — with slightly tighter tracking. */
+.hero-title,
+.details-title,
+.settings-head h1,
+.loading-title,
+.section-page-head h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+/* Anything numeric that updates in place must not wobble. */
+.status-clock,
+.download-pct,
+.ep-num,
+.loading-msg {
+  font-variant-numeric: tabular-nums;
 }
 
 .app {
@@ -56,6 +100,22 @@ body {
   display: flex;
   flex-direction: column;
   position: relative;
+  /* The ambient art bleeds past the edges by design — clip it so it can
+     never make the document scrollable (a scrolled page cropped the hero). */
+  overflow: hidden;
+}
+
+/* A 10-foot UI never shows scrollbars — position is expressed by focus. */
+.details,
+.settings-scrim,
+.search-scrim {
+  scrollbar-width: none;
+}
+
+.details::-webkit-scrollbar,
+.settings-scrim::-webkit-scrollbar,
+.search-scrim::-webkit-scrollbar {
+  display: none;
 }
 
 /* Blurred artwork of the focused item, washing the whole screen. */
@@ -77,8 +137,17 @@ body {
 .hero {
   position: relative;
   z-index: 1;
-  padding: 56px 72px 24px;
-  min-height: 220px;
+  padding: 24px 48px 18px 104px; /* left: room for the sidebar rail */
+  min-height: 286px;
+  display: flex;
+  align-items: flex-start;
+  gap: 44px;
+}
+
+.hero-text {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 1100px;
 }
 
 .hero-kind {
@@ -89,18 +158,76 @@ body {
 }
 
 .hero-title {
-  font-size: 52px;
-  font-weight: 800;
-  margin: 8px 0 12px;
-  text-shadow: 0 2px 24px rgba(0, 0, 0, 0.25);
-  white-space: nowrap;
+  /* Fluid: full 52px on a TV, stepping down in a small window so the title
+     is always fully visible (it wraps to two lines before it truncates). */
+  font-size: clamp(34px, 3.2vw, 52px);
+  font-weight: 700;
+  line-height: 1.08;
+  margin: 8px 0 10px;
+  text-shadow: var(--title-shadow);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.hero-sub {
+  color: var(--text-dim);
+  font-size: 16px;
+  margin-bottom: 12px;
+}
+
+.hero-desc {
+  font-size: 17px;
+  line-height: 1.5;
+  color: var(--text);
+  margin-bottom: 14px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .hero-hint {
   color: var(--text-dim);
-  font-size: 18px;
+  font-size: 16px;
+}
+
+/* The highlighted preview images for the focused item; margin-top keeps
+   them clear of the clock in the corner. */
+.hero-images {
+  display: flex;
+  gap: 12px;
+  flex-shrink: 0;
+  max-width: 50vw;
+  margin-top: 40px;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+/* Short window (the app is often used windowed): compact hero so the rows
+   keep enough room and nothing ever crops. */
+@media (max-height: 880px) {
+  .hero {
+    min-height: 236px;
+    padding-top: 16px;
+  }
+
+  .hero-shot {
+    height: 168px;
+  }
+
+  .hero-desc {
+    -webkit-line-clamp: 2;
+  }
+}
+
+.hero-shot {
+  height: 200px;
+  border-radius: 12px;
+  object-fit: cover;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  animation: fade-in 0.3s ease;
 }
 
 .key {
@@ -116,7 +243,7 @@ body {
   z-index: 1;
   flex: 1;
   overflow: hidden;
-  padding: 12px 72px;
+  padding: 12px 48px 24px 104px; /* left: clear of the sidebar rail */
   display: flex;
   flex-direction: column;
   gap: 28px;
@@ -132,38 +259,168 @@ body {
 }
 
 .row-title {
-  font-size: 20px;
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
   margin-bottom: 14px;
   color: var(--text-dim);
+  transition: color 0.25s ease;
 }
 
 .row-active .row-title {
   color: var(--text);
 }
 
-.row-strip {
+/* Sections wrap instead of scrolling sideways: a grid of N cards per line
+   (posters: 8, wide video thumbs: 5), at most 3 lines + a "Show all" tile.
+   Padding gives the focused card's scale room so nothing ever crops. */
+.row-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 20px 18px;
+  padding: 10px 8px;
+  margin: -10px -8px;
+}
+
+.row-grid-wide {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+/* A video inside a poster row: 16:9 thumb letterboxed in the poster cell,
+   caption beneath — the row's card edges stay perfectly aligned. */
+.card-letterbox {
   display: flex;
-  gap: 18px;
-  transition: transform 0.25s ease;
-  will-change: transform;
+  flex-direction: column;
+  justify-content: center;
+  background: linear-gradient(165deg, var(--surface-2), var(--surface));
+}
+
+.card-letterbox .card-art {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
+.card-letterbox .card-caption {
+  position: static;
+  background: none;
+  color: var(--text);
+  padding: 10px 10px 0;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.row-count {
+  margin-left: 10px;
+  padding: 1px 9px;
+  border: 1px solid var(--overlay-border);
+  border-radius: 10px;
+  font-size: 11px;
+  letter-spacing: 0;
+  color: var(--text-dim);
+  background: var(--surface);
 }
 
 .card {
   position: relative;
-  flex: 0 0 196px;
-  height: 280px;
+  aspect-ratio: 2 / 3;
   border-radius: var(--card-radius);
   overflow: hidden;
   background: var(--surface);
   transition: transform 0.18s ease, box-shadow 0.18s ease;
   outline: 3px solid transparent;
+  cursor: pointer;
+}
+
+/* Wide 16:9 card for videos — the thumbnail is shown uncropped-ish, the
+   way the content is meant to be read. */
+.card-wide {
+  aspect-ratio: 16 / 9;
+}
+
+.card-caption {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 22px 10px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: #fff;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.85));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The "Show all N" tile at the end of an overflowing section. */
+.expand-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: linear-gradient(160deg, var(--surface-2), var(--surface));
+  color: var(--text-dim);
+}
+
+.expand-count {
+  font-size: 30px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.expand-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* ---- Full-section page ("Show all") ---- */
+
+.section-page {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: var(--bg);
+  overflow-y: auto;
+  padding: 5vh 4.5vw 10vh;
+  animation: fade-in 0.2s ease;
+  scrollbar-width: none;
+}
+
+.section-page::-webkit-scrollbar {
+  display: none;
+}
+
+.section-page-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 26px;
+}
+
+.section-page-head h1 {
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: -0.022em;
+}
+
+.section-page-back {
+  margin-left: auto;
+}
+
+.section-page-grid .card {
+  scroll-margin: 90px 0;
 }
 
 .card-focused {
-  transform: scale(1.08);
+  transform: scale(1.05);
   outline-color: var(--accent);
-  box-shadow: 0 8px 40px rgba(79, 140, 255, 0.35);
+  box-shadow: 0 8px 40px var(--accent-glow);
 }
 
 .card-art {
@@ -206,6 +463,14 @@ body {
   color: var(--text);
 }
 
+/* To-buy recommendations: accent text on glass, distinct from OWNED (solid
+   accent) and INSTALLED (neutral glass). */
+.card-badge-buy {
+  background: var(--overlay);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
 .downloads {
   position: fixed;
   right: 32px;
@@ -217,6 +482,7 @@ body {
   border-radius: 12px;
   padding: 16px 18px;
   animation: fade-in 0.2s ease;
+  backdrop-filter: blur(16px);
 }
 
 .downloads-title {
@@ -269,13 +535,96 @@ body {
   background: #d4534f;
 }
 
-.status-chips {
+/* ---- TV sidebar: collapsed icon rail on the left, part of the d-pad grid.
+   Press ◀ at the first column to focus it — it expands to icons + labels
+   (also on mouse hover). ▲▼ walk entries, A activates, ▶/B return. ---- */
+
+.tv-sidebar {
   position: fixed;
-  top: 28px;
-  right: 32px;
-  z-index: 6;
+  inset: 0 auto 0 0;
+  z-index: 7;
+  width: 72px;
+  padding: 0 12px;
   display: flex;
-  gap: 10px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  overflow: hidden;
+  background: var(--rail);
+  transition: width 0.2s ease, background 0.2s ease;
+}
+
+.tv-sidebar.open,
+.tv-sidebar:hover {
+  width: 280px;
+  background: var(--panel);
+  backdrop-filter: blur(24px);
+  border-right: 1px solid var(--overlay-border);
+}
+
+.tv-sb-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 12px;
+  border: none;
+  border-radius: 12px;
+  background: none;
+  color: var(--text-dim);
+  font-size: 16px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  outline: 2px solid transparent;
+}
+
+.tv-sb-item:hover {
+  color: var(--text);
+  background: var(--surface);
+}
+
+.tv-sb-item.focused {
+  color: var(--text);
+  background: var(--surface-2);
+  outline-color: var(--accent);
+  box-shadow: 0 4px 18px var(--accent-glow);
+}
+
+.tv-sb-icon {
+  width: 24px;
+  flex-shrink: 0;
+  text-align: center;
+  font-size: 19px;
+}
+
+.tv-sb-label,
+.tv-sb-hint {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.tv-sidebar.open .tv-sb-label,
+.tv-sidebar:hover .tv-sb-label,
+.tv-sidebar.open .tv-sb-hint,
+.tv-sidebar:hover .tv-sb-hint {
+  opacity: 1;
+}
+
+.tv-sb-hint {
+  margin-top: 10px;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* The living-room clock — always visible, interactive with nothing. */
+.tv-clock {
+  position: fixed;
+  top: 20px;
+  right: 24px;
+  z-index: 6;
 }
 
 .status-chip {
@@ -287,11 +636,18 @@ body {
   color: var(--text-dim);
   background: var(--overlay);
   border: 1px solid var(--overlay-border);
+  backdrop-filter: blur(16px);
 }
 
 .status-chip-button {
   cursor: pointer;
   font-family: inherit;
+}
+
+.status-clock {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 1px;
 }
 
 .status-chip-button:hover,
@@ -303,11 +659,13 @@ body {
 
 /* ---- Settings panel ---- */
 
+/* Settings is a full page, not a floating dialog: calm, scrollable, one
+   column of sections with consistent type. */
 .settings-scrim {
   position: fixed;
   inset: 0;
   z-index: 20;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--bg);
   display: flex;
   justify-content: center;
   align-items: flex-start;
@@ -316,55 +674,91 @@ body {
 }
 
 .settings {
-  width: min(760px, 92vw);
-  margin: 48px 0;
-  background: var(--bg);
-  border: 1px solid var(--overlay-border);
-  border-radius: 16px;
-  padding: 32px 36px 40px;
-  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.5);
+  width: min(1080px, 92vw);
+  padding: 6vh 0 14vh;
 }
 
 .settings-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  margin-bottom: 18px;
 }
 
 .settings-head h1 {
-  font-size: 30px;
-  font-weight: 800;
+  font-size: 40px;
+  font-weight: 700;
+}
+
+/* The daemon build number — the "am I on the latest version?" check. */
+.settings-version {
+  margin-left: 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.5px;
 }
 
 .settings-section {
   border-top: 1px solid var(--overlay-border);
-  padding: 22px 0;
+  padding: 30px 0 34px;
 }
 
 .settings-section h2 {
-  font-size: 19px;
+  font-size: 21px;
   font-weight: 700;
-  margin-bottom: 6px;
+  letter-spacing: -0.01em;
+  margin-bottom: 8px;
 }
 
 .settings-muted {
   color: var(--text-dim);
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 14.5px;
+  line-height: 1.55;
+  max-width: 760px;
 }
 
 .settings-field {
   display: block;
-  margin-top: 14px;
+  margin-top: 16px;
 }
 
 .settings-field-label {
   display: block;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
   color: var(--text-dim);
-  margin-bottom: 6px;
+  margin-bottom: 7px;
+}
+
+/* A value that's already set shows as a quiet locked row; the input only
+   appears after an explicit "Edit". */
+.locked-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 620px;
+}
+
+.locked-row input {
+  flex: 1;
+  max-width: none;
+}
+
+.locked-value {
+  flex: 1;
+  padding: 11px 14px;
+  font-size: 15px;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+  border-radius: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: 1px;
 }
 
 .settings-field input,
@@ -377,13 +771,37 @@ body {
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--overlay-border);
-  border-radius: 9px;
+  border-radius: 10px;
 }
 
 .settings-field input:focus,
 .settings-field select:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+/* A <select> that's been "opened" with A/Enter for editing: the d-pad now
+   changes its value (Enter again commits). The filled accent makes it obvious
+   that arrows edit here instead of moving to the next field. */
+.settings-field select.select-editing {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* Controller navigation moves real DOM focus — make it always visible,
+   not just for :focus-visible heuristics. */
+.settings .btn:focus {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.settings .accent-swatch:focus,
+.settings .accent-picker:focus {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
 }
 
 .settings-actions {
@@ -399,6 +817,20 @@ body {
   color: var(--text-dim);
 }
 
+.settings-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.settings-check input {
+  width: 17px;
+  height: 17px;
+  accent-color: var(--accent);
+}
+
 .btn {
   padding: 10px 18px;
   font-size: 15px;
@@ -407,7 +839,7 @@ body {
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--overlay-border);
-  border-radius: 9px;
+  border-radius: 10px;
   cursor: pointer;
 }
 
@@ -426,6 +858,80 @@ body {
 .btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.lib-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.lib-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+  border-radius: 10px;
+}
+
+.lib-name {
+  font-size: 16px;
+  font-weight: 600;
+  margin-right: 12px;
+}
+
+.lib-status {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.lib-status.lib-on {
+  color: #2e9e5b;
+}
+
+.lib-hint {
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.accent-swatches {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.accent-swatch {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.12s ease;
+}
+
+.accent-swatch:hover {
+  transform: scale(1.1);
+}
+
+.accent-swatch-active {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+.accent-picker {
+  width: 42px;
+  height: 34px;
+  border: 1px solid var(--overlay-border);
+  border-radius: 8px;
+  background: none;
+  cursor: pointer;
+  padding: 2px;
 }
 
 .addon-list {
@@ -475,6 +981,358 @@ body {
   font-size: 18px;
   z-index: 10;
   animation: fade-in 0.2s ease;
+  backdrop-filter: blur(16px);
+}
+
+/* ---- Search overlay ---- */
+
+.search-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  background: var(--scrim); /* theme-aware: text renders directly on it */
+  backdrop-filter: blur(8px);
+  animation: fade-in 0.18s ease;
+  overflow-y: auto;
+}
+
+.search {
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 6vh 6vw;
+}
+
+.search-input {
+  width: 100%;
+  font-size: 32px;
+  font-family: inherit;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--surface);
+  border: 2px solid var(--overlay-border);
+  border-radius: 14px;
+  padding: 18px 24px;
+  margin-bottom: 32px;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Keyboard + hint share a line so results start higher on the page. */
+.search-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 48px;
+  margin-bottom: 30px;
+}
+
+/* On-screen keyboard: lets a controller / TV remote type the query. */
+.osk {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 0 0 640px;
+}
+
+.osk-row {
+  display: flex;
+  gap: 10px;
+}
+
+.osk-key {
+  flex: 1 0 0;
+  padding: 12px 0;
+  text-align: center;
+  font-family: inherit;
+  font-size: 18px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+  border-radius: 8px;
+  cursor: pointer;
+  outline: 3px solid transparent;
+  transition: outline-color 0.12s ease, background 0.12s ease;
+}
+
+.osk-key:hover {
+  background: var(--surface-2);
+}
+
+.osk-key.focused {
+  outline-color: var(--accent);
+  background: var(--surface-2);
+  box-shadow: 0 4px 18px var(--accent-glow);
+}
+
+.osk-key-wide {
+  flex: 3 0 0;
+  font-size: 15px;
+  text-transform: none;
+}
+
+/* The "Search all" key — the one that fans out over the entire space. */
+.osk-key-accent {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.osk-key-accent.focused {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Sweep bar + line shown while the deep search fans out. */
+.search-busy {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  align-items: flex-start;
+  margin: 8px 0 32px;
+  color: var(--text-dim);
+  font-size: 16px;
+  animation: fade-in 0.2s ease;
+}
+
+/* ---- Deep-search sections: themed rows like the home screen ---- */
+
+.search-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+  animation: fade-in 0.25s ease;
+}
+
+.search-section {
+  opacity: 0.55;
+  transition: opacity 0.25s ease;
+}
+
+.search-section.section-active {
+  opacity: 1;
+}
+
+.search-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 14px;
+  transition: color 0.25s ease;
+}
+
+.search-section.section-active .search-section-head {
+  color: var(--text);
+}
+
+.search-section-count {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+  border-radius: 10px;
+  padding: 1px 9px;
+}
+
+.search-section-strip {
+  display: flex;
+  gap: 16px;
+  overflow-x: auto;
+  padding: 6px;
+  margin: -6px; /* room for the focus outline without clipping */
+  scrollbar-width: none;
+}
+
+.search-section-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.search-section-strip .search-card {
+  flex: 0 0 148px;
+}
+
+.search-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 20px;
+}
+
+.search-hint {
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1.6;
+  max-width: 620px;
+  padding-top: 4px;
+}
+
+.search-card {
+  cursor: pointer;
+  border-radius: var(--card-radius);
+  overflow: hidden;
+  outline: 3px solid transparent;
+  transition: transform 0.15s ease, outline-color 0.15s ease;
+}
+
+.search-card.selected {
+  outline-color: var(--accent);
+  transform: scale(1.06);
+  box-shadow: 0 8px 30px var(--accent-glow);
+}
+
+/* Artwork area: fixed 2:3 like the home cards, badge pinned to it (not the
+   title line below). Videos use their natural 16:9 thumbnails instead. */
+.search-art {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  border-radius: var(--card-radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.search-art-wide {
+  aspect-ratio: 16 / 9;
+}
+
+/* Wide result cards: width = the poster cards' height (148px × 1.5), so
+   both shapes share one rhythm inside the strips. */
+.search-section-strip .search-card-wide {
+  flex: 0 0 222px;
+}
+
+.search-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.search-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  padding: 8px 4px 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- Loading screen (stream/app starting) ----
+   The item's own artwork, washed into the theme: a slowly drifting blurred
+   backdrop, the poster, and a quiet indeterminate bar. */
+
+.loading-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  overflow: hidden;
+  animation: fade-in 0.25s ease;
+}
+
+.loading-art {
+  position: absolute;
+  inset: -12%;
+  background-size: cover;
+  background-position: center;
+  filter: var(--ambient-filter);
+  animation: loading-drift 24s ease-in-out infinite alternate;
+}
+
+@keyframes loading-drift {
+  from { transform: scale(1); }
+  to { transform: scale(1.08) translateY(-1.5%); }
+}
+
+.loading-content {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  animation: rise-in 0.45s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.loading-poster {
+  width: 168px;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 14px;
+  margin-bottom: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+  outline: 1px solid var(--overlay-border);
+}
+
+.loading-kicker {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.loading-title {
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.022em;
+  max-width: 70vw;
+  text-align: center;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-shadow: var(--title-shadow);
+}
+
+/* Indeterminate: a soft accent comet sweeping a hairline track. */
+.loading-bar {
+  width: 280px;
+  height: 4px;
+  margin-top: 8px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.loading-bar-fill {
+  width: 40%;
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent));
+  box-shadow: 0 0 12px var(--accent-glow);
+  animation: loading-sweep 1.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes loading-sweep {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(350%); }
+}
+
+.loading-msg {
+  font-size: 16px;
+  color: var(--text-dim);
+  animation: fade-in 0.4s ease;
 }
 
 .screen-message {
@@ -524,21 +1382,25 @@ body {
 .details-body {
   position: relative;
   z-index: 1;
-  padding: 84px 64px 64px;
-  max-width: 1100px;
+  /* full width: side padding only, extra bottom room for legend + strips */
+  padding: 6vh 4.5vw 14vh;
 }
 
 .details-head {
   display: flex;
-  gap: 32px;
-  margin-bottom: 28px;
+  gap: 44px;
+  margin-bottom: 36px;
+}
+
+.details-info {
+  max-width: 1150px;
 }
 
 .details-poster {
-  width: 200px;
-  height: 300px;
+  width: 260px;
+  height: 390px;
   object-fit: cover;
-  border-radius: 12px;
+  border-radius: 14px;
   flex-shrink: 0;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
@@ -552,10 +1414,10 @@ body {
 }
 
 .details-title {
-  font-size: 46px;
-  font-weight: 800;
+  font-size: 56px;
+  font-weight: 700;
   line-height: 1.05;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
 .details-sub {
@@ -615,7 +1477,10 @@ body {
   display: flex;
   gap: 16px;
   overflow-x: auto;
-  padding-bottom: 8px;
+  /* breathing room for the focused card's scale — without it the strip
+     clips the enlarged card's edges */
+  padding: 12px 10px;
+  margin: -12px -10px;
   scrollbar-width: none;
 }
 
@@ -631,12 +1496,173 @@ body {
   border-radius: 12px;
   background: var(--surface);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  outline: 3px solid transparent;
+  transition: transform 0.18s ease, outline-color 0.18s ease;
+}
+
+.shot.focused {
+  outline-color: var(--accent);
+  transform: scale(1.04);
+}
+
+.shots-head.focused {
+  color: var(--accent);
+}
+
+/* ---- Game stats (playtime · HowLongToBeat · achievement count) ---- */
+
+.game-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.game-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 14px;
+  border: 1px solid var(--overlay-border);
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.game-stat-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* ---- Achievement tiles (earned first, locked grayed) ---- */
+
+.ach-tile {
+  flex: 0 0 300px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px;
+  border: 1px solid var(--overlay-border);
+  border-radius: 12px;
+  background: var(--surface);
+  outline: 3px solid transparent;
+  transition: transform 0.15s ease, outline-color 0.15s ease;
+}
+
+.ach-tile img {
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+  flex-shrink: 0;
+  background: var(--surface-2);
+}
+
+.ach-tile.focused {
+  outline-color: var(--accent);
+  transform: scale(1.03);
+  box-shadow: 0 6px 24px var(--accent-glow);
+}
+
+.ach-locked {
+  opacity: 0.45;
+}
+
+.ach-name {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.ach-desc {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.ach-date {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- "More like this" cards (details page) ---- */
+
+.sim-card {
+  flex: 0 0 172px;
+  border-radius: var(--card-radius);
+  overflow: hidden;
+  cursor: pointer;
+  outline: 3px solid transparent;
+  transition: transform 0.15s ease, outline-color 0.15s ease;
+}
+
+.sim-card img {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  display: block;
+  border-radius: var(--card-radius);
+  background: var(--surface);
+}
+
+.sim-card .card-placeholder {
+  aspect-ratio: 2 / 3;
+  border-radius: var(--card-radius);
+}
+
+.sim-card.focused {
+  outline-color: var(--accent);
+  transform: scale(1.05);
+  box-shadow: 0 8px 30px var(--accent-glow);
+}
+
+.sim-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 4px 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Persistent, minimal control legend — the whole grammar in one glance. */
+.details-legend {
+  position: fixed;
+  right: 28px;
+  bottom: 22px;
+  z-index: 2;
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  color: var(--text-dim);
+  font-size: 13px;
+  background: var(--overlay);
+  border: 1px solid var(--overlay-border);
+  border-radius: 10px;
+  padding: 8px 16px;
+  backdrop-filter: blur(16px);
+}
+
+.details-legend .key {
+  font-size: 12px;
+  padding: 0 7px;
 }
 
 .details-desc {
   font-size: 17px;
   line-height: 1.55;
-  max-width: 720px;
+  max-width: 940px;
   color: var(--text);
 }
 
@@ -653,10 +1679,28 @@ body {
   font-weight: 700;
 }
 
+.resume-btn {
+  display: inline-block;
+  padding: 14px 32px;
+  margin-bottom: 18px;
+  font-size: 18px;
+  font-weight: 700;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  outline: 3px solid transparent;
+}
+
+.resume-btn.selected {
+  outline-color: #fff;
+  box-shadow: 0 6px 24px var(--accent-glow);
+}
+
 /* selected list entry (episodes, streams, action) */
 .selected {
   outline: 3px solid var(--accent);
-  box-shadow: 0 6px 24px rgba(79, 140, 255, 0.3);
+  box-shadow: 0 6px 24px var(--accent-glow);
 }
 
 .season-tabs {
@@ -686,7 +1730,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-width: 860px;
+  max-width: 1080px;
 }
 
 .ep-item,
@@ -699,6 +1743,14 @@ body {
   border: 1px solid var(--overlay-border);
   border-radius: 10px;
   cursor: pointer;
+  /* d-pad navigation scrolls the page — keep the selection off the edges */
+  scroll-margin: 140px 0;
+}
+
+.resume-btn,
+.action-button,
+.shots {
+  scroll-margin: 120px 0;
 }
 
 .ep-num {
@@ -763,4 +1815,379 @@ body {
   color: var(--text-dim);
   margin-top: 3px;
   word-break: break-word;
+}
+
+/* =====================================================================
+   Desktop (pointer-first) layout — <html data-mode="desktop">.
+   Top bar with search, collapsible sidebar, filter chips, one big grid;
+   details reflow into a watch-style page with a related rail.
+   ===================================================================== */
+
+[data-mode='desktop'] body {
+  cursor: auto; /* the TV layout hides the pointer; desktop needs it */
+}
+
+.dt {
+  position: relative;
+  z-index: 1;
+  height: 100vh;
+  display: grid;
+  grid-template:
+    'top top' 60px
+    'nav main' 1fr
+    / 232px 1fr;
+}
+
+.dt.dt-nav-closed {
+  grid-template-columns: 76px 1fr;
+}
+
+.dt-nav-closed .dt-nav-label,
+.dt-nav-closed .dt-nav-head,
+.dt-nav-closed .dt-nav-sep {
+  display: none;
+}
+
+/* ---- Top bar ---- */
+
+.dt-topbar {
+  grid-area: top;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 18px;
+}
+
+.dt-icon-btn {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--text);
+  font-size: 17px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.dt-icon-btn:hover {
+  background: var(--surface);
+}
+
+.dt-logo {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.022em;
+  cursor: pointer;
+  user-select: none;
+}
+
+.dt-logo-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 22px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+}
+
+.dt-searchbox {
+  margin: 0 auto;
+  width: min(620px, 44vw);
+  height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 0 16px;
+  border: 1px solid var(--overlay-border);
+  border-radius: 20px;
+  background: var(--surface);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 14px;
+  cursor: text;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.dt-searchbox:hover {
+  border-color: var(--accent);
+}
+
+.dt-kbd {
+  margin-left: auto;
+  padding: 1px 8px;
+  border: 1px solid var(--overlay-border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.dt-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dt-pill {
+  padding: 8px 14px;
+  border: 1px solid var(--overlay-border);
+  border-radius: 18px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.dt-pill:hover {
+  border-color: var(--accent);
+}
+
+/* ---- Sidebar ---- */
+
+.dt-nav {
+  grid-area: nav;
+  overflow-y: auto;
+  padding: 6px 10px 24px;
+  scrollbar-width: none;
+}
+
+.dt-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.dt-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dt-nav-item:hover {
+  background: var(--surface);
+}
+
+.dt-nav-item.active {
+  background: var(--surface-2);
+  font-weight: 700;
+}
+
+.dt-nav-icon {
+  width: 22px;
+  flex-shrink: 0;
+  text-align: center;
+  font-size: 16px;
+}
+
+.dt-nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dt-nav-sep {
+  border-top: 1px solid var(--overlay-border);
+  margin: 10px 6px;
+}
+
+.dt-nav-head {
+  padding: 4px 14px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* ---- Content: chips + grid ---- */
+
+.dt-content {
+  grid-area: main;
+  overflow-y: auto;
+  padding: 0 26px 56px;
+  scrollbar-width: none;
+}
+
+.dt-content::-webkit-scrollbar {
+  display: none;
+}
+
+.dt-chips {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  gap: 10px;
+  padding: 10px 0 14px;
+  overflow-x: auto;
+  background: var(--bg);
+  scrollbar-width: none;
+}
+
+.dt-chips::-webkit-scrollbar {
+  display: none;
+}
+
+.dt-chip {
+  flex-shrink: 0;
+  padding: 7px 13px;
+  border: none;
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.dt-chip:hover {
+  background: var(--surface-2);
+}
+
+.dt-chip.active {
+  background: var(--text);
+  color: var(--bg);
+}
+
+.dt-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 26px 18px;
+  align-items: start;
+}
+
+.dt-card {
+  cursor: pointer;
+}
+
+.dt-thumb {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.dt-thumb-wide {
+  aspect-ratio: 16 / 9;
+}
+
+.dt-card:hover .dt-thumb {
+  transform: scale(1.03);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.35);
+}
+
+.dt-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.dt-card-title {
+  margin-top: 9px;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.dt-card-sub {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- Overlays, reflowed for a pointer ---- */
+
+/* Physical keyboard exists — the on-screen keyboard is dead weight. */
+[data-mode='desktop'] .osk {
+  display: none;
+}
+
+[data-mode='desktop'] .search {
+  padding-top: 4vh;
+}
+
+[data-mode='desktop'] .details-legend {
+  display: none;
+}
+
+/* Watch-style details: content column + related rail on the right. */
+@media (min-width: 1100px) {
+  [data-mode='desktop'] .details-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 380px;
+    column-gap: 44px;
+    align-items: start;
+  }
+
+  [data-mode='desktop'] .details-body > * {
+    grid-column: 1;
+  }
+
+  [data-mode='desktop'] .details-body > .similar-block {
+    grid-column: 2;
+    grid-row: 1 / span 20;
+    margin-top: 0;
+  }
+
+  /* The rail is a vertical list: poster left, title right, like a watch-
+     page's related column. */
+  [data-mode='desktop'] .similar-block .shots-strip {
+    flex-direction: column;
+    gap: 12px;
+    overflow: visible;
+  }
+
+  [data-mode='desktop'] .similar-block .sim-card {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    width: 100%;
+    flex: none;
+  }
+
+  [data-mode='desktop'] .similar-block .sim-card img,
+  [data-mode='desktop'] .similar-block .sim-card .card-placeholder {
+    width: 104px;
+    flex-shrink: 0;
+  }
+
+  [data-mode='desktop'] .similar-block .sim-card-title {
+    white-space: normal;
+    padding: 2px 0 0;
+    font-size: 14px;
+    line-height: 1.35;
+  }
 }

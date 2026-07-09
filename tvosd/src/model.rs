@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Game,
@@ -37,7 +37,7 @@ pub struct ContentItem {
 }
 
 /// One horizontal row on the home screen.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Row {
     pub title: String,
     pub items: Vec<ContentItem>,

@@ -27,13 +27,17 @@ const CATALOG_TTL: Duration = Duration::from_secs(600);
 const ROW_LIMIT: usize = 25;
 const CATALOGS_PER_ADDON: usize = 2;
 
-/// A few well-known public trackers added to every magnet so a torrent can
-/// find peers even when the addon supplies none.
-const DEFAULT_TRACKERS: [&str; 4] = [
+/// Well-known, high-population public trackers added to every magnet so peers
+/// are found fast (quicker start) even when the addon supplies few or none.
+const DEFAULT_TRACKERS: [&str; 8] = [
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.demonii.com:1337/announce",
     "udp://tracker.openbittorrent.com:6969/announce",
     "udp://exodus.desync.com:6969/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://explodie.org:6969/announce",
 ];
 
 #[derive(Default)]
@@ -58,6 +62,7 @@ impl Source for Stremio {
                 addon
                     .catalogs
                     .iter()
+                    .filter(|c| c.browse)
                     .take(CATALOGS_PER_ADDON)
                     .map(|catalog| Row {
                         title: format!("{} · {}", addon.name, catalog.name),
@@ -70,7 +75,7 @@ impl Source for Stremio {
 
     fn launch(&self, item_id: &str) -> Result<(), String> {
         let (kind, meta_id) = parse_id(item_id)?;
-        play_meta(kind, meta_id)
+        play_meta(kind, meta_id, Some(item_id))
     }
 }
 
@@ -117,43 +122,181 @@ pub fn streams(kind: &str, id: &str) -> Vec<Stream> {
     all
 }
 
-/// Launches a stream the user (or the auto-picker) chose.
-pub fn play_stream(stream: &Stream) -> Result<(), String> {
+const SEARCH_TTL: Duration = Duration::from_secs(300);
+const SEARCH_CATALOGS_PER_ADDON: usize = 3;
+
+static SEARCH_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Vec<ContentItem>)>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Searches every installed addon's search-capable catalogs (the `search`
+/// extra of the addon protocol). Addons are queried in parallel and results
+/// cached briefly, so search-as-you-type stays responsive.
+pub fn search(query: &str) -> Vec<ContentItem> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    if let Some((at, items)) = SEARCH_CACHE.lock().unwrap().get(&query.to_lowercase()) {
+        if at.elapsed() < SEARCH_TTL {
+            return items.clone();
+        }
+    }
+
+    let addons = addons::STORE.list();
+    let mut items: Vec<ContentItem> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = addons
+            .iter()
+            .map(|addon| {
+                scope.spawn(move || {
+                    addon
+                        .catalogs
+                        .iter()
+                        .filter(|c| c.search)
+                        .take(SEARCH_CATALOGS_PER_ADDON)
+                        .flat_map(|catalog| {
+                            let url = format!(
+                                "{}/catalog/{}/{}/search={}.json",
+                                addon.base,
+                                percent_encode(&catalog.kind),
+                                percent_encode(&catalog.id),
+                                percent_encode(query)
+                            );
+                            addons::http_get_quick(&url)
+                                .map(|json| parse_catalog(&json))
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for handle in handles {
+            for item in handle.join().unwrap_or_default() {
+                if seen.insert(item.id.clone()) {
+                    items.push(item);
+                }
+            }
+        }
+    });
+
+    let mut cache = SEARCH_CACHE.lock().unwrap();
+    if cache.len() > 64 {
+        cache.clear(); // crude but sufficient: queries are tiny and short-lived
+    }
+    cache.insert(query.to_lowercase(), (Instant::now(), items.clone()));
+    items
+}
+
+/// Launches a stream the user (or the auto-picker) chose. `item_id` is the
+/// content id used for resume + remembering the source for the next episode
+/// (a series id, so "Continue" surfaces the *show*). `track_id` is the precise
+/// watched id for the scrobbler — an episode id (`…:season:episode`) so Trakt
+/// and AniList record the exact episode; it defaults to `item_id`.
+pub fn play_stream(
+    stream: &Stream,
+    item_id: Option<&str>,
+    track_id: Option<&str>,
+) -> Result<(), String> {
     let mode = settings::STORE.get().enhance;
     let hint = describe(stream);
+    // Remember the source so Continue / the next episode can reuse it.
+    if let Some(id) = item_id {
+        if stream.kind != StreamKind::External {
+            crate::resume::STORE.remember(id, stream);
+        }
+    }
+    let track_id = track_id.or(item_id);
     match stream.kind {
         StreamKind::Direct | StreamKind::Youtube => {
             let profile = upscale::resolve(mode, &hint);
-            launcher::play_video(&stream.url, &profile, mode, &hint)
+            launcher::play_video(&stream.url, &profile, mode, &hint, item_id, track_id)
         }
         StreamKind::External => launcher::open_external(&stream.url),
         StreamKind::Torrent => {
             let profile = upscale::resolve(mode, &hint);
-            launcher::play_torrent(&stream.url, stream.file_idx, &profile, mode, &hint)
+            launcher::play_torrent(
+                &stream.url,
+                stream.file_idx,
+                &profile,
+                mode,
+                &hint,
+                item_id,
+                track_id,
+            )
         }
     }
 }
 
-/// Auto-pick: best playable stream for `(kind, id)`. Used by Source::launch
-/// (the quick path). Prefers a directly-playable stream; for a bare series id
-/// it falls back to the first episode.
-pub fn play_meta(kind: &str, id: &str) -> Result<(), String> {
+/// How many sources the auto-picker will try before giving up. Each attempt now
+/// waits for playback to actually start, so a dead/seederless source fails fast-
+/// ish and we move on — "sometimes the stream doesn't start" becomes "we tried
+/// the next one".
+const AUTO_PICK_ATTEMPTS: usize = 3;
+
+/// Auto-pick: play the best source for `(kind, id)`, falling back to the next
+/// one if it doesn't start. Used by Source::launch (the quick path). Prefers the
+/// source the show last used (so the next episode stays on the same addon /
+/// quality), then directly-playable streams, then torrents. `item_id` is the
+/// content id, used for resume and same-source memory.
+pub fn play_meta(kind: &str, id: &str, item_id: Option<&str>) -> Result<(), String> {
     let mut found = streams(kind, id);
     if found.is_empty() && kind == "series" && !id.contains(':') {
         found = streams(kind, &format!("{id}:1:1"));
     }
-    let pick = found
-        .iter()
-        .find(|s| matches!(s.kind, StreamKind::Direct | StreamKind::Youtube))
-        .or_else(|| found.iter().find(|s| s.kind == StreamKind::Torrent))
-        .or_else(|| found.first())
-        .ok_or("No playable stream found — install a stream addon that carries this title")?;
-    crate::log_info!(
-        "auto-pick: [{:?}] {}",
-        pick.kind,
-        pick.name.replace('\n', " ")
+    if found.is_empty() {
+        return Err(
+            "No playable stream found — install a stream addon that carries this title".to_string(),
+        );
+    }
+
+    // For the next episode of a show, float sources matching the one the show
+    // last played (same addon + quality) to the very front.
+    let preferred = item_id.and_then(|id| crate::resume::STORE.series_stream(id));
+    let matches_preferred = |s: &Stream| {
+        preferred
+            .as_ref()
+            .is_some_and(|p| same_source(p, s))
+    };
+
+    // Order: remembered source → directly-playable → torrents → externals.
+    let mut order: Vec<&Stream> = found.iter().filter(|s| matches_preferred(s)).collect();
+    order.extend(
+        found
+            .iter()
+            .filter(|s| !matches_preferred(s) && matches!(s.kind, StreamKind::Direct | StreamKind::Youtube)),
     );
-    play_stream(pick)
+    order.extend(
+        found
+            .iter()
+            .filter(|s| !matches_preferred(s) && s.kind == StreamKind::Torrent),
+    );
+    order.extend(found.iter().filter(|s| s.kind == StreamKind::External));
+
+    let mut last_error = "No source could be started".to_string();
+    for stream in order.into_iter().take(AUTO_PICK_ATTEMPTS) {
+        crate::log_info!(
+            "auto-pick trying [{:?}] {}",
+            stream.kind,
+            stream.name.replace('\n', " ")
+        );
+        match play_stream(stream, item_id, None) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                crate::log_warn!("source failed, trying next: {e}");
+                last_error = e;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+/// Whether two streams are "the same source" — same addon/release/quality,
+/// ignoring the per-episode bits. Used to keep a show on one source. The whole
+/// `name` (provider + quality, e.g. "Torrentio\n1080p") is compared: per-episode
+/// details live in `title`, so `name` is stable across a season.
+fn same_source(a: &Stream, b: &Stream) -> bool {
+    a.kind == b.kind && a.name == b.name
 }
 
 impl Stremio {
@@ -272,23 +415,101 @@ fn build_magnet(info_hash: &str, name: &str, sources: Option<&Value>) -> String 
     magnet
 }
 
-/// Orders the details-page list: resolution desc, then directly-playable
-/// sources ahead of torrents/externals.
+/// Orders the list best-first: the **highest resolution that will actually
+/// stream**. Directly-playable (debrid/HTTP) sources win outright; among
+/// torrents we group by a seeder "tier" (enough seeders to stream → preferred,
+/// a few → weaker, none → dead/last) and, within a tier, prefer higher
+/// resolution. So a well-seeded 4K ranks first (best for a capable system),
+/// while a seederless 4K that would never start drops below a solid 1080p.
 fn rank(streams: &mut [Stream]) {
-    streams.sort_by_key(|s| {
-        let text = describe(s).to_lowercase();
-        let height = [2160, 1440, 1080, 720, 480]
-            .into_iter()
-            .find(|h| text.contains(&format!("{h}p")) || text.contains(&format!("{h}i")))
-            .unwrap_or(0);
-        let kind_rank = match s.kind {
-            StreamKind::Direct => 3,
-            StreamKind::Torrent => 2,
-            StreamKind::Youtube => 1,
-            StreamKind::External => 0,
-        };
-        std::cmp::Reverse((height, kind_rank))
+    streams.sort_by(|a, b| {
+        stream_score(b)
+            .partial_cmp(&stream_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+/// Seeders considered "enough" to stream the higher resolutions comfortably.
+const GOOD_SEEDERS: i64 = 5;
+
+/// Higher is better. See [`rank`].
+fn stream_score(s: &Stream) -> f64 {
+    let text = describe(s);
+    let height = resolution_height(&text.to_lowercase());
+    match s.kind {
+        // Instant, reliable sources first; still prefer higher resolution.
+        StreamKind::Direct => 1_000_000_000.0 + height,
+        StreamKind::Youtube => 500_000_000.0,
+        // Official "watch on …" services (WatchHub): visible above the
+        // torrent pile so they read as recommendations, not buried under 50
+        // entries. The auto-picker still skips them (it filters by kind).
+        StreamKind::External => 400_000_000.0,
+        StreamKind::Torrent => {
+            let seeders = parse_seeders(&text).unwrap_or(0);
+            // Tier first (viability), then resolution (4K on top), then seeders.
+            let tier = if seeders >= GOOD_SEEDERS {
+                2.0
+            } else if seeders >= 1 {
+                1.0
+            } else {
+                0.0
+            };
+            // Tiny tiebreak: among otherwise-equal sources, the smaller file
+            // starts a touch faster (always < 1, so it never beats a seeder).
+            let smaller = parse_size_gb(&text)
+                .map(|gb| gb.min(100.0) / 1000.0)
+                .unwrap_or(0.0);
+            tier * 100_000_000.0 + height * 1_000.0 + (seeders.min(9_999) as f64) - smaller
+        }
+    }
+}
+
+/// The numeric resolution height advertised in the source name (2160, 1080, …),
+/// used so the best quality sorts to the top of its tier.
+fn resolution_height(lower: &str) -> f64 {
+    if lower.contains("2160p") || lower.contains("4k") || lower.contains("uhd") {
+        2160.0
+    } else if lower.contains("1440p") {
+        1440.0
+    } else if lower.contains("1080p") || lower.contains("1080i") {
+        1080.0
+    } else if lower.contains("720p") {
+        720.0
+    } else if lower.contains("480p") {
+        480.0
+    } else {
+        600.0 // unknown — between SD and HD
+    }
+}
+
+/// Seeder count from a Torrentio-style "👤 89" label, if present.
+fn parse_seeders(text: &str) -> Option<i64> {
+    let after = text.split('👤').nth(1)?.trim_start();
+    let digits: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .collect();
+    digits.replace(',', "").parse().ok()
+}
+
+/// File size in GB from a "💾 35.09 GB" / "💾 700 MB" label, if present.
+fn parse_size_gb(text: &str) -> Option<f64> {
+    let after = text.split('💾').nth(1)?.trim_start();
+    let num: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let value: f64 = num.parse().ok()?;
+    let unit = after[num.len()..].trim_start().to_uppercase();
+    if unit.starts_with("TB") {
+        Some(value * 1024.0)
+    } else if unit.starts_with("GB") {
+        Some(value)
+    } else if unit.starts_with("MB") {
+        Some(value / 1024.0)
+    } else {
+        None
+    }
 }
 
 fn parse_meta(json: &str) -> Option<Meta> {
@@ -379,6 +600,18 @@ fn parse_catalog(json: &str) -> Vec<ContentItem> {
         .take(ROW_LIMIT)
         .filter_map(|m| {
             let kind = m.get("type")?.as_str()?;
+            // Require a poster — skip catalog entries with no artwork.
+            let art = m
+                .get("poster")
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .or_else(|| {
+                    m.get("background")
+                        .and_then(|p| p.as_str())
+                        .filter(|p| !p.is_empty())
+                        .map(String::from)
+                })?;
             Some(ContentItem {
                 id: format!("strm:{}:{}", kind, m.get("id")?.as_str()?),
                 kind: match kind {
@@ -387,7 +620,7 @@ fn parse_catalog(json: &str) -> Vec<ContentItem> {
                     _ => Kind::Video,
                 },
                 title: m.get("name")?.as_str()?.to_string(),
-                art: m.get("poster").and_then(|p| p.as_str()).map(String::from),
+                art: Some(art),
                 action: Action::Play,
             })
         })
@@ -413,10 +646,11 @@ mod tests {
     fn parses_catalog_metas() {
         let json = r#"{"metas": [
             {"type": "movie", "id": "bbb", "name": "Big Buck Bunny", "poster": "https://x/p.jpg"},
-            {"type": "series", "id": "tt1", "name": "Some Show"}
+            {"type": "series", "id": "tt1", "name": "Some Show", "poster": "https://x/s.jpg"},
+            {"type": "movie", "id": "nope", "name": "No Art"}
         ]}"#;
         let items = parse_catalog(json);
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 2); // the art-less "No Art" entry is dropped
         assert_eq!(items[0].id, "strm:movie:bbb");
         assert_eq!(items[1].id, "strm:series:tt1");
     }
@@ -451,25 +685,55 @@ mod tests {
     }
 
     #[test]
-    fn ranking_prefers_resolution_then_direct() {
-        let mk = |kind, name: &str| Stream {
+    fn ranking_prefers_streamable_sources() {
+        let mk = |kind, name: &str, title: &str| Stream {
             kind,
+            url: "x".into(),
+            name: name.into(),
+            title: title.into(),
+            file_idx: None,
+        };
+        let mut streams = vec![
+            // a barely-seeded 4K — would never start, so it must drop down
+            mk(StreamKind::Torrent, "4k weak", "Movie.2160p.REMUX 👤 1 💾 60 GB"),
+            // a well-seeded 1080p
+            mk(StreamKind::Torrent, "1080p", "Movie.1080p 👤 200 💾 2.4 GB"),
+            // a debrid/direct link — always wins
+            mk(StreamKind::Direct, "direct", "Movie.1080p"),
+            // "watch on …" service (WatchHub) — visible above the torrents
+            mk(StreamKind::External, "netflix", "Subscription"),
+            // a low-but-ok-seeded 720p
+            mk(StreamKind::Torrent, "720p", "Movie.720p 👤 6 💾 1.1 GB"),
+            // a well-seeded 4K — best for a capable system, should top the torrents
+            mk(StreamKind::Torrent, "4k", "Movie.2160p 👤 80 💾 40 GB"),
+        ];
+        rank(&mut streams);
+        let order: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(order, vec!["direct", "netflix", "4k", "1080p", "720p", "4k weak"]);
+        assert_eq!(streams[0].kind, StreamKind::Direct);
+    }
+
+    #[test]
+    fn same_source_matches_provider_and_quality() {
+        let mk = |name: &str| Stream {
+            kind: StreamKind::Torrent,
             url: "x".into(),
             name: name.into(),
             title: String::new(),
             file_idx: None,
         };
-        let mut streams = vec![
-            mk(StreamKind::Torrent, "720p"),
-            mk(StreamKind::Torrent, "2160p"),
-            mk(StreamKind::Direct, "1080p"),
-            mk(StreamKind::Direct, "2160p"),
-        ];
-        rank(&mut streams);
-        let order: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
-        // 2160p direct, then 2160p torrent, then 1080p direct, then 720p torrent.
-        assert_eq!(order, vec!["2160p", "2160p", "1080p", "720p"]);
-        assert_eq!(streams[0].kind, StreamKind::Direct);
+        assert!(same_source(&mk("Torrentio\n1080p"), &mk("Torrentio\n1080p")));
+        assert!(!same_source(&mk("Torrentio\n1080p"), &mk("Torrentio\n4k")));
+    }
+
+    #[test]
+    fn parses_seeders_and_size() {
+        assert_eq!(parse_seeders("Torrentio 👤 89 💾 35.09 GB"), Some(89));
+        assert_eq!(parse_seeders("👤 1,234 peers"), Some(1234));
+        assert_eq!(parse_seeders("no marker"), None);
+        assert_eq!(parse_size_gb("💾 35.09 GB"), Some(35.09));
+        assert_eq!(parse_size_gb("💾 700 MB"), Some(700.0 / 1024.0));
+        assert_eq!(parse_size_gb("nothing"), None);
     }
 
     #[test]

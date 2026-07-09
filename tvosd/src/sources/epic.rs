@@ -24,7 +24,6 @@ use crate::sources::Source;
 const OWNED_CACHE_TTL: Duration = Duration::from_secs(300);
 
 pub struct Epic {
-    available: bool,
     owned_cache: Mutex<Option<(Instant, Vec<EpicGame>)>>,
 }
 
@@ -37,12 +36,7 @@ struct EpicGame {
 
 impl Epic {
     pub fn detect() -> Self {
-        let available = Command::new("legendary")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success());
         Self {
-            available,
             owned_cache: Mutex::new(None),
         }
     }
@@ -74,7 +68,10 @@ impl Source for Epic {
     }
 
     fn available(&self) -> bool {
-        self.available
+        // Detected live (not cached at startup) so installing legendary or
+        // signing in is picked up without restarting the daemon. "Connected"
+        // means legendary is present *and* you're logged in.
+        legendary_present() && legendary_logged_in()
     }
 
     fn rows(&self) -> Vec<Row> {
@@ -97,7 +94,7 @@ impl Source for Epic {
 
         vec![
             Row {
-                title: "Games".to_string(),
+                title: "Ready to Play".to_string(),
                 items: installed
                     .into_iter()
                     .map(|g| g.into_item(Action::Play))
@@ -147,6 +144,23 @@ impl EpicGame {
             action,
         }
     }
+}
+
+/// Is the legendary CLI installed (on PATH)?
+fn legendary_present() -> bool {
+    Command::new("legendary")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Has the user signed in (legendary stores credentials in user.json)?
+fn legendary_logged_in() -> bool {
+    std::env::var("HOME")
+        .map(|h| std::path::Path::new(&h).join(".config/legendary/user.json").exists())
+        .unwrap_or(false)
 }
 
 fn legendary_json(args: &[&str]) -> Option<String> {

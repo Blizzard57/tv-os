@@ -39,6 +39,10 @@ pub struct Catalog {
     pub kind: String,
     pub id: String,
     pub name: String,
+    /// Fetchable as a plain row (no required extra parameters).
+    pub browse: bool,
+    /// Supports the `search` extra — usable for catalog search.
+    pub search: bool,
 }
 
 pub static STORE: LazyLock<AddonStore> = LazyLock::new(AddonStore::load);
@@ -110,8 +114,21 @@ impl AddonStore {
 }
 
 pub fn http_get(url: &str) -> Result<String, String> {
+    http_get_within(url, Duration::from_secs(10))
+}
+
+/// Short-budget GET for latency-sensitive paths (search): one dead addon
+/// must not stall the whole merged result.
+pub fn http_get_quick(url: &str) -> Result<String, String> {
+    http_get_within(url, Duration::from_secs(4))
+}
+
+fn http_get_within(url: &str, timeout: Duration) -> Result<String, String> {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(timeout)
+        // Several public APIs (CheapShark among them) reject requests with
+        // no User-Agent, which is reqwest's default.
+        .user_agent(concat!("tvos/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?
         .get(url)
@@ -159,8 +176,13 @@ fn parse_manifest(url: &str, manifest: &Value) -> Option<Addon> {
         .map(|catalogs| {
             catalogs
                 .iter()
-                .filter(|c| !requires_extra(c))
                 .filter_map(|c| {
+                    let browse = !requires_extra(c);
+                    let search = supports_search(c);
+                    // A catalog we can neither browse nor search is useless to us.
+                    if !browse && !search {
+                        return None;
+                    }
                     Some(Catalog {
                         kind: c.get("type")?.as_str()?.to_string(),
                         id: c.get("id")?.as_str()?.to_string(),
@@ -169,6 +191,8 @@ fn parse_manifest(url: &str, manifest: &Value) -> Option<Addon> {
                             .and_then(|n| n.as_str())
                             .unwrap_or("Catalog")
                             .to_string(),
+                        browse,
+                        search,
                     })
                 })
                 .collect()
@@ -195,6 +219,23 @@ fn requires_extra(catalog: &Value) -> bool {
                 .iter()
                 .any(|e| e.get("isRequired").and_then(|r| r.as_bool()) == Some(true))
         })
+        // Legacy manifest form.
+        || catalog
+            .get("extraRequired")
+            .and_then(|e| e.as_array())
+            .is_some_and(|extras| !extras.is_empty())
+}
+
+/// Whether the catalog accepts the `search` extra (either manifest form).
+fn supports_search(catalog: &Value) -> bool {
+    let names_search = |v: &Value| v.as_str() == Some("search")
+        || v.get("name").and_then(|n| n.as_str()) == Some("search");
+    ["extra", "extraSupported", "extraRequired"].iter().any(|key| {
+        catalog
+            .get(key)
+            .and_then(|e| e.as_array())
+            .is_some_and(|extras| extras.iter().any(names_search))
+    })
 }
 
 #[cfg(test)]
@@ -207,21 +248,41 @@ mod tests {
         "resources": ["catalog", {"name": "stream", "types": ["movie"]}],
         "types": ["movie"],
         "catalogs": [
-            {"type": "movie", "id": "top", "name": "Top Films"},
+            {"type": "movie", "id": "top", "name": "Top Films",
+             "extra": [{"name": "search", "isRequired": false}]},
             {"type": "movie", "id": "bygenre", "name": "By Genre",
-             "extra": [{"name": "genre", "isRequired": true}]}
+             "extra": [{"name": "genre", "isRequired": true}]},
+            {"type": "movie", "id": "searchonly", "name": "Lookup",
+             "extra": [{"name": "search", "isRequired": true}]}
         ]
     }"#;
 
     #[test]
-    fn parses_manifest_and_skips_required_extra_catalogs() {
+    fn parses_manifest_catalogs_with_browse_and_search_flags() {
         let manifest: Value = serde_json::from_str(MANIFEST).unwrap();
         let addon = parse_manifest("https://x.example/manifest.json", &manifest).unwrap();
         assert_eq!(addon.name, "Example Films");
         assert_eq!(addon.base, "https://x.example");
         assert!(addon.streams);
-        assert_eq!(addon.catalogs.len(), 1);
+        // "bygenre" needs a mandatory genre and can't search — dropped.
+        assert_eq!(addon.catalogs.len(), 2);
+        assert!(addon.catalogs[0].browse && addon.catalogs[0].search);
         assert_eq!(addon.catalogs[0].id, "top");
+        // Search-only catalogs are kept for search but not browsed as rows.
+        assert_eq!(addon.catalogs[1].id, "searchonly");
+        assert!(!addon.catalogs[1].browse && addon.catalogs[1].search);
+    }
+
+    #[test]
+    fn legacy_extra_supported_marks_searchable() {
+        let manifest: Value = serde_json::from_str(
+            r#"{"id": "a", "name": "Legacy", "resources": ["catalog"],
+                "catalogs": [{"type": "movie", "id": "top", "name": "Top",
+                              "extraSupported": ["search", "genre"]}]}"#,
+        )
+        .unwrap();
+        let addon = parse_manifest("https://x/manifest.json", &manifest).unwrap();
+        assert!(addon.catalogs[0].browse && addon.catalogs[0].search);
     }
 
     #[test]

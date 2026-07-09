@@ -18,7 +18,8 @@ export type NavAction =
   | 'back'
   | 'theme'
   | 'enhance'
-  | 'settings';
+  | 'settings'
+  | 'search';
 
 const KEY_MAP: Record<string, NavAction> = {
   ArrowUp: 'up',
@@ -34,6 +35,7 @@ const KEY_MAP: Record<string, NavAction> = {
   E: 'enhance',
   s: 'settings',
   S: 'settings',
+  '/': 'search',
 };
 
 // Standard-mapping gamepad button indices.
@@ -60,10 +62,26 @@ export function useTvInput(onAction: (action: NavAction) => void) {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      // While typing in a form field (e.g. the Settings panel), let the
-      // browser handle keys normally — don't steal arrows/letters/Enter.
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      // Form fields (the Settings panel) need care so the d-pad behaves like a
+      // TV, not a desktop form:
+      //   * text inputs keep native typing + Left/Right cursor; only Up/Down
+      //     escape to move focus to the next field.
+      //   * checkboxes/selects are driven entirely by our nav — Arrows move
+      //     focus, Enter activates (a select enters "edit mode"; see
+      //     focusNav/SettingsPanel). The browser must NOT change a select's
+      //     value while you're merely scrolling past it.
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      const key = e.key;
+      const isArrow = key.startsWith('Arrow');
+      if (tag === 'TEXTAREA') return;
+      if (tag === 'INPUT') {
+        const type = (el as HTMLInputElement).type;
+        const textual = type !== 'checkbox' && type !== 'radio' && type !== 'button';
+        if (textual && key !== 'ArrowUp' && key !== 'ArrowDown') return;
+        if (!textual && !isArrow && key !== 'Enter') return;
+      }
+      if (tag === 'SELECT' && !isArrow && key !== 'Enter') return;
       const action = KEY_MAP[e.key];
       if (action) {
         e.preventDefault();

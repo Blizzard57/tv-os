@@ -1,10 +1,15 @@
-import { MutableRefObject, useCallback, useEffect, useMemo, useState } from 'react';
+import { MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ContentItem,
   Episode,
+  GameExtras,
   Meta,
+  ResumeInfo,
   Stream,
+  fetchGameExtras,
   fetchMeta,
+  fetchResume,
+  fetchSimilar,
   fetchStreams,
   launch,
   playStream,
@@ -15,6 +20,8 @@ import { NavAction } from './input';
 interface Props {
   item: ContentItem;
   onClose: () => void;
+  /** Opens another item's details page ("More like this"). */
+  onOpen: (item: ContentItem) => void;
   /** Called after something plays/installs so the home screen can refresh. */
   onPlayed: () => void;
   /** App writes its forwarded nav handler here while details is open. */
@@ -22,6 +29,11 @@ interface Props {
 }
 
 type Stage = 'actions' | 'episodes' | 'streams';
+
+/// The horizontal strips below the main list, in navigation order.
+type StripZone = 'shots' | 'ach' | 'similar';
+
+const isGameId = (id: string) => id.startsWith('steam:') || id.startsWith('gshop:');
 
 const KIND_BADGE: Record<Stream['kind'], string> = {
   direct: 'DIRECT',
@@ -31,8 +43,10 @@ const KIND_BADGE: Record<Stream['kind'], string> = {
 };
 
 const isStreamItem = (id: string) => id.startsWith('strm:') || id.startsWith('tmdb:');
+// Unowned games (GameHub): their "sources" are store offers, cheapest first.
+const isShopItem = (id: string) => id.startsWith('gshop:');
 
-export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
+export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Props) {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [stage, setStage] = useState<Stage>('actions');
   const [season, setSeason] = useState(1);
@@ -40,19 +54,65 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
   const [streams, setStreams] = useState<Stream[] | null>(null);
   const [sel, setSel] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
+  const [loading, setLoading] = useState<{ label: string; kind: LoadingKind } | null>(null);
+  // When non-null, focus is in a horizontal strip (screenshots / similar).
+  const [strip, setStrip] = useState<{ zone: StripZone; idx: number } | null>(null);
+  const [similar, setSimilar] = useState<ContentItem[]>([]);
+  const [extras, setExtras] = useState<GameExtras>({});
+  const shotRefs = useRef<(HTMLImageElement | null)[]>([]);
+  const simRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const achRefs = useRef<(HTMLDivElement | null)[]>([]);
+  // The selected entry of the active list, so navigation scrolls the page.
+  const selRef = useRef<HTMLDivElement | null>(null);
+  const [resume, setResume] = useState<ResumeInfo | null>(null);
 
   const series = (meta?.kind ?? item.kind) === 'series';
   const isGame = (meta?.kind ?? item.kind) === 'game';
+  // A "Resume" entry leads the episodes/streams list when there's a saved spot.
+  const resumeShown = !!resume && isStreamItem(item.id) && (stage === 'streams' || stage === 'episodes');
+  const resumeOffset = resumeShown ? 1 : 0;
 
   // Load metadata, then decide the opening stage.
+  // Is there a saved spot/source to continue from?
+  useEffect(() => {
+    setResume(null);
+    if (isStreamItem(item.id)) {
+      fetchResume(item.id)
+        .then((r) => setResume(r && r.position > 0 ? r : null))
+        .catch(() => setResume(null));
+    }
+  }, [item.id]);
+
+  // "More like this" — arrives lazily; the strip appears when it has items.
+  useEffect(() => {
+    fetchSimilar(item.id)
+      .then(setSimilar)
+      .catch(() => setSimilar([]));
+  }, [item.id]);
+
+  // Game extras: playtime, HowLongToBeat, achievements.
+  useEffect(() => {
+    setExtras({});
+    if (isGameId(item.id)) {
+      fetchGameExtras(item.id)
+        .then(setExtras)
+        .catch(() => setExtras({}));
+    }
+  }, [item.id]);
+
   useEffect(() => {
     let cancelled = false;
+    setStrip(null);
     fetchMeta(item.id)
       .then((m) => {
         if (cancelled) return;
         setMeta(m);
         const isSeries = (m.kind || item.kind) === 'series';
-        if (!isStreamItem(item.id)) {
+        if (isShopItem(item.id)) {
+          // Not owned — the page is about where to buy it.
+          setStage('streams');
+          loadStreams(item.id);
+        } else if (!isStreamItem(item.id)) {
           setStage('actions');
         } else if (isSeries) {
           const seasons = [...new Set(m.episodes.map((e) => e.season))].sort((a, b) => a - b);
@@ -73,6 +133,7 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
   const loadStreams = useCallback((id: string) => {
     setStreams(null);
     setSel(0);
+    setStrip(null);
     fetchStreams(id)
       .then(setStreams)
       .catch(() => setStreams([]));
@@ -92,14 +153,35 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
     window.setTimeout(() => setStatus((s) => (s === msg ? null : s)), 3500);
   }, []);
 
+  // The precise id being watched: for an episode it's `strm:series:<imdb>:s:e`
+  // so Trakt/AniList scrobble the exact episode (the show `item` still drives
+  // "Continue"). Movies just watch under their own id.
+  const trackId = episode ? `strm:series:${episode.id}` : item.id;
+
   const playChosen = useCallback(
     (s: Stream) => {
-      flash(s.kind === 'external' ? `Opening ${s.name}…` : `Playing ${s.name.split('\n')[0]}…`);
-      playStream(s, item)
-        .then(onPlayed)
-        .catch((e) => flash(`Could not play: ${e.message}`));
+      // External links just open elsewhere — no loading screen needed.
+      if (s.kind === 'external') {
+        flash(`Opening ${s.name.split('\n')[0]}…`);
+        playStream(s, item, trackId)
+          .then(onPlayed)
+          .catch((e) => flash(`Could not open: ${e.message}`));
+        return;
+      }
+      // The play request blocks until playback actually starts (or fails), so
+      // show a loading screen meanwhile — never a frozen-looking blank.
+      setLoading({ label: s.name.split('\n')[0] || meta?.title || item.title, kind: 'stream' });
+      playStream(s, item, trackId)
+        .then(() => {
+          setLoading(null);
+          onPlayed();
+        })
+        .catch((e) => {
+          setLoading(null);
+          flash(`Could not play: ${e.message}`);
+        });
     },
-    [item, onPlayed, flash],
+    [item, onPlayed, flash, meta, trackId],
   );
 
   const runAction = useCallback(() => {
@@ -107,8 +189,16 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
       flash(`Downloading ${item.title}…`);
       startInstall(item.id).then(onPlayed).catch((e) => flash(`Could not install: ${e.message}`));
     } else {
-      flash(`Launching ${item.title}…`);
-      launch(item).then(onPlayed).catch((e) => flash(`Could not launch: ${e.message}`));
+      setLoading({ label: item.title, kind: 'app' });
+      launch(item)
+        .then(() => {
+          setLoading(null);
+          onPlayed();
+        })
+        .catch((e) => {
+          setLoading(null);
+          flash(`Could not launch: ${e.message}`);
+        });
     }
   }, [item, onPlayed, flash]);
 
@@ -124,11 +214,65 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
   // The list the current stage navigates, and how to activate an entry.
   const handleAction = useCallback(
     (action: NavAction) => {
-      const list: unknown[] =
+      if (loading) return; // ignore input while a stream is starting
+      const shots = meta?.screenshots ?? [];
+      const achAll = extras.achievements
+        ? [...extras.achievements.unlocked, ...extras.achievements.locked]
+        : [];
+      // The strips below the list, top to bottom, skipping empty ones.
+      const strips: StripZone[] = [
+        ...(shots.length > 0 ? (['shots'] as const) : []),
+        ...(achAll.length > 0 ? (['ach'] as const) : []),
+        ...(similar.length > 0 ? (['similar'] as const) : []),
+      ];
+
+      // Focus is in a horizontal strip: ◀▶ browse, ↑↓ move between strips.
+      if (strip) {
+        const items =
+          strip.zone === 'shots' ? shots : strip.zone === 'ach' ? achAll : similar;
+        const at = strips.indexOf(strip.zone);
+        switch (action) {
+          case 'left':
+            setStrip((s) => s && { ...s, idx: Math.max(0, s.idx - 1) });
+            break;
+          case 'right':
+            setStrip((s) => s && { ...s, idx: Math.min(items.length - 1, s.idx + 1) });
+            break;
+          case 'up':
+            if (at > 0) setStrip({ zone: strips[at - 1], idx: 0 });
+            else setStrip(null); // back up into the main list
+            break;
+          case 'down':
+            if (at < strips.length - 1) setStrip({ zone: strips[at + 1], idx: 0 });
+            break;
+          case 'confirm':
+            if (strip.zone === 'similar') {
+              const next = similar[strip.idx];
+              if (next) onOpen(next);
+            }
+            break;
+          case 'back':
+            setStrip(null);
+            break;
+          default:
+            break;
+        }
+        return;
+      }
+
+      const base: unknown[] =
         stage === 'episodes' ? episodesInSeason : stage === 'streams' ? (streams ?? []) : [0];
+      // A "Resume" entry takes index 0 when we have somewhere to continue from.
+      const offset = resumeShown ? 1 : 0;
+      const navLen = base.length + offset;
       switch (action) {
         case 'down':
-          setSel((i) => Math.min(list.length - 1, i + 1));
+          // At the bottom of the list, drop into the strips if any exist.
+          if (sel >= navLen - 1 && strips.length > 0) {
+            setStrip({ zone: strips[0], idx: 0 });
+          } else {
+            setSel((i) => Math.min(navLen - 1, i + 1));
+          }
           break;
         case 'up':
           setSel((i) => Math.max(0, i - 1));
@@ -145,12 +289,15 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
           }
           break;
         case 'confirm':
-          if (stage === 'actions') runAction();
-          else if (stage === 'episodes') {
-            const ep = episodesInSeason[sel];
+          if (resumeShown && sel === 0) {
+            if (resume) playChosen(resume.stream);
+          } else if (stage === 'actions') {
+            runAction();
+          } else if (stage === 'episodes') {
+            const ep = episodesInSeason[sel - offset];
             if (ep) openEpisode(ep);
           } else if (stage === 'streams') {
-            const s = streams?.[sel];
+            const s = streams?.[sel - offset];
             if (s) playChosen(s);
           }
           break;
@@ -164,8 +311,26 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
           break;
       }
     },
-    [stage, episodesInSeason, streams, seasons, season, sel, series, runAction, openEpisode, playChosen, onClose],
+    [stage, episodesInSeason, streams, seasons, season, sel, series, runAction, openEpisode, playChosen, onClose, onOpen, loading, strip, similar, extras, meta, resume, resumeShown],
   );
+
+  // Navigation must always keep the selection on screen: the selected list
+  // entry when walking the list, the focused card when in a strip.
+  useEffect(() => {
+    if (strip) return;
+    selRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [sel, stage, strip, streams, episodesInSeason]);
+
+  useEffect(() => {
+    if (!strip) return;
+    const el =
+      strip.zone === 'shots'
+        ? shotRefs.current[strip.idx]
+        : strip.zone === 'ach'
+          ? achRefs.current[strip.idx]
+          : simRefs.current[strip.idx];
+    el?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'center' });
+  }, [strip]);
 
   // Register the handler so App forwards controller/keyboard nav here.
   useEffect(() => {
@@ -207,6 +372,39 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
                 .filter(Boolean)
                 .join('  ·  ')}
             </div>
+            {(extras.playtime_minutes != null || extras.hltb || extras.achievements) && (
+              <div className="game-stats">
+                {extras.playtime_minutes != null && (
+                  <span className="game-stat">
+                    <span className="game-stat-label">Played</span>
+                    {formatHours(extras.playtime_minutes / 60)}
+                  </span>
+                )}
+                {extras.hltb && (
+                  <>
+                    <span className="game-stat">
+                      <span className="game-stat-label">Story</span>
+                      {formatHours(extras.hltb.main)}
+                    </span>
+                    <span className="game-stat">
+                      <span className="game-stat-label">Story + extras</span>
+                      {formatHours(extras.hltb.main_extra)}
+                    </span>
+                    <span className="game-stat">
+                      <span className="game-stat-label">Completionist</span>
+                      {formatHours(extras.hltb.completionist)}
+                    </span>
+                  </>
+                )}
+                {extras.achievements && (
+                  <span className="game-stat">
+                    <span className="game-stat-label">Achievements</span>
+                    {extras.achievements.unlocked.length} /{' '}
+                    {extras.achievements.unlocked.length + extras.achievements.locked.length}
+                  </span>
+                )}
+              </div>
+            )}
             {(meta?.developer || meta?.publisher) && (
               <div className="details-credits">
                 {meta?.developer && (
@@ -237,9 +435,23 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
 
         {stage === 'actions' && (
           <div className="details-actions">
-            <div className="row-item selected action-button">
+            <div
+              ref={!strip ? selRef : undefined}
+              className={`row-item action-button ${!strip ? 'selected' : ''}`}
+              onClick={runAction}
+            >
               {item.action === 'install' ? 'Install' : 'Play'}
             </div>
+          </div>
+        )}
+
+        {resumeShown && resume && (
+          <div
+            ref={sel === 0 && !strip ? selRef : undefined}
+            className={`resume-btn ${sel === 0 && !strip ? 'selected' : ''}`}
+            onClick={() => playChosen(resume.stream)}
+          >
+            ▶ Resume · {formatTime(resume.position)} · same source
           </div>
         )}
 
@@ -259,9 +471,10 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
               {episodesInSeason.map((ep, i) => (
                 <div
                   key={ep.id}
-                  className={`ep-item ${i === sel ? 'selected' : ''}`}
+                  ref={i === sel - resumeOffset && !strip ? selRef : undefined}
+                  className={`ep-item ${i === sel - resumeOffset && !strip ? 'selected' : ''}`}
                   onClick={() => {
-                    setSel(i);
+                    setSel(i + resumeOffset);
                     openEpisode(ep);
                   }}
                 >
@@ -282,24 +495,32 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
         {stage === 'streams' && (
           <div className="streams">
             <div className="streams-head">
-              {episode
-                ? `${episode.season}×${String(episode.episode).padStart(2, '0')} — ${episode.title}`
-                : 'Sources'}
+              {isShopItem(item.id)
+                ? 'Where to buy — cheapest first'
+                : episode
+                  ? `${episode.season}×${String(episode.episode).padStart(2, '0')} — ${episode.title}`
+                  : 'Sources'}
             </div>
-            {streams === null && <div className="details-hint">Finding sources…</div>}
+            {streams === null && (
+              <div className="details-hint">
+                {isShopItem(item.id) ? 'Comparing store prices…' : 'Finding sources…'}
+              </div>
+            )}
             {streams?.length === 0 && (
               <div className="details-hint">
-                No sources found. Add or configure a stream addon (e.g. Torrentio, WatchHub) in
-                Settings.
+                {isShopItem(item.id)
+                  ? 'No store offers found right now.'
+                  : 'No sources found. Add or configure a stream addon (e.g. Torrentio, WatchHub) in Settings.'}
               </div>
             )}
             <div className="stream-list">
               {streams?.map((s, i) => (
                 <div
                   key={`${s.url}-${i}`}
-                  className={`stream-item ${i === sel ? 'selected' : ''}`}
+                  ref={i === sel - resumeOffset && !strip ? selRef : undefined}
+                  className={`stream-item ${i === sel - resumeOffset && !strip ? 'selected' : ''}`}
                   onClick={() => {
-                    setSel(i);
+                    setSel(i + resumeOffset);
                     playChosen(s);
                   }}
                 >
@@ -316,21 +537,188 @@ export function DetailsPage({ item, onClose, onPlayed, actionRef }: Props) {
 
         {!!meta?.screenshots?.length && (
           <div className="shots">
-            <div className="shots-head">Screenshots</div>
+            <div className={`shots-head ${strip?.zone === 'shots' ? 'focused' : ''}`}>
+              Screenshots <span className="details-hint">↓ then ◀ ▶ to browse</span>
+            </div>
             <div className="shots-strip">
-              {meta.screenshots.map((src) => (
-                <img key={src} className="shot" src={src} alt="" loading="lazy" />
+              {meta.screenshots.map((src, i) => (
+                <img
+                  key={src}
+                  ref={(el) => {
+                    shotRefs.current[i] = el;
+                  }}
+                  className={`shot ${strip?.zone === 'shots' && i === strip.idx ? 'focused' : ''}`}
+                  src={src}
+                  alt=""
+                  loading="lazy"
+                  onClick={() => setStrip({ zone: 'shots', idx: i })}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {extras.achievements &&
+          extras.achievements.unlocked.length + extras.achievements.locked.length > 0 && (
+            <div className="shots">
+              <div className={`shots-head ${strip?.zone === 'ach' ? 'focused' : ''}`}>
+                Achievements
+                <span className="search-section-count">
+                  {extras.achievements.unlocked.length} of{' '}
+                  {extras.achievements.unlocked.length + extras.achievements.locked.length} earned
+                </span>{' '}
+                <span className="details-hint">↓ then ◀ ▶ to browse</span>
+              </div>
+              <div className="shots-strip">
+                {[...extras.achievements.unlocked, ...extras.achievements.locked].map((a, i) => (
+                  <div
+                    key={`${a.name}-${i}`}
+                    ref={(el) => {
+                      achRefs.current[i] = el;
+                    }}
+                    className={`ach-tile ${a.unlocked_at == null ? 'ach-locked' : ''} ${
+                      strip?.zone === 'ach' && i === strip.idx ? 'focused' : ''
+                    }`}
+                  >
+                    {a.icon && <img src={a.icon} alt="" loading="lazy" />}
+                    <div className="ach-text">
+                      <div className="ach-name">{a.name}</div>
+                      {a.description && <div className="ach-desc">{a.description}</div>}
+                      {a.unlocked_at != null && a.unlocked_at > 0 && (
+                        <div className="ach-date">
+                          {new Date(a.unlocked_at * 1000).toLocaleDateString()}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+        {similar.length > 0 && (
+          <div className="shots similar-block">
+            <div className={`shots-head ${strip?.zone === 'similar' ? 'focused' : ''}`}>
+              More like this <span className="details-hint">↓ then ◀ ▶ · A to open</span>
+            </div>
+            <div className="shots-strip">
+              {similar.map((s, i) => (
+                <div
+                  key={s.id}
+                  ref={(el) => {
+                    simRefs.current[i] = el;
+                  }}
+                  className={`sim-card ${
+                    strip?.zone === 'similar' && i === strip.idx ? 'focused' : ''
+                  }`}
+                  onClick={() => onOpen(s)}
+                >
+                  {s.art ? (
+                    <img src={s.art} alt={s.title} loading="lazy" />
+                  ) : (
+                    <div className="card-placeholder">{s.title}</div>
+                  )}
+                  <div className="sim-card-title">{s.title}</div>
+                </div>
               ))}
             </div>
           </div>
         )}
       </div>
 
+      <div className="details-legend">
+        <span>
+          <span className="key">↑↓</span> Browse
+        </span>
+        <span>
+          <span className="key">A</span> Select
+        </span>
+        <span>
+          <span className="key">B</span> Back
+        </span>
+        {stage === 'episodes' && seasons.length > 1 && (
+          <span>
+            <span className="key">◀▶</span> Season
+          </span>
+        )}
+      </div>
+
       {status && <div className="toast">{status}</div>}
+      {loading && (
+        <LoadingOverlay
+          label={loading.label}
+          kind={loading.kind}
+          art={meta?.background || item.art}
+          poster={meta?.poster || item.art}
+        />
+      )}
+    </div>
+  );
+}
+
+type LoadingKind = 'stream' | 'app';
+
+const LOADING_MESSAGES: Record<LoadingKind, string[]> = {
+  stream: ['Finding the best source…', 'Connecting to peers…', 'Buffering — almost there…'],
+  app: ['Launching…', 'Still starting — big games take a moment…', 'Almost there…'],
+};
+
+/** Full-screen "it's working, not frozen" overlay shown while a stream/app
+ *  starts: the item's own artwork washed into the theme, its poster, and a
+ *  quiet indeterminate bar with staged reassurance messages. */
+function LoadingOverlay({
+  label,
+  kind,
+  art,
+  poster,
+}: {
+  label: string;
+  kind: LoadingKind;
+  art?: string;
+  poster?: string;
+}) {
+  const [phase, setPhase] = useState(0);
+  useEffect(() => {
+    const t1 = window.setTimeout(() => setPhase(1), 4000);
+    const t2 = window.setTimeout(() => setPhase(2), 9000);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, []);
+  return (
+    <div className="loading-screen">
+      {art && <div className="loading-art" style={{ backgroundImage: `url(${art})` }} />}
+      <div className="loading-content">
+        {poster && <img className="loading-poster" src={poster} alt="" />}
+        <div className="loading-kicker">{kind === 'app' ? 'Launching' : 'Now playing'}</div>
+        <div className="loading-title">{label}</div>
+        <div className="loading-bar">
+          <div className="loading-bar-fill" />
+        </div>
+        {/* key remounts the line so each new message fades in */}
+        <div className="loading-msg" key={phase}>
+          {LOADING_MESSAGES[kind][phase]}
+        </div>
+      </div>
     </div>
   );
 }
 
 function emptyMeta(item: ContentItem): Meta {
   return { id: item.id, kind: item.kind, title: item.title, genres: [], episodes: [] };
+}
+
+function formatHours(hours: number): string {
+  if (hours <= 0) return '—';
+  if (hours < 10) return `${Math.round(hours * 2) / 2} h`;
+  return `${Math.round(hours)} h`;
+}
+
+function formatTime(seconds: number): string {
+  const s = Math.floor(seconds % 60);
+  const m = Math.floor((seconds / 60) % 60);
+  const h = Math.floor(seconds / 3600);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }

@@ -7,11 +7,16 @@
 //! can be installed at runtime.
 
 pub mod epic;
+pub mod gamehub;
+pub mod gamerec;
+pub mod gog;
+pub mod hltb;
 pub mod retro;
 pub mod steam;
 pub mod stremio;
 pub mod tmdb;
 pub mod videos;
+pub mod youtube;
 
 use serde::Serialize;
 
@@ -72,10 +77,12 @@ impl Registry {
             sources: vec![
                 Box::new(steam::Steam::new()),
                 Box::new(epic::Epic::detect()),
-                Box::new(retro::Retro::new()),
+                Box::new(gog::Gog),
                 Box::new(videos::Videos),
                 Box::new(stremio::Stremio::default()),
                 Box::new(tmdb::Tmdb::default()),
+                Box::new(youtube::YouTube::detect()),
+                Box::new(gamehub::GameShop),
             ],
         }
     }

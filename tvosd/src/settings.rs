@@ -33,6 +33,36 @@ pub struct Settings {
     /// TMDB API key (themoviedb.org → Settings → API).
     #[serde(default)]
     pub tmdb_key: String,
+    /// UI accent color as a hex string (e.g. "#4f8cff"); empty = the default.
+    #[serde(default)]
+    pub accent: String,
+    /// YouTube channels to follow (@handles or channel URLs, comma/space
+    /// separated). Each becomes a home row via yt-dlp — no API key needed.
+    #[serde(default)]
+    pub youtube_channels: String,
+    /// Use the YouTube account signed in inside the TV OS browser window:
+    /// adds the personal "For you" and "Subscriptions" rows (cookie-based).
+    #[serde(default)]
+    pub youtube_account: bool,
+    /// Two-letter country code for game store pricing ("" = US).
+    #[serde(default)]
+    pub game_region: String,
+    /// Trakt API app credentials (trakt.tv/oauth/applications) + the OAuth
+    /// token the device-code flow saves. Watched movies/episodes sync there.
+    #[serde(default)]
+    pub trakt_client_id: String,
+    #[serde(default)]
+    pub trakt_client_secret: String,
+    #[serde(default)]
+    pub trakt_token: String,
+    /// AniList access token (implicit grant from your own AniList API client).
+    #[serde(default)]
+    pub anilist_token: String,
+    /// MyAnimeList API client id (PKCE flow; token saved by the callback).
+    #[serde(default)]
+    pub mal_client_id: String,
+    #[serde(default)]
+    pub mal_token: String,
 }
 
 pub struct SettingsStore {

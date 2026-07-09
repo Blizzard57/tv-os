@@ -2,7 +2,8 @@
 # Downloads the AI upscaling shaders tvosd's Enhance profiles use:
 #   Anime4K v4   (anime chains)        — MIT, github.com/bloc97/Anime4K
 #   FSRCNNX      (live-action chains)  — github.com/igv/FSRCNN-TensorFlow
-# Idempotent; safe to re-run. Profiles degrade gracefully if this never runs.
+# tvosd now fetches these itself at startup (src/shaders.rs); this script is
+# the manual/offline alternative. Idempotent; safe to re-run.
 set -euo pipefail
 
 DIR="${TVOS_SHADER_DIR:-$HOME/.local/share/tvos/shaders}"

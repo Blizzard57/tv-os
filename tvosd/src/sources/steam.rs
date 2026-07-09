@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::install::InstallManager;
 use crate::model::{Action, ContentItem, Kind, Row};
 use crate::sources::Source;
 use crate::util::percent_encode;
@@ -86,36 +87,57 @@ impl Source for Steam {
     }
 
     fn rows(&self) -> Vec<Row> {
-        // Installed games first, then everything else the account owns;
-        // dedupe so an installed game isn't listed twice.
-        let mut items = scan();
-        for game in self.owned_games() {
-            if !items.iter().any(|i| i.id == game.id) {
-                items.push(game);
-            }
-        }
-        items.sort_by_key(|item| item.title.to_lowercase());
-        vec![Row {
-            title: "Games".to_string(),
-            items,
-        }]
+        // Installed (on-disk) games are ready to play; everything else the
+        // account owns is ready to install.
+        let mut installed = scan();
+        let installed_ids: Vec<String> = installed.iter().map(|i| i.id.clone()).collect();
+        let mut not_installed: Vec<ContentItem> = self
+            .owned_games()
+            .into_iter()
+            .filter(|g| !installed_ids.contains(&g.id))
+            .map(|mut g| {
+                g.action = Action::Install;
+                g
+            })
+            .collect();
+        installed.sort_by_key(|item| item.title.to_lowercase());
+        not_installed.sort_by_key(|item| item.title.to_lowercase());
+        vec![
+            Row {
+                title: "Ready to Play".to_string(),
+                items: installed,
+            },
+            Row {
+                title: "Ready to Install".to_string(),
+                items: not_installed,
+            },
+        ]
     }
 
     fn launch(&self, item_id: &str) -> Result<(), String> {
         let appid = item_id.strip_prefix("steam:").unwrap_or_default();
-        let url = format!("steam://rungameid/{appid}");
-        // Native install first, flatpak as fallback.
-        let attempts: [(&str, Vec<&str>); 2] = [
-            ("steam", vec![&url]),
-            ("flatpak", vec!["run", "com.valvesoftware.Steam", &url]),
-        ];
-        for (program, args) in attempts {
-            if launcher::spawn_detached(program, &args).is_ok() {
-                return Ok(());
-            }
-        }
-        Err("could not start Steam (tried native and flatpak)".to_string())
+        run_steam_url(&format!("steam://rungameid/{appid}"))
     }
+
+    fn install(&self, item_id: &str, _jobs: &InstallManager) -> Result<(), String> {
+        let appid = item_id.strip_prefix("steam:").unwrap_or_default();
+        // Steam owns the download; this opens its install dialog.
+        run_steam_url(&format!("steam://install/{appid}"))
+    }
+}
+
+/// Opens a steam:// URL via the native client, falling back to the flatpak.
+fn run_steam_url(url: &str) -> Result<(), String> {
+    let attempts: [(&str, Vec<&str>); 2] = [
+        ("steam", vec![url]),
+        ("flatpak", vec!["run", "com.valvesoftware.Steam", url]),
+    ];
+    for (program, args) in attempts {
+        if launcher::spawn_detached(program, &args).is_ok() {
+            return Ok(());
+        }
+    }
+    Err("could not start Steam (tried native and flatpak)".to_string())
 }
 
 /// Store-page summary for a game's details page (public Steam storefront API,
@@ -337,8 +359,156 @@ fn owned_item(game: &Value) -> Option<ContentItem> {
 }
 
 /// Public Steam CDN poster art; the UI falls back to a placeholder on 404.
-fn art_url(appid: impl std::fmt::Display) -> String {
+pub fn art_url(appid: impl std::fmt::Display) -> String {
     format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg")
+}
+
+// ---- Per-game stats for the details page (playtime, achievements) ----------
+
+static PLAYTIME_CACHE: std::sync::LazyLock<
+    Mutex<Option<(std::time::Instant, std::collections::HashMap<String, i64>)>>,
+> = std::sync::LazyLock::new(Mutex::default);
+
+/// Minutes played across all time, from GetOwnedGames (cached ten minutes).
+pub fn playtime_minutes(appid: &str) -> Option<i64> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    {
+        let cache = PLAYTIME_CACHE.lock().unwrap();
+        if let Some((at, map)) = &*cache {
+            if at.elapsed() < TTL {
+                return map.get(appid).copied();
+            }
+        }
+    }
+    let s = settings::STORE.get();
+    if s.steam_api_key.is_empty() || s.steam_id.is_empty() {
+        return None;
+    }
+    let steamid = resolve_steamid(&s.steam_api_key, &s.steam_id)?;
+    let url = format!(
+        "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key={}\
+         &steamid={steamid}&include_played_free_games=1&format=json",
+        s.steam_api_key
+    );
+    let json: Value = serde_json::from_str(&addons::http_get(&url).ok()?).ok()?;
+    let map: std::collections::HashMap<String, i64> = json
+        .get("response")?
+        .get("games")?
+        .as_array()?
+        .iter()
+        .filter_map(|g| {
+            Some((
+                g.get("appid")?.as_i64()?.to_string(),
+                g.get("playtime_forever")?.as_i64()?,
+            ))
+        })
+        .collect();
+    let minutes = map.get(appid).copied();
+    *PLAYTIME_CACHE.lock().unwrap() = Some((std::time::Instant::now(), map));
+    minutes
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct Achievement {
+    pub name: String,
+    pub description: String,
+    pub icon: String,
+    /// Unix time when earned; None = still locked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlocked_at: Option<i64>,
+}
+
+/// (unlocked, locked) achievements for a game, or None when the game has
+/// none / the profile hides them. Schema gives names+icons, the player call
+/// gives earned state; joined by api name.
+pub fn achievements(appid: &str) -> Option<(Vec<Achievement>, Vec<Achievement>)> {
+    let s = settings::STORE.get();
+    if s.steam_api_key.is_empty() || s.steam_id.is_empty() {
+        return None;
+    }
+    let steamid = resolve_steamid(&s.steam_api_key, &s.steam_id)?;
+
+    let schema_url = format!(
+        "https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/?key={}&appid={appid}&l=english",
+        s.steam_api_key
+    );
+    let schema: Value = serde_json::from_str(&addons::http_get(&schema_url).ok()?).ok()?;
+    let defs = schema
+        .get("game")?
+        .get("availableGameStats")?
+        .get("achievements")?
+        .as_array()?
+        .clone();
+    if defs.is_empty() {
+        return None;
+    }
+
+    let player_url = format!(
+        "https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/?key={}&steamid={steamid}&appid={appid}",
+        s.steam_api_key
+    );
+    // Private profiles / never-launched games 400 here — show all as locked.
+    let earned: std::collections::HashMap<String, i64> = addons::http_get(&player_url)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| {
+            Some(
+                v.get("playerstats")?
+                    .get("achievements")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|a| {
+                        if a.get("achieved")?.as_i64()? == 1 {
+                            Some((
+                                a.get("apiname")?.as_str()?.to_string(),
+                                a.get("unlocktime").and_then(|t| t.as_i64()).unwrap_or(0),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+
+    let mut unlocked = Vec::new();
+    let mut locked = Vec::new();
+    for def in &defs {
+        let api = def.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+        let display = def
+            .get("displayName")
+            .and_then(|n| n.as_str())
+            .unwrap_or(api)
+            .to_string();
+        let description = def
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        match earned.get(api) {
+            Some(&t) => unlocked.push(Achievement {
+                name: display,
+                description,
+                icon: def.get("icon").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
+                unlocked_at: Some(t),
+            }),
+            None => locked.push(Achievement {
+                name: display,
+                description,
+                // The grayed-out variant reads as "not yet earned".
+                icon: def
+                    .get("icongray")
+                    .or_else(|| def.get("icon"))
+                    .and_then(|i| i.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                unlocked_at: None,
+            }),
+        }
+    }
+    unlocked.sort_by_key(|a| std::cmp::Reverse(a.unlocked_at.unwrap_or(0)));
+    Some((unlocked, locked))
 }
 
 fn scan() -> Vec<ContentItem> {

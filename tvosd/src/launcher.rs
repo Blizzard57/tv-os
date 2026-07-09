@@ -1,25 +1,26 @@
 //! Process helpers for launching content.
 //!
-//! Video plays in libmpv — the same engine Stremio uses — skinned with uosc for
-//! a modern, minimal, controller-friendly UI. We point mpv at a private config
-//! dir (MPV_HOME) that tvosd fully provisions from its bundled, editable player
-//! (see tvosd/player/): the uosc UI, thumbfast thumbnails, our controller +
-//! upscaler scripts, an input map, and a freshly written mpv.conf holding the
-//! resolved Enhance shader chain. Because everything travels via MPV_HOME, *any*
-//! mpv launch picks it up — including the one webtorrent-cli spawns for torrents
-//! — so torrents get the same player, UI, and realtime upscaler too.
+//! Video plays in libmpv — the same engine Stremio uses — skinned with ModernZ
+//! for a modern, minimal, controller-friendly UI. We point mpv at a private
+//! config dir (MPV_HOME) that tvosd fully provisions from its bundled, editable
+//! player (see tvosd/player/): the ModernZ UI, thumbfast thumbnails, our
+//! controller + upscaler scripts, an input map, and a freshly written mpv.conf
+//! holding the resolved Enhance shader chain. Because everything travels via
+//! MPV_HOME, *any* mpv launch picks it up — including the one webtorrent-cli
+//! spawns for torrents — so torrents get the same player, UI, and upscaler too.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use include_dir::{include_dir, Dir};
 
 use crate::settings::EnhanceMode;
 use crate::upscale::Profile;
 
-/// The bundled player (uosc + thumbfast + our controller/upscaler scripts and
-/// config), embedded so the daemon always provisions a complete, working uosc.
+/// The bundled player (ModernZ + thumbfast + our controller/upscaler scripts and
+/// config), embedded so the daemon always provisions a complete, working UI.
 static PLAYER_FILES: Dir = include_dir!("$CARGO_MANIFEST_DIR/player");
 
 /// The currently playing player process, if any. Starting a new video stops
@@ -42,6 +43,8 @@ slang=en,eng
 alang=en,eng
 sub-auto=fuzzy
 sub-font-size=42
+# ModernZ raises subtitles above its bar; keep that out of watch-later state.
+watch-later-options-remove=sub-pos
 # Clean, widely-installed UI/subtitle font (uosc text follows osd-font).
 osd-font=Noto Sans
 volume=100
@@ -60,22 +63,35 @@ pub fn play_video(
     profile: &Profile,
     mode: EnhanceMode,
     hint: &str,
+    item_id: Option<&str>,
+    track_id: Option<&str>,
 ) -> Result<(), String> {
-    let home = prepare_mpv_home(profile, mode, hint);
+    let start = item_id.and_then(crate::resume::position);
+    let home = prepare_mpv_home(profile, mode, hint, start);
     let mut player = PLAYER.lock().unwrap();
     stop(&mut player);
 
     crate::log_info!("playing [{}] mpv {target}", profile.name);
-    let child = Command::new("mpv")
-        .env("MPV_HOME", &home)
+    let _ = std::fs::remove_file(home.join(".started")); // fresh start signal
+    let _ = std::fs::remove_file(home.join("mpv.log"));
+    let mut cmd = Command::new("mpv");
+    cmd.env("MPV_HOME", &home)
         .args(["--no-terminal", target])
         .stdin(Stdio::null())
         .stdout(crate::logging::child_output())
-        .stderr(crate::logging::child_output())
+        .stderr(crate::logging::child_output());
+    own_process_group(&mut cmd);
+    if let Some(id) = item_id {
+        cmd.env("TVOS_POSITION_FILE", crate::resume::position_file(id));
+        // resume.lua tags the watched-marker with the *precise* id (an episode
+        // carries season:episode) so the Trakt/AniList scrobbler can resolve
+        // exactly what was watched; the resume position stays keyed by item_id.
+        cmd.env("TVOS_ITEM_ID", track_id.unwrap_or(id));
+    }
+    let child = cmd
         .spawn()
         .map_err(|e| format!("could not start mpv: {e}"))?;
-    *player = Some(child);
-    Ok(())
+    confirm_started(&home, child, false, &mut player)
 }
 
 /// Opens a link (a WatchHub service, an addon's /configure page) in the
@@ -97,12 +113,15 @@ pub fn play_torrent(
     profile: &Profile,
     mode: EnhanceMode,
     hint: &str,
+    item_id: Option<&str>,
+    track_id: Option<&str>,
 ) -> Result<(), String> {
     let webtorrent = resolve_webtorrent().ok_or(
         "Torrent playback needs webtorrent-cli. Install it with `npm install -g webtorrent-cli`, \
          or configure the addon with a debrid service (e.g. RealDebrid) for direct streams.",
     )?;
-    let home = prepare_mpv_home(profile, mode, hint);
+    let start = item_id.and_then(crate::resume::position);
+    let home = prepare_mpv_home(profile, mode, hint, start);
     let mut player = PLAYER.lock().unwrap();
     stop(&mut player);
 
@@ -123,10 +142,17 @@ pub fn play_torrent(
     // when partial data was already cached (the file finishes seconds in) or the
     // file was small. Keeping it seeding leaves the server up for the whole
     // playback; webtorrent still exits when mpv itself closes.
+    // Give webtorrent its own free port for the local HTTP server. Its default
+    // is 8000, and when that's taken — e.g. an earlier --keep-seeding instance
+    // orphaned by a daemon restart is still seeding on it — webtorrent-cli's
+    // fallback is buggy and it *never launches the player*. That was the real
+    // "sometimes the stream doesn't start". A fresh port makes it impossible.
+    let port = free_port();
     let mut cmd = Command::new(&webtorrent);
     cmd.arg(magnet)
         .arg("--mpv")
         .arg("--keep-seeding")
+        .args(["--port", &port.to_string()])
         // --quiet drops webtorrent's once-a-second full-screen progress redraw,
         // which otherwise floods the shared log file (mpv's own log-file keeps
         // the rich playback diagnostics, and webtorrent still prints errors).
@@ -145,24 +171,133 @@ pub fn play_torrent(
         "playing [torrent {}] via {webtorrent}: {magnet}",
         profile.name
     );
-    let child = cmd
-        .env("MPV_HOME", &home)
+    let _ = std::fs::remove_file(home.join(".started")); // fresh start signal
+    let _ = std::fs::remove_file(home.join("mpv.log"));
+    cmd.env("MPV_HOME", &home)
         .stdin(Stdio::null())
         .stdout(crate::logging::child_output())
-        .stderr(crate::logging::child_output())
+        .stderr(crate::logging::child_output());
+    own_process_group(&mut cmd);
+    if let Some(id) = item_id {
+        // webtorrent's mpv inherits these, so resume.lua can save the position
+        // and write the watched-marker — torrents scrobble just like direct
+        // streams (previously the marker was never written for torrents).
+        cmd.env("TVOS_POSITION_FILE", crate::resume::position_file(id));
+        cmd.env("TVOS_ITEM_ID", track_id.unwrap_or(id));
+    }
+    let child = cmd
         .spawn()
         .map_err(|e| format!("could not start torrent stream: {e}"))?;
-    *player = Some(child);
-    Ok(())
+    confirm_started(&home, child, true, &mut player)
+}
+
+/// Waits until playback actually starts before reporting success, so the shell
+/// shows a real error instead of a window that never appears. The signal is the
+/// `.started` marker that scripts/startup.lua writes on mpv's `file-loaded`
+/// event (reliable even for torrents, where webtorrent runs mpv with
+/// --really-quiet and the log file is suppressed). As a fast path we also watch
+/// mpv's log for an open failure (present for direct streams). On failure (the
+/// player exits, the source can't be opened, or nothing starts in time) the
+/// just-spawned process is killed and a clear message is returned.
+fn confirm_started(
+    home: &Path,
+    mut child: Child,
+    torrent: bool,
+    player: &mut Option<Child>,
+) -> Result<(), String> {
+    let started = home.join(".started");
+    let log = home.join("mpv.log");
+    let timeout = Duration::from_secs(if torrent { 25 } else { 15 });
+    let deadline = Instant::now() + timeout;
+
+    let outcome = loop {
+        std::thread::sleep(Duration::from_millis(400));
+
+        if started.exists() {
+            break Ok(());
+        }
+
+        if let Ok(text) = std::fs::read_to_string(&log) {
+            if text.contains("Failed to open")
+                || text.contains("Opening failed or was aborted")
+                || text.contains("Failed to recognize file format")
+            {
+                break Err(if torrent {
+                    "Could not open this torrent's file — the source looks broken. Try another source."
+                } else {
+                    "Could not open the stream — the source may be down. Try another source."
+                });
+            }
+        }
+
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break Err(if torrent {
+                "The torrent stream stopped before it started — likely no seeders or an unavailable source. Try another source."
+            } else {
+                "The player exited before the stream started — the source may be unavailable. Try another source."
+            });
+        }
+
+        if Instant::now() >= deadline {
+            break Err(if torrent {
+                "No working source — this torrent has too few seeders to stream. Pick another quality, or add a debrid service (e.g. RealDebrid) in the addon for instant, reliable streams."
+            } else {
+                "Stream didn't start in time — the source may be slow or unavailable. Try another source."
+            });
+        }
+    };
+
+    match outcome {
+        Ok(()) => {
+            *player = Some(child);
+            Ok(())
+        }
+        Err(message) => {
+            kill_tree(&mut child);
+            crate::log_error!("{message}");
+            Err(message.to_string())
+        }
+    }
+}
+
+/// Puts the child in its own process group so [`kill_tree`] can take out the
+/// whole tree. Matters for torrents: the tracked child is webtorrent, and the
+/// mpv *it* spawns must die with it — otherwise switching content leaves an
+/// orphaned player window fighting the new one for the screen.
+fn own_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
+/// Kills the child and every process in its group (mpv under webtorrent, etc.).
+fn kill_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Sets up MPV_HOME for this playback and returns it: provisions the bundled
 /// player, writes mpv.conf with the resolved shader chain, and writes the
 /// upscaler menu's preset list. Idempotent.
-fn prepare_mpv_home(profile: &Profile, mode: EnhanceMode, hint: &str) -> PathBuf {
+fn prepare_mpv_home(
+    profile: &Profile,
+    mode: EnhanceMode,
+    hint: &str,
+    start: Option<f64>,
+) -> PathBuf {
     let home = mpv_home();
     provision_player(&home);
-    write_mpv_conf(&home, profile);
+    write_mpv_conf(&home, profile, start);
     write_upscalers(&home, mode, hint);
     home
 }
@@ -171,13 +306,13 @@ fn prepare_mpv_home(profile: &Profile, mode: EnhanceMode, hint: &str) -> PathBuf
 /// bundled files are rewritten *once*. Otherwise the daemon never touches them
 /// again, so anything you edit under MPV_HOME stays edited (no rebuild needed),
 /// and deleting a file restores its shipped default on the next launch.
-const PLAYER_VERSION: &str = "3";
+const PLAYER_VERSION: &str = "11";
 
-/// Installs the bundled player into MPV_HOME so uosc is *always* the UI. The
-/// entire player tree (uosc + its lib/elements/intl, thumbfast, our scripts and
-/// config) is extracted. Each file is (re)written only when missing or when
+/// Installs the bundled player into MPV_HOME so ModernZ is *always* the UI. The
+/// entire player tree (ModernZ, thumbfast, our scripts and config) is
+/// extracted. Each file is (re)written only when missing or when
 /// PLAYER_VERSION changes, which makes MPV_HOME the live, editable surface: edit
-/// script-opts/uosc.conf, input.conf, scripts/*.lua there and they take effect
+/// script-opts/modernz.conf, input.conf, scripts/*.lua there and they take effect
 /// on the next play; delete one to restore its shipped default.
 fn provision_player(home: &Path) {
     let _ = std::fs::create_dir_all(home);
@@ -199,7 +334,12 @@ fn provision_player(home: &Path) {
     }
 
     if refresh {
-        // Superseded by upscaler.lua / the complete uosc — clear stale files.
+        // Remove players/scripts shipped by earlier versions so MPV_HOME doesn't
+        // load two OSCs at once (uosc + ModernZ would fight over the screen).
+        let _ = std::fs::remove_dir_all(home.join("scripts/uosc"));
+        let _ = std::fs::remove_file(home.join("fonts/uosc_icons.otf"));
+        let _ = std::fs::remove_file(home.join("fonts/uosc_textures.ttf"));
+        let _ = std::fs::remove_file(home.join("script-opts/uosc.conf"));
         let _ = std::fs::remove_file(home.join("scripts/enhance-toggle.lua"));
         let _ = std::fs::remove_file(home.join("enhance-toggle.lua"));
         let _ = std::fs::remove_file(home.join(".uosc-version")); // old stamp name
@@ -226,11 +366,16 @@ fn extract_dir(dir: &Dir, dest: &Path, refresh: bool) {
 
 /// Writes the per-playback mpv.conf: base 10-foot settings, uosc as the UI,
 /// gamepad input on, a real log file, and the resolved Enhance shader chain.
-fn write_mpv_conf(home: &Path, profile: &Profile) {
+fn write_mpv_conf(home: &Path, profile: &Profile, start: Option<f64>) {
     let mut conf = String::from(BASE_MPV_CONF);
     conf.push_str("osc=no\n"); // uosc is the UI
     conf.push_str("osd-bar=no\n");
     conf.push_str("input-gamepad=yes\n"); // controller.lua maps the buttons
+    // Resume where we left off (works for torrents too, since their mpv only
+    // reads this config — we can't pass it args).
+    if let Some(secs) = start {
+        conf.push_str(&format!("start={secs}\n"));
+    }
     // A real log file (mpv writes nothing to a suppressed terminal) so the
     // actual reason a stream fails is always visible.
     conf.push_str(&format!("log-file=\"{}\"\n", home.join("mpv.log").display()));
@@ -279,6 +424,16 @@ fn torrent_cache() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/tvos/torrents")
 }
 
+/// An OS-assigned free TCP port (bound to :0, then released) for webtorrent's
+/// HTTP server, so it never collides with a stray seeder on the default 8000.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(8000)
+}
+
 /// Finds the webtorrent binary on PATH, or in the usual npm-global locations
 /// (a desktop-launched daemon often has a minimal PATH that misses them).
 fn resolve_webtorrent() -> Option<String> {
@@ -307,8 +462,7 @@ fn resolve_webtorrent() -> Option<String> {
 
 fn stop(player: &mut Option<Child>) {
     if let Some(mut old) = player.take() {
-        let _ = old.kill();
-        let _ = old.wait();
+        kill_tree(&mut old);
     }
 }
 
@@ -356,7 +510,7 @@ mod tests {
                 "--glsl-shaders=/a.glsl:/b.glsl".into(),
             ],
         };
-        prepare_mpv_home(&profile, EnhanceMode::Off, "Movie.1080p.mkv");
+        prepare_mpv_home(&profile, EnhanceMode::Off, "Movie.1080p.mkv", None);
 
         let conf = std::fs::read_to_string(dir.join("mpv.conf")).unwrap();
         assert!(conf.contains("fullscreen=yes"));
@@ -365,11 +519,12 @@ mod tests {
         assert!(conf.contains("glsl-shaders=\"/a.glsl:/b.glsl\""));
 
         // The bundled player is installed and is the default.
-        assert!(dir.join("scripts/uosc/main.lua").exists());
+        assert!(dir.join("scripts/modernz.lua").exists());
         assert!(dir.join("scripts/upscaler.lua").exists());
         assert!(dir.join("scripts/controller.lua").exists());
         assert!(dir.join("input.conf").exists());
-        assert!(dir.join("fonts/uosc_icons.otf").exists());
+        assert!(dir.join("script-opts/modernz.conf").exists());
+        assert!(dir.join("fonts/modernz-icons.ttf").exists());
 
         // The upscaler menu has its preset list, with a valid active preset.
         let upscalers = std::fs::read_to_string(dir.join("upscalers.json")).unwrap();

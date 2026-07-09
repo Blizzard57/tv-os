@@ -76,6 +76,77 @@ export interface Settings {
   steam_api_key: string;
   steam_id: string;
   tmdb_key: string;
+  accent: string; // hex; "" means the default accent
+  /** YouTube channels to follow (@handles / URLs, comma or space separated). */
+  youtube_channels: string;
+  /** Use the account signed in inside TV OS for For-you/Subscriptions rows. */
+  youtube_account: boolean;
+  /** Two-letter country code for game store pricing ("" = US). */
+  game_region: string;
+  /** Trakt API app credentials + saved OAuth token (device flow). */
+  trakt_client_id: string;
+  trakt_client_secret: string;
+  trakt_token: string;
+  /** AniList access token (implicit grant from your own API client). */
+  anilist_token: string;
+  /** MyAnimeList client id + token saved by the PKCE callback. */
+  mal_client_id: string;
+  mal_token: string;
+}
+
+// ---- Game page extras (playtime, HLTB, achievements) ----
+
+export interface GameAchievement {
+  name: string;
+  description: string;
+  icon: string;
+  unlocked_at?: number;
+}
+
+export interface GameExtras {
+  playtime_minutes?: number | null;
+  hltb?: { main: number; main_extra: number; completionist: number } | null;
+  achievements?: { unlocked: GameAchievement[]; locked: GameAchievement[] } | null;
+}
+
+export async function fetchGameExtras(id: string): Promise<GameExtras> {
+  const res = await fetch(`/api/game?id=${encodeURIComponent(id)}`);
+  if (!res.ok) return {};
+  return res.json();
+}
+
+// ---- Watch tracking (Trakt / AniList / MAL) ----
+
+export interface TrackingStatus {
+  trakt: boolean;
+  trakt_pending?: string | null;
+  anilist: boolean;
+  mal: boolean;
+}
+
+export async function fetchTrackingStatus(): Promise<TrackingStatus> {
+  const res = await fetch('/api/tracking/status');
+  if (!res.ok) throw new Error(`tracking status failed: ${res.status}`);
+  return res.json();
+}
+
+/** Starts the Trakt device flow → show the code, the daemon polls. */
+export async function traktConnect(): Promise<{ user_code: string; url: string }> {
+  const res = await fetch('/api/trakt/connect', { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export interface YouTubeStatus {
+  connected: boolean;
+  detail: string;
+}
+
+/** Whether the signed-in YouTube feeds are reachable (cookie check). */
+export async function fetchYouTubeStatus(): Promise<YouTubeStatus> {
+  const res = await fetch('/api/youtube/status');
+  if (!res.ok) throw new Error(`youtube status failed: ${res.status}`);
+  return res.json();
 }
 
 export interface SteamStatus {
@@ -93,6 +164,13 @@ export interface Addon {
   streams: boolean;
   meta: boolean;
   configure_url?: string;
+}
+
+/** Daemon version — the quick "am I on the latest build?" check. */
+export async function fetchVersion(): Promise<string> {
+  const res = await fetch('/api/version');
+  if (!res.ok) throw new Error(`version request failed: ${res.status}`);
+  return (await res.json()).version as string;
 }
 
 export async function fetchSettings(): Promise<Settings> {
@@ -137,6 +215,17 @@ export const launch = (item: ContentItem) =>
   post('/api/launch', { id: item.id, title: item.title, kind: item.kind, art: item.art });
 export const startInstall = (id: string) => post('/api/install', { id });
 
+export interface SourceStatus {
+  id: string;
+  available: boolean;
+}
+
+export async function fetchSources(): Promise<SourceStatus[]> {
+  const res = await fetch('/api/sources');
+  if (!res.ok) throw new Error(`sources request failed: ${res.status}`);
+  return res.json();
+}
+
 export async function fetchSteamStatus(): Promise<SteamStatus> {
   const res = await fetch('/api/steam/status');
   if (!res.ok) throw new Error(`steam status failed: ${res.status}`);
@@ -165,10 +254,46 @@ export async function fetchStreams(id: string): Promise<Stream[]> {
   return res.json();
 }
 
+export async function searchCatalog(query: string): Promise<ContentItem[]> {
+  const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+  if (!res.ok) throw new Error(`search failed: ${res.status}`);
+  return res.json();
+}
+
+/** Deep search over the entire space — titles, actors, plot keywords, genre/
+ *  region idioms ("k drama"), library, addons — as titled sections. */
+export async function searchDeep(query: string): Promise<Row[]> {
+  const res = await fetch(`/api/search/deep?q=${encodeURIComponent(query)}`);
+  if (!res.ok) throw new Error(`deep search failed: ${res.status}`);
+  return res.json();
+}
+
+/** "More like this" for a details page item (empty when nothing is known). */
+export async function fetchSimilar(id: string): Promise<ContentItem[]> {
+  const res = await fetch(`/api/similar?id=${encodeURIComponent(id)}`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export interface ResumeInfo {
+  stream: Stream;
+  position: number; // seconds
+}
+
+/** The source + position to continue an item from, or null if none saved. */
+export async function fetchResume(id: string): Promise<ResumeInfo | null> {
+  const res = await fetch(`/api/resume?id=${encodeURIComponent(id)}`);
+  if (!res.ok) return null;
+  return res.json();
+}
+
 // Plays a chosen stream; sends the item so the daemon records it for the
-// recommender (with the title/art shown on the details page).
-export const playStream = (stream: Stream, item: ContentItem) =>
+// recommender (with the title/art shown on the details page). `trackId` is the
+// precise watched id — for an episode it carries season:episode so Trakt/
+// AniList scrobble the exact episode, while `item` (the show) drives Continue.
+export const playStream = (stream: Stream, item: ContentItem, trackId?: string) =>
   post('/api/play', {
     stream,
     item: { id: item.id, title: item.title, kind: item.kind, art: item.art },
+    track_id: trackId ?? item.id,
   });

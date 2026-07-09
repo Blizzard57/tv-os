@@ -1,0 +1,504 @@
+//! Watch tracking — pushes finished movies/episodes to Trakt, AniList and
+//! MyAnimeList, whichever are connected.
+//!
+//! The player writes a `<position-file>.done` marker (containing the item id)
+//! when a title ends naturally or is quit in the last 10%. A background
+//! worker sweeps the positions directory, resolves each marker to the
+//! services' ids (Trakt by IMDb id; AniList/MAL by title search, series
+//! only) and records the watch. Everything is best-effort: a service that
+//! isn't configured or doesn't match is silently skipped.
+//!
+//! The sync also runs the other way: [`watched_history`] pulls your recent
+//! Trakt history so the "For You" row is seeded by what you've watched
+//! anywhere, not just what you've played on this box.
+
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::model::{Action, ContentItem, Kind};
+use crate::settings::{self, config_dir};
+use crate::{log_error, log_info, recommend};
+
+const SWEEP_SECS: u64 = 15;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a pull of Trakt history is reused before refetching.
+const HISTORY_TTL: Duration = Duration::from_secs(600);
+
+/// Trakt device-code flow state (set by /api/trakt/connect, polled off-thread).
+static TRAKT_PENDING: Mutex<Option<String>> = Mutex::new(None); // user_code shown in UI
+/// MAL PKCE verifier for the in-flight login (single user, single flow).
+static MAL_VERIFIER: Mutex<Option<String>> = Mutex::new(None);
+/// Cached Trakt watch history (seeds for recommendations), refetched lazily.
+static HISTORY_CACHE: LazyLock<Mutex<Option<(Instant, Vec<ContentItem>)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+pub fn start_worker() {
+    std::thread::spawn(|| loop {
+        sweep_markers();
+        std::thread::sleep(Duration::from_secs(SWEEP_SECS));
+    });
+}
+
+/// Which services are connected (for the Settings panel).
+pub fn status() -> Value {
+    let s = settings::STORE.get();
+    json!({
+        "trakt": !s.trakt_token.is_empty(),
+        "trakt_pending": TRAKT_PENDING.lock().unwrap().clone(),
+        "anilist": !s.anilist_token.is_empty(),
+        "mal": !s.mal_token.is_empty(),
+    })
+}
+
+fn client() -> Option<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent(concat!("tvos/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()
+}
+
+// ---- Completion markers → scrobbles ----------------------------------------
+
+fn sweep_markers() {
+    let dir = config_dir().join("positions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("done") {
+            continue;
+        }
+        let item_id = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        let item_id = item_id.trim();
+        if !item_id.is_empty() {
+            log_info!("watched: {item_id} — syncing trackers");
+            scrobble(item_id);
+        }
+    }
+}
+
+/// What a finished item means to the trackers.
+struct Watched {
+    imdb: String,
+    /// (season, episode) for series; None = movie.
+    episode: Option<(i64, i64)>,
+    title: Option<String>,
+}
+
+/// "strm:movie:tt123" / "strm:series:tt123:2:5" / "tmdb:movie:603" → the pieces
+/// trackers need. The title comes from the recommender log (every play records
+/// it). Games and YouTube (`steam:`, `yt:`, …) don't scrobble anywhere.
+fn parse_watched(item_id: &str) -> Option<Watched> {
+    let title = title_for(item_id);
+    match item_id.split(':').next().unwrap_or_default() {
+        // IMDb-keyed ids carry the episode directly (…:season:episode).
+        "strm" => {
+            let mut parts = item_id.split(':');
+            parts.next(); // "strm"
+            let kind = parts.next()?;
+            let imdb = parts.next()?.to_string();
+            if !imdb.starts_with("tt") {
+                return None;
+            }
+            let episode = if kind == "series" {
+                Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+            } else {
+                None
+            };
+            Some(Watched { imdb, episode, title })
+        }
+        // TMDB catalog ids resolve to an IMDb id via TMDB. They name a whole
+        // title (no episode), so only movies scrobble this way; TMDB series are
+        // watched per-episode through their resolved `strm:…:s:e` id above.
+        "tmdb" => {
+            let (kind, imdb) = crate::sources::resolve_video(item_id).ok()?;
+            if kind == "series" || !imdb.starts_with("tt") {
+                return None;
+            }
+            Some(Watched {
+                imdb,
+                episode: None,
+                title,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The title recorded for an id in the recommender log (used for AniList/MAL
+/// anime matching). Matches the id itself or any episode id under it.
+fn title_for(item_id: &str) -> Option<String> {
+    recommend::LOG
+        .recent_items(64)
+        .into_iter()
+        .find(|i| i.id == item_id || item_id.starts_with(&format!("{}:", i.id)))
+        .map(|i| i.title)
+}
+
+fn scrobble(item_id: &str) {
+    let Some(watched) = parse_watched(item_id) else {
+        return;
+    };
+    let s = settings::STORE.get();
+    if !s.trakt_token.is_empty() && !s.trakt_client_id.is_empty() {
+        if let Err(e) = trakt_history(&s.trakt_client_id, &s.trakt_token, &watched) {
+            log_error!("trakt sync failed: {e}");
+        }
+    }
+    // AniList/MAL track anime series by episode number.
+    if let (Some((_, ep)), Some(title)) = (watched.episode, watched.title.as_deref()) {
+        if !s.anilist_token.is_empty() {
+            if let Err(e) = anilist_progress(&s.anilist_token, title, ep) {
+                log_error!("anilist sync failed: {e}");
+            }
+        }
+        if !s.mal_token.is_empty() {
+            if let Err(e) = mal_progress(&s.mal_token, title, ep) {
+                log_error!("mal sync failed: {e}");
+            }
+        }
+    }
+}
+
+// ---- Trakt ------------------------------------------------------------------
+
+fn trakt_history(client_id: &str, token: &str, w: &Watched) -> Result<(), String> {
+    let body = match w.episode {
+        None => json!({ "movies": [{ "ids": { "imdb": w.imdb } }] }),
+        Some((season, episode)) => json!({
+            "shows": [{
+                "ids": { "imdb": w.imdb },
+                "seasons": [{ "number": season, "episodes": [{ "number": episode }] }]
+            }]
+        }),
+    };
+    let res = client()
+        .ok_or("no http client")?
+        .post("https://api.trakt.tv/sync/history")
+        .header("trakt-api-version", "2")
+        .header("trakt-api-key", client_id)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .map_err(|e| e.to_string())?;
+    res.error_for_status().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Your recent Trakt watch history as recommendation seeds — so the "For You"
+/// row is personal to what you've *actually watched anywhere*, not just what
+/// you played on this box. Episodes seed on their show (recommendations are
+/// per-title). Trakt hands us TMDB ids, so the recommender resolves these with
+/// no extra lookups. Empty (and free) when Trakt isn't connected. Cached.
+pub fn watched_history(limit: usize) -> Vec<ContentItem> {
+    let s = settings::STORE.get();
+    if s.trakt_token.is_empty() || s.trakt_client_id.is_empty() {
+        return Vec::new();
+    }
+    if let Some((at, items)) = HISTORY_CACHE.lock().unwrap().as_ref() {
+        if at.elapsed() < HISTORY_TTL {
+            return items.clone();
+        }
+    }
+    let items = match fetch_trakt_history(&s.trakt_client_id, &s.trakt_token, limit) {
+        Ok(items) => items,
+        Err(e) => {
+            log_error!("trakt history fetch failed: {e}");
+            Vec::new()
+        }
+    };
+    if !items.is_empty() {
+        *HISTORY_CACHE.lock().unwrap() = Some((Instant::now(), items.clone()));
+    }
+    items
+}
+
+fn fetch_trakt_history(
+    client_id: &str,
+    token: &str,
+    limit: usize,
+) -> Result<Vec<ContentItem>, String> {
+    let v: Value = client()
+        .ok_or("no http client")?
+        .get(format!("https://api.trakt.tv/sync/history?limit={limit}"))
+        .header("trakt-api-version", "2")
+        .header("trakt-api-key", client_id)
+        .bearer_auth(token)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let entries = v.as_array().ok_or("history is not an array")?;
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if let Some(item) = history_seed(entry) {
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+            }
+        }
+    }
+    Ok(items)
+}
+
+/// One Trakt history entry → a recommendation seed, or None for anything
+/// without a resolvable id.
+fn history_seed(entry: &Value) -> Option<ContentItem> {
+    let (obj, media, kind) = match entry.get("type")?.as_str()? {
+        "movie" => (entry.get("movie")?, "movie", Kind::Movie),
+        "episode" => (entry.get("show")?, "tv", Kind::Series),
+        _ => return None,
+    };
+    let ids = obj.get("ids")?;
+    let title = obj
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // Prefer the TMDB id (no resolution needed); fall back to IMDb.
+    let id = if let Some(tmdb) = ids.get("tmdb").and_then(|x| x.as_i64()) {
+        format!("tmdb:{media}:{tmdb}")
+    } else if let Some(imdb) = ids.get("imdb").and_then(|x| x.as_str()) {
+        let k = if media == "tv" { "series" } else { "movie" };
+        format!("strm:{k}:{imdb}")
+    } else {
+        return None;
+    };
+    Some(ContentItem {
+        id,
+        kind,
+        title,
+        art: None,
+        action: Action::Play,
+    })
+}
+
+/// Starts the Trakt device flow: returns (user_code, verification_url) for
+/// the Settings panel and polls for the token in the background.
+pub fn trakt_connect() -> Result<Value, String> {
+    let s = settings::STORE.get();
+    if s.trakt_client_id.is_empty() || s.trakt_client_secret.is_empty() {
+        return Err("save your Trakt client id & secret first".to_string());
+    }
+    let http = client().ok_or("no http client")?;
+    let v: Value = http
+        .post("https://api.trakt.tv/oauth/device/code")
+        .json(&json!({ "client_id": s.trakt_client_id }))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("device code request failed: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let device_code = v["device_code"].as_str().unwrap_or_default().to_string();
+    let user_code = v["user_code"].as_str().unwrap_or_default().to_string();
+    let url = v["verification_url"].as_str().unwrap_or("https://trakt.tv/activate").to_string();
+    let interval = v["interval"].as_u64().unwrap_or(5).max(3);
+    let expires = v["expires_in"].as_u64().unwrap_or(600);
+    *TRAKT_PENDING.lock().unwrap() = Some(user_code.clone());
+
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(expires);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_secs(interval));
+            let s = settings::STORE.get();
+            let Some(http) = client() else { break };
+            let Ok(res) = http
+                .post("https://api.trakt.tv/oauth/device/token")
+                .json(&json!({
+                    "code": device_code,
+                    "client_id": s.trakt_client_id,
+                    "client_secret": s.trakt_client_secret,
+                }))
+                .send()
+            else {
+                continue;
+            };
+            if res.status().is_success() {
+                if let Ok(v) = res.json::<Value>() {
+                    if let Some(token) = v["access_token"].as_str() {
+                        let mut updated = settings::STORE.get();
+                        updated.trakt_token = token.to_string();
+                        let _ = settings::STORE.set(updated);
+                        log_info!("trakt connected");
+                    }
+                }
+                break;
+            }
+            if res.status().as_u16() != 400 {
+                break; // 400 = still pending; anything else is fatal
+            }
+        }
+        *TRAKT_PENDING.lock().unwrap() = None;
+    });
+
+    Ok(json!({ "user_code": user_code, "url": url }))
+}
+
+// ---- AniList -----------------------------------------------------------------
+
+fn anilist_progress(token: &str, title: &str, episode: i64) -> Result<(), String> {
+    let http = client().ok_or("no http client")?;
+    // Find the anime by name; not everything is anime — no match is fine.
+    let search = json!({
+        "query": "query($q:String){Media(search:$q,type:ANIME){id episodes}}",
+        "variables": { "q": title },
+    });
+    let v: Value = http
+        .post("https://graphql.anilist.co")
+        .bearer_auth(token)
+        .json(&search)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let Some(media_id) = v["data"]["Media"]["id"].as_i64() else {
+        return Ok(()); // not on AniList — not anime, skip quietly
+    };
+    let total = v["data"]["Media"]["episodes"].as_i64().unwrap_or(0);
+    let status = if total > 0 && episode >= total { "COMPLETED" } else { "CURRENT" };
+    let save = json!({
+        "query": "mutation($id:Int,$p:Int,$st:MediaListStatus){SaveMediaListEntry(mediaId:$id,progress:$p,status:$st){id}}",
+        "variables": { "id": media_id, "p": episode, "st": status },
+    });
+    http.post("https://graphql.anilist.co")
+        .bearer_auth(token)
+        .json(&save)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+// ---- MyAnimeList --------------------------------------------------------------
+
+fn mal_progress(token: &str, title: &str, episode: i64) -> Result<(), String> {
+    let http = client().ok_or("no http client")?;
+    let v: Value = http
+        .get(format!(
+            "https://api.myanimelist.net/v2/anime?q={}&limit=1",
+            crate::util::percent_encode(title)
+        ))
+        .bearer_auth(token)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let Some(anime_id) = v["data"][0]["node"]["id"].as_i64() else {
+        return Ok(()); // not anime as far as MAL is concerned
+    };
+    http.put(format!(
+        "https://api.myanimelist.net/v2/anime/{anime_id}/my_list_status"
+    ))
+    .bearer_auth(token)
+    .form(&[
+        ("num_watched_episodes", episode.to_string()),
+        ("status", "watching".to_string()),
+    ])
+    .send()
+    .and_then(|r| r.error_for_status())
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// The MAL PKCE login URL (plain method: challenge == verifier). The user's
+/// MAL API client must list http://localhost:8484/api/mal/callback as its
+/// redirect URI.
+pub fn mal_login_url() -> Result<String, String> {
+    let s = settings::STORE.get();
+    if s.mal_client_id.is_empty() {
+        return Err("save your MAL client id first".to_string());
+    }
+    let verifier: String = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        format!("tvos{seed:x}tvos{seed:x}tvos{seed:x}") // 43+ chars, unreserved
+    };
+    *MAL_VERIFIER.lock().unwrap() = Some(verifier.clone());
+    Ok(format!(
+        "https://myanimelist.net/v1/oauth2/authorize?response_type=code&client_id={}&code_challenge={verifier}&code_challenge_method=plain",
+        s.mal_client_id
+    ))
+}
+
+/// Exchanges the callback code for a token and saves it.
+pub fn mal_callback(code: &str) -> Result<(), String> {
+    let verifier = MAL_VERIFIER
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("no login in progress — start again from Settings")?;
+    let s = settings::STORE.get();
+    let http = client().ok_or("no http client")?;
+    let v: Value = http
+        .post("https://myanimelist.net/v1/oauth2/token")
+        .form(&[
+            ("client_id", s.mal_client_id.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("token exchange failed: {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let token = v["access_token"]
+        .as_str()
+        .ok_or("no access token in response")?;
+    let mut updated = settings::STORE.get();
+    updated.mal_token = token.to_string();
+    settings::STORE.set(updated)?;
+    log_info!("myanimelist connected");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_watched_ids() {
+        let m = parse_watched("strm:movie:tt0133093").unwrap();
+        assert_eq!(m.imdb, "tt0133093");
+        assert!(m.episode.is_none());
+
+        let e = parse_watched("strm:series:tt0903747:2:5").unwrap();
+        assert_eq!(e.imdb, "tt0903747");
+        assert_eq!(e.episode, Some((2, 5)));
+
+        assert!(parse_watched("steam:620").is_none());
+        assert!(parse_watched("yt:abc").is_none());
+        assert!(parse_watched("strm:movie:notimdb").is_none());
+    }
+
+    #[test]
+    fn history_seeds_prefer_tmdb_then_imdb() {
+        let movie = json!({
+            "type": "movie",
+            "movie": { "title": "The Matrix", "ids": { "tmdb": 603, "imdb": "tt0133093" } }
+        });
+        let seed = history_seed(&movie).unwrap();
+        assert_eq!(seed.id, "tmdb:movie:603"); // TMDB id wins
+        assert_eq!(seed.kind, Kind::Movie);
+
+        // Episodes seed on their *show*, TMDB missing → IMDb fallback.
+        let episode = json!({
+            "type": "episode",
+            "show": { "title": "Breaking Bad", "ids": { "imdb": "tt0903747" } },
+            "episode": { "season": 2, "number": 5 }
+        });
+        let seed = history_seed(&episode).unwrap();
+        assert_eq!(seed.id, "strm:series:tt0903747");
+        assert_eq!(seed.kind, Kind::Series);
+
+        assert!(history_seed(&json!({ "type": "movie", "movie": { "ids": {} } })).is_none());
+        assert!(history_seed(&json!({ "type": "person" })).is_none());
+    }
+}

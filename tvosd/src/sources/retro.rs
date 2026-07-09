@@ -1,10 +1,13 @@
 //! Retro games: ROMs on disk + a downloadable catalog, launched in RetroArch.
+// Unregistered from the home screen by user request; the module (and its
+// tests) stay so it can be re-enabled by adding it back to Registry::detect.
+#![allow(dead_code)]
 //!
 //! ROMs live in one directory per system (EmuDeck's layout):
 //!
 //!   ~/ROMs/nes/Nova the Squirrel.nes      (override root with TVOS_ROM_DIR)
 //!
-//! Installed ROMs join the same "Games" row as Steam/Epic — retro is not a
+//! Installed ROMs join the same "Ready to Play" row as Steam/Epic — retro is not a
 //! separate world. Box art comes from the libretro thumbnail CDN, keyed by
 //! the file name (No-Intro naming gives the best hit rate).
 //!
@@ -198,7 +201,7 @@ impl Source for Retro {
     fn rows(&self) -> Vec<Row> {
         vec![
             Row {
-                title: "Games".to_string(),
+                title: "Ready to Play".to_string(),
                 items: self.installed(),
             },
             Row {

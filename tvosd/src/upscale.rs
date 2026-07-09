@@ -188,7 +188,7 @@ fn shader_chain(dir: &Path, mode: EnhanceMode, anime: bool) -> Vec<PathBuf> {
         .collect()
 }
 
-fn shader_dir() -> PathBuf {
+pub fn shader_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_SHADER_DIR") {
         return PathBuf::from(dir);
     }
