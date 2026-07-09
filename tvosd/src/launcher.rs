@@ -68,13 +68,16 @@ pub fn play_video(
 ) -> Result<(), String> {
     let start = item_id.and_then(crate::resume::position);
     let home = prepare_mpv_home(profile, mode, hint, start);
-    let mut player = PLAYER.lock().unwrap();
+    let mut player = PLAYER.lock().unwrap_or_else(|e| e.into_inner());
     stop(&mut player);
 
     crate::log_info!("playing [{}] mpv {target}", profile.name);
     let _ = std::fs::remove_file(home.join(".started")); // fresh start signal
     let _ = std::fs::remove_file(home.join("mpv.log"));
-    let mut cmd = Command::new("mpv");
+    // In the TV/gamescope session, run mpv through gamescope so it lands in the
+    // compositor's fullscreen output like everything else; degrades to a direct
+    // mpv launch off-session or when gamescope isn't installed.
+    let mut cmd = gamescope_command("mpv");
     cmd.env("MPV_HOME", &home)
         .args(["--no-terminal", target])
         .stdin(Stdio::null())
@@ -122,7 +125,7 @@ pub fn play_torrent(
     )?;
     let start = item_id.and_then(crate::resume::position);
     let home = prepare_mpv_home(profile, mode, hint, start);
-    let mut player = PLAYER.lock().unwrap();
+    let mut player = PLAYER.lock().unwrap_or_else(|e| e.into_inner());
     stop(&mut player);
 
     // Download to a predictable, disk-backed cache dir. webtorrent otherwise
@@ -273,14 +276,33 @@ fn own_process_group(cmd: &mut Command) {
 }
 
 /// Kills the child and every process in its group (mpv under webtorrent, etc.).
+/// SIGTERM the group first for a clean shutdown, then — after a short grace
+/// period — SIGKILL anything still alive so a wedged player can never survive.
 fn kill_tree(child: &mut Child) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &format!("-{}", child.id())])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let pgid = format!("-{}", child.id());
+        let signal = |sig: &str| {
+            let _ = Command::new("kill")
+                .args([sig, "--", &pgid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        };
+        signal("-TERM");
+        // Give the group a moment to exit gracefully; if the tracked child is
+        // still running, escalate to SIGKILL on the whole group.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                _ if Instant::now() >= deadline => {
+                    signal("-KILL");
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -378,17 +400,50 @@ fn write_mpv_conf(home: &Path, profile: &Profile, start: Option<f64>) {
     }
     // A real log file (mpv writes nothing to a suppressed terminal) so the
     // actual reason a stream fails is always visible.
-    conf.push_str(&format!("log-file=\"{}\"\n", home.join("mpv.log").display()));
-    // Turn the resolved profile's "--key=value" mpv flags into config lines so
-    // they apply to webtorrent's mpv too (which we can't pass args to).
+    if let Some(line) = conf_line("log-file", Some(&home.join("mpv.log").to_string_lossy())) {
+        conf.push_str(&line);
+    }
+    // Turn the resolved profile's mpv flags into config lines so they apply to
+    // webtorrent's mpv too (which we can't pass args to). Handle both
+    // "--key=value" and valueless "--flag" forms; skip anything unparseable or
+    // carrying characters that would break out of the quoted config value.
     for arg in &profile.args {
-        if let Some((key, value)) = arg.trim_start_matches("--").split_once('=') {
-            conf.push_str(&format!("{key}=\"{value}\"\n"));
+        let body = arg.trim_start_matches("--");
+        let (key, value) = match body.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (body, None),
+        };
+        match conf_line(key, value) {
+            Some(line) => conf.push_str(&line),
+            None => crate::log_warn!("mpv.conf: dropping unparseable profile arg {arg:?}"),
         }
     }
     // User overrides win — included last so they override anything above.
-    conf.push_str(&format!("include=\"{}\"\n", home.join("user.conf").display()));
+    if let Some(line) = conf_line("include", Some(&home.join("user.conf").to_string_lossy())) {
+        conf.push_str(&line);
+    }
     let _ = std::fs::write(home.join("mpv.conf"), conf);
+}
+
+/// One validated `key` / `key="value"` config line, or None if the key or value
+/// is unsafe. mpv reads config values as double-quoted strings with no escape
+/// mechanism, so a `"` or newline in a value (e.g. a shader path crafted to
+/// inject settings) would break out of the value — reject those outright. A
+/// valueless flag becomes a bare `key` line (equivalent to `key=yes`).
+fn conf_line(key: &str, value: Option<&str>) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    match value {
+        None => Some(format!("{key}\n")),
+        Some(v) if v.contains('"') || v.contains('\n') || v.contains('\r') => None,
+        Some(v) => Some(format!("{key}=\"{v}\"\n")),
+    }
 }
 
 /// Writes the preset list the in-player upscaler menu reads, marking the one the
@@ -409,11 +464,30 @@ fn write_upscalers(home: &Path, mode: EnhanceMode, hint: &str) {
     let _ = std::fs::write(home.join("upscalers.json"), json.to_string());
 }
 
+/// An absolute home directory. Falls back to `/root` rather than collapsing to
+/// a relative path (which would scatter tvos data across whatever cwd the
+/// daemon happened to start in) when HOME is unset.
+fn home_dir() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => PathBuf::from("/root"),
+    }
+}
+
+/// Base of an XDG dir (e.g. XDG_DATA_HOME), honoring the spec's rule that a
+/// relative value is ignored in favor of the `~/default` fallback.
+fn xdg_dir(var: &str, default: &str) -> PathBuf {
+    match std::env::var(var) {
+        Ok(v) if v.starts_with('/') => PathBuf::from(v),
+        _ => home_dir().join(default),
+    }
+}
+
 fn mpv_home() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_MPV_HOME") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/tvos/mpv")
+    xdg_dir("XDG_DATA_HOME", ".local/share").join("tvos/mpv")
 }
 
 /// Where webtorrent downloads torrent data (disk-backed, easy to clear).
@@ -421,7 +495,7 @@ fn torrent_cache() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_TORRENT_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/tvos/torrents")
+    xdg_dir("XDG_CACHE_HOME", ".cache").join("tvos/torrents")
 }
 
 /// An OS-assigned free TCP port (bound to :0, then released) for webtorrent's
@@ -440,7 +514,7 @@ fn resolve_webtorrent() -> Option<String> {
     if command_exists("webtorrent") {
         return Some("webtorrent".to_string());
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir().to_string_lossy().into_owned();
     let mut candidates = vec![
         format!("{home}/.npm-global/bin/webtorrent"),
         format!("{home}/.local/bin/webtorrent"),
@@ -492,6 +566,67 @@ pub fn spawn_detached_env(
         .stderr(Stdio::null())
         .spawn()
         .map(drop)
+}
+
+/// Like [`spawn_detached_env`] but, in the TV/gamescope session, wraps the
+/// launch in `gamescope [profile args] -- <program> <args>` so games and
+/// emulators render into the compositor's fullscreen output. Off-session (or
+/// when gamescope isn't on PATH) it degrades to a plain detached launch, so
+/// desktop/app mode is unchanged. Game launch sites (epic/steam/retro) should
+/// prefer this over `spawn_detached` for a consistent 10-foot experience.
+pub fn spawn_detached_game(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::io::Result<()> {
+    if let Some(gs) = gamescope_prefix() {
+        // Run gamescope as the program; its profile args, then `--`, then the
+        // real command follow. gs[0] is "gamescope".
+        let mut gs_args: Vec<&str> = gs[1..].iter().map(String::as_str).collect();
+        gs_args.push("--");
+        gs_args.push(program);
+        gs_args.extend_from_slice(args);
+        return spawn_detached_env(&gs[0], &gs_args, envs);
+    }
+    spawn_detached_env(program, args, envs)
+}
+
+/// True when running inside the TV session where every launch should go through
+/// gamescope (per PLAN.md). Gated by env so desktop/app mode never wraps.
+fn in_tv_session() -> bool {
+    matches!(std::env::var("TVOS_GAMESCOPE").as_deref(), Ok("1"))
+        || matches!(std::env::var("TVOS_TV").as_deref(), Ok("1"))
+}
+
+/// The `gamescope [profile args]` prefix to run a launch under, or None when
+/// not in the TV session or gamescope isn't installed (→ direct launch).
+/// TVOS_GAMESCOPE_ARGS overrides the conservative default profile.
+fn gamescope_prefix() -> Option<Vec<String>> {
+    if !in_tv_session() || !command_exists("gamescope") {
+        return None;
+    }
+    let mut prefix = vec!["gamescope".to_string()];
+    match std::env::var("TVOS_GAMESCOPE_ARGS") {
+        Ok(args) if !args.trim().is_empty() => {
+            prefix.extend(args.split_whitespace().map(String::from));
+        }
+        // Conservative default: fullscreen, HDR left to gamescope's own detection.
+        _ => prefix.push("-f".to_string()),
+    }
+    Some(prefix)
+}
+
+/// A [`Command`] for `program`, transparently wrapped in gamescope when in the
+/// TV session (and gamescope is present). Callers set env/args/stdio as usual.
+fn gamescope_command(program: &str) -> Command {
+    match gamescope_prefix() {
+        Some(prefix) => {
+            let mut cmd = Command::new(&prefix[0]);
+            cmd.args(&prefix[1..]).arg("--").arg(program);
+            cmd
+        }
+        None => Command::new(program),
+    }
 }
 
 #[cfg(test)]

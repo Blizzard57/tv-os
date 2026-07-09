@@ -33,7 +33,9 @@ export function SectionPage({ row, onPick, onClose, actionRef }: Props) {
           setSel((i) => (i - cols >= 0 ? i - cols : i));
           break;
         case 'down':
-          setSel((i) => (i + cols < len ? i + cols : Math.min(len - 1, i)));
+          // Full step down when a card sits directly below; otherwise, if the
+          // last (partial) row still has a card past this column, land on it.
+          setSel((i) => (i + cols < len ? i + cols : Math.max(i, len - 1)));
           break;
         case 'confirm': {
           const item = row.items[sel];

@@ -52,8 +52,9 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
   - **Retro** (phase 3) — ROMs in `~/ROMs/<system>/` (EmuDeck layout;
     override with `TVOS_ROM_DIR`) join the same "Games" row — retro is not a
     separate world. A launches the ROM in RetroArch (native or flatpak),
-    picking the best installed core per system (NES, SNES, GB/GBC/GBA,
-    Genesis, N64, PSX); errors tell you exactly which core to download.
+    picking a reasonable core per system (NES, SNES, GB/GBC/GBA, Genesis,
+    N64, PSX) and falling back to RetroArch's own default core when the
+    preferred one isn't installed; errors tell you which core to download.
     Box art is scraped from the libretro thumbnail CDN by file name.
   - **ROM catalog** (phase 3) — a "Homebrew & Retro" row of downloadable,
     freely licensed homebrew (built-in manifest), installable from the couch:
@@ -95,9 +96,10 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
   rows, and pressing play asks every stream-capable addon for streams,
   **ranks them** (resolution from the label, then https over http) and plays
   the best one in mpv — through the Enhance upscaling pipeline, which is the
-  thing Stremio's own player can't do. Torrent-only entries (bare infoHash)
-  are skipped: there is no torrent engine; debrid-backed addons that return
-  direct URLs work. YouTube (`ytId`) streams play via mpv's yt-dlp hook.
+  thing Stremio's own player can't do. Torrent entries (magnet / infoHash) are
+  streamed via `webtorrent-cli`'s `--mpv` mode (seekable, with the upscaler);
+  debrid-backed addons that return direct URLs also work. YouTube (`ytId`)
+  streams play via mpv's yt-dlp hook.
   Addons persist (with their manifests) in `~/.config/tvos/addons.json`, so
   the home screen works offline at boot. See **Addons** below.
 - **Recommender** (phase 6): fully local, no cloud. Every successful launch
@@ -131,19 +133,32 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
 
 ## API
 
+The transport is plain **HTTP/JSON** on `127.0.0.1:8484` (not the gRPC /
+WebSocket that PLAN.md sketched). Download and playback progress is **polled**
+(`GET /api/installs`, `GET /api/resume`) rather than pushed over a socket.
+
 | Endpoint | Meaning |
 |---|---|
 | `GET /api/library` | Home rows; each item carries its `action` (`play` / `install` / `none`) |
 | `GET /api/sources` | Which sources were detected |
 | `POST /api/launch {"id"}` | Play/run an item (`steam:620`, `epic:Sugar`, `rom:gb/Game.gb`, `video:…`) |
 | `POST /api/install {"id"}` | Start a download job |
-| `GET /api/installs` | All jobs with status + progress |
+| `GET /api/installs` | All jobs with status + progress (polled) |
 | `GET / PUT /api/settings` | User settings (enhance, Steam creds, TMDB key), persisted to `~/.config/tvos/` |
 | `GET /api/steam/status` | Tests saved Steam creds → `{connected, count}` or `{error}` |
 | `GET / POST /api/addons` | List installed addons / install one (`{"url": "…/manifest.json"}`) |
 | `POST /api/addons/remove` | Uninstall an addon (`{"url": …}`) |
 | `GET /api/meta?id=` | Details-page metadata: summary + episode list (series) |
 | `GET /api/streams?id=` | Every source for a title/episode (direct, torrent, external, youtube) |
+| `GET /api/search?q=` | Search installed catalogs |
+| `GET /api/search/deep?q=` | Broader/remote search across sources |
+| `GET /api/similar?id=` | "More like this" for an item |
+| `GET /api/game?id=` | Game details (metadata / HLTB etc.) |
+| `GET /api/tracking/status` | Trakt / MAL connection status |
+| `POST /api/trakt/connect` | Connect a Trakt account |
+| `GET /api/mal/login` / `GET /api/mal/callback` | MyAnimeList OAuth login / redirect callback |
+| `GET /api/resume` | Resume points / in-progress playback (polled) |
+| `GET /api/youtube/status` | yt-dlp availability for YouTube streams |
 | `POST /api/play` | Play a chosen `{stream, item}` |
 | `POST /api/open {"url"}` | Open a link with the system (WatchHub apps, addon Configure pages) |
 | `GET /api/version` | Daemon version (handy for testing packages) |
@@ -154,9 +169,26 @@ always sends them).
 
 ## What's deliberately still open
 
-Profiles ("who's watching"), HDMI-CEC power sync, the phone companion app,
-an on-screen keyboard for controller-only text entry, the aggregated store
-pages + checkout webview, and the VapourSynth/TensorRT upscaling backend.
+Genuinely unbuilt roadmap items (honest list):
+
+- **NN video upscaler** — the VapourSynth/TensorRT models from PLAN.md. Today's
+  Enhance is mpv **GLSL shaders only** (Anime4K / FSRCNNX); the NN backend slots
+  in behind the same resolver later.
+- **Auto-degrade on framedrop** — no dynamic quality backoff yet.
+- **A/B compare** — an mpv **on/off toggle** (press `e` to flip Enhance on the
+  running video), not a split-screen preview.
+- **gamescope per-item profiles** — per-title resolution/HDR/FSR tuning. (Basic
+  optional gamescope wrapping is being added this run; per-item profiles aren't.)
+- **CEC power sync** — turning the TV/AVR on/off with the session.
+- **Phone companion app** and **QR sign-in**.
+- **Profiles / "who's watching"** and **save sync** across machines.
+- **Bazzite image + atomic/OTA updates**.
+- **Aggregated store pages** + **IsThereAnyDeal** pricing + **checkout webview**.
+- **Amazon** game source (`nile`).
+- **Theming SDK** and an **addon catalog UI** (addons are added by URL for now).
+- Presentation polish: **parallax**, **haptics**, **ambient color**, **muted
+  trailer** autoplay, **logo titles**.
+
 Each slots behind an existing seam (the `Source` trait, the Enhance resolver,
 the recommender's row contract) — none require rearchitecting.
 
@@ -214,8 +246,17 @@ Then either:
 - **Test inside your desktop**: `TVOS_WINDOWED=1 tvos-session` — runs the
   whole thing nested in a window; or
 - **Go full TV**: log out, pick the **TV OS** session on the login screen.
-  For console-like boot, enable autologin to that session
-  (System Settings → Users on KDE, or an `/etc/sddm.conf.d/` autologin entry).
+  For console-like boot straight into TV OS, re-run with autologin:
+
+  ```sh
+  ./system/install.sh --autologin "$USER"
+  ```
+
+  which writes `/etc/sddm.conf.d/tvos-autologin.conf` for that user. (You can
+  also set it in System Settings → Users on KDE.)
+
+Remove the system session files with `./uninstall.sh --system` (sudo) — that
+reverses everything `system/install.sh` wrote, including the autologin drop-in.
 
 ## Settings panel
 
@@ -251,7 +292,8 @@ on your machine; nothing leaves the box.
 | **Epic** | Install [legendary](https://github.com/derrod/legendary) (`pip install legendary-gl` or the distro package) and run `legendary auth` once. Installed games launch; owned games appear in "Ready to Install". |
 | **Retro** | Drop ROMs into `~/ROMs/<system>/` (nes, snes, gb, gbc, gba, genesis, n64, psx) **or** install from the built-in "Homebrew & Retro" row. Install RetroArch (`flatpak install flathub org.libretro.RetroArch`) and the cores you need. |
 | **More ROM catalogs** | Write a manifest like `tvosd/data/homebrew.json` and point `TVOS_ROM_SOURCES=/path/one.json,/path/two.json` at it. |
-| GOG / Amazon | Planned — same `Source` seam (gogdl / nile). |
+| **GOG** | Sign into GOG in [Heroic](https://heroicgameslauncher.com/); TV OS reads Heroic's library and launches/installs via `heroic://` deep links. |
+| Amazon | Planned — same `Source` seam (nile). |
 
 ### Stream addons (Stremio-compatible)
 

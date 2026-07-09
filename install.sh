@@ -5,6 +5,7 @@
 # After this, "TV OS" appears in your application menu — launch it like any
 # app. From a terminal:  tvos-app   (or  tvos-app --tv  for big-screen mode).
 set -euo pipefail
+: "${HOME:?HOME must be set}"
 cd "$(dirname "$0")"
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }

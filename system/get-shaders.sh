@@ -9,19 +9,50 @@ set -euo pipefail
 DIR="${TVOS_SHADER_DIR:-$HOME/.local/share/tvos/shaders}"
 mkdir -p "$DIR"
 
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# TODO: pin known-good SHA256 for each artifact and verify with `sha256sum -c`
+# below. Upstream releases are unsigned and unhashed; until the hashes are
+# pinned we rely on HTTPS + the temp-download-then-atomic-mv below so an
+# interrupted transfer never leaves a truncated file the `[ -f ]` guard would
+# treat as a complete install.
+
+# The full set Enhance's profiles expect; a partial install must NOT count.
+FSRCNNX_FILES=(FSRCNNX_x2_16-0-4-1.glsl FSRCNNX_x2_8-0-4-1.glsl)
+ANIME4K_MARKER="Anime4K_Upscale_CNN_x2_VL.glsl"
+
 echo "==> FSRCNNX"
-for f in FSRCNNX_x2_16-0-4-1.glsl FSRCNNX_x2_8-0-4-1.glsl; do
-  [ -f "$DIR/$f" ] || curl -fsSL -o "$DIR/$f" \
-    "https://github.com/igv/FSRCNN-TensorFlow/releases/download/1.1/$f"
+for f in "${FSRCNNX_FILES[@]}"; do
+  if [ ! -f "$DIR/$f" ]; then
+    curl -fsSL -o "$TMP/$f" \
+      "https://github.com/igv/FSRCNN-TensorFlow/releases/download/1.1/$f"
+    mv -f "$TMP/$f" "$DIR/$f"   # atomic: only lands on a complete download
+  fi
 done
 
 echo "==> Anime4K v4"
-if [ ! -f "$DIR/Anime4K_Upscale_CNN_x2_VL.glsl" ]; then
-  TMP="$(mktemp -d)"
-  trap 'rm -rf "$TMP"' EXIT
+if [ ! -f "$DIR/$ANIME4K_MARKER" ]; then
   curl -fsSL -o "$TMP/anime4k.zip" \
     "https://github.com/bloc97/Anime4K/releases/download/v4.0.1/Anime4K_v4.0.zip"
-  unzip -joq "$TMP/anime4k.zip" '*.glsl' -d "$DIR"
+  # Extract into a staging dir first; only publish once extraction succeeded.
+  mkdir -p "$TMP/a4k"
+  unzip -joq "$TMP/anime4k.zip" '*.glsl' -d "$TMP/a4k"
+  [ -f "$TMP/a4k/$ANIME4K_MARKER" ] || {
+    echo "get-shaders: Anime4K zip missing $ANIME4K_MARKER — aborting" >&2
+    exit 1
+  }
+  mv -f "$TMP/a4k/"*.glsl "$DIR/"
+fi
+
+# Verify the full expected set actually landed.
+missing=()
+for f in "${FSRCNNX_FILES[@]}" "$ANIME4K_MARKER"; do
+  [ -f "$DIR/$f" ] || missing+=("$f")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+  echo "get-shaders: incomplete install, missing: ${missing[*]}" >&2
+  exit 1
 fi
 
 echo "Shaders installed in $DIR:"

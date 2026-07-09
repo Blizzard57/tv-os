@@ -6,6 +6,7 @@
 //! playable URLs). Installed addons are persisted with their manifest in
 //! ~/.config/tvos/addons.json, so the home screen works offline at boot.
 
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -68,7 +69,7 @@ impl AddonStore {
     pub fn list(&self) -> Vec<Addon> {
         self.addons
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter_map(|(url, manifest)| parse_manifest(url, manifest))
             .collect()
@@ -76,16 +77,21 @@ impl AddonStore {
 
     /// Fetches and validates a manifest, then installs (or updates) the addon.
     pub fn install(&self, manifest_url: &str) -> Result<Addon, String> {
+        if manifest_url.len() > MAX_URL_LEN {
+            return Err("addon URL is too long".to_string());
+        }
         if !manifest_url.ends_with("/manifest.json") {
             return Err("addon URL must end in /manifest.json".to_string());
         }
+        // SSRF guard: only fetch from public hosts (localhost allowed for dev).
+        validate_fetch_url(manifest_url)?;
         let text = http_get(manifest_url)?;
         let manifest: Value =
             serde_json::from_str(&text).map_err(|e| format!("manifest is not JSON: {e}"))?;
         let addon = parse_manifest(manifest_url, &manifest)
             .ok_or("manifest is missing required fields (id, name)")?;
 
-        let mut addons = self.addons.lock().unwrap();
+        let mut addons = self.addons.lock().unwrap_or_else(|e| e.into_inner());
         addons.retain(|(url, _)| url != manifest_url);
         addons.push((manifest_url.to_string(), manifest));
         self.persist(&addons)
@@ -94,7 +100,7 @@ impl AddonStore {
     }
 
     pub fn remove(&self, manifest_url: &str) -> Result<(), String> {
-        let mut addons = self.addons.lock().unwrap();
+        let mut addons = self.addons.lock().unwrap_or_else(|e| e.into_inner());
         let before = addons.len();
         addons.retain(|(url, _)| url != manifest_url);
         if addons.len() == before {
@@ -124,8 +130,11 @@ pub fn http_get_quick(url: &str) -> Result<String, String> {
 }
 
 fn http_get_within(url: &str, timeout: Duration) -> Result<String, String> {
+    validate_fetch_url(url)?;
     reqwest::blocking::Client::builder()
         .timeout(timeout)
+        // Cap redirects so a public URL can't bounce us into a private host.
+        .redirect(reqwest::redirect::Policy::limited(3))
         // Several public APIs (CheapShark among them) reject requests with
         // no User-Agent, which is reqwest's default.
         .user_agent(concat!("tvos/", env!("CARGO_PKG_VERSION")))
@@ -134,9 +143,108 @@ fn http_get_within(url: &str, timeout: Duration) -> Result<String, String> {
         .get(url)
         .send()
         .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("request failed: {e}"))?
+        .map_err(|e| format!("request failed: {}", crate::util::scrub_secrets(&e.to_string())))?
         .text()
         .map_err(|e| e.to_string())
+}
+
+/// Upper bound on any user-supplied URL we accept (addon manifests, play URLs).
+pub const MAX_URL_LEN: usize = 2048;
+
+/// SSRF guard for outbound fetches. Requires https (http only when the host is
+/// an explicit localhost dev target) and refuses any URL whose host resolves to
+/// a private, loopback, or link-local address — except that localhost dev case.
+///
+/// NB: this is a best-effort check at request time; DNS can still be re-resolved
+/// to a different IP by reqwest (TOCTOU). Combined with the redirect cap it
+/// blocks the common metadata-endpoint / internal-service SSRF vectors.
+fn validate_fetch_url(url: &str) -> Result<(), String> {
+    if url.len() > MAX_URL_LEN {
+        return Err("URL is too long".to_string());
+    }
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or("URL must include a scheme (http/https)")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("unsupported URL scheme: {scheme}"));
+    }
+    // authority = everything up to the first '/', '?' or '#'.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    // Drop any userinfo, then split host[:port].
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(stripped) = hostport.strip_prefix('[') {
+        // IPv6 literal: [::1]:port
+        stripped.split(']').next().unwrap_or(stripped)
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    if host.is_empty() {
+        return Err("URL has no host".to_string());
+    }
+
+    let is_localhost_name = host.eq_ignore_ascii_case("localhost");
+    // Resolve the host to its IPs (a literal IP resolves to itself).
+    let addrs: Vec<IpAddr> = (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve host {host}: {e}"))?
+        .map(|s| s.ip())
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("host {host} did not resolve"));
+    }
+
+    let all_loopback = addrs.iter().all(is_loopback);
+    let is_dev_localhost = all_loopback && (is_localhost_name || host.parse::<IpAddr>().is_ok());
+
+    if scheme == "http" && !is_dev_localhost {
+        return Err("plain http is only allowed for localhost; use https".to_string());
+    }
+    for ip in &addrs {
+        if is_private_ip(ip) && !is_dev_localhost {
+            return Err(format!(
+                "refusing to fetch {host}: resolves to a non-public address"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_loopback(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// Whether an IP is in a private / loopback / link-local / reserved range that
+/// a public-internet fetch should never reach.
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                // Carrier-grade NAT 100.64.0.0/10.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique local fc00::/7.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped: check the embedded v4.
+                || v6.to_ipv4_mapped().map(|m| is_private_ip(&IpAddr::V4(m))).unwrap_or(false)
+        }
+    }
 }
 
 /// Distills a Stremio manifest. Tolerant of both resource forms the protocol
@@ -299,5 +407,21 @@ mod tests {
     fn invalid_manifest_is_rejected() {
         let manifest: Value = serde_json::from_str(r#"{"no": "fields"}"#).unwrap();
         assert!(parse_manifest("https://x/manifest.json", &manifest).is_none());
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_private_and_bad_schemes() {
+        // Loopback literals are only reachable as the explicit dev case (http).
+        assert!(validate_fetch_url("http://127.0.0.1:8484/manifest.json").is_ok());
+        assert!(validate_fetch_url("http://localhost:8484/manifest.json").is_ok());
+        // Private ranges are refused.
+        assert!(validate_fetch_url("http://192.168.1.10/manifest.json").is_err());
+        assert!(validate_fetch_url("https://10.0.0.5/manifest.json").is_err());
+        assert!(validate_fetch_url("http://169.254.169.254/latest/meta-data").is_err());
+        // Non-http schemes are refused.
+        assert!(validate_fetch_url("file:///etc/passwd").is_err());
+        assert!(validate_fetch_url("ftp://example.com/x").is_err());
+        // Plain http to a public host is refused (https required).
+        assert!(validate_fetch_url("http://example.com/manifest.json").is_err());
     }
 }

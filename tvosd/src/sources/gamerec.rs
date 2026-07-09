@@ -42,7 +42,7 @@ static GENRES_CACHE: Mutex<Option<(Instant, Vec<(String, String)>)>> = Mutex::ne
 pub fn top_genres(limit: usize) -> Vec<(String, String)> {
     const TTL: Duration = Duration::from_secs(900);
     {
-        let cache = GENRES_CACHE.lock().unwrap();
+        let cache = GENRES_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, genres)) = &*cache {
             if at.elapsed() < TTL {
                 return genres.iter().take(limit).cloned().collect();
@@ -79,7 +79,7 @@ pub fn top_genres(limit: usize) -> Vec<(String, String)> {
                 .map(|(_, slug)| (name, slug.to_string()))
         })
         .collect();
-    *GENRES_CACHE.lock().unwrap() = Some((Instant::now(), genres.clone()));
+    *GENRES_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), genres.clone()));
     genres.into_iter().take(limit).collect()
 }
 

@@ -16,7 +16,7 @@ export TVOS_UI_DIR="$ROOT/ui"
 
 URL="http://127.0.0.1:8484"
 PIDS=()
-cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
+cleanup() { [ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 
 "$ROOT/tvosd" &

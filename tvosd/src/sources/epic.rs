@@ -22,9 +22,14 @@ use crate::model::{Action, ContentItem, Kind, Row};
 use crate::sources::Source;
 
 const OWNED_CACHE_TTL: Duration = Duration::from_secs(300);
+/// `available()` shells out to `legendary --version`; a short TTL keeps that
+/// off the hot path (rows/library refresh) while still noticing an install or
+/// sign-in within a few seconds.
+const AVAILABLE_CACHE_TTL: Duration = Duration::from_secs(15);
 
 pub struct Epic {
     owned_cache: Mutex<Option<(Instant, Vec<EpicGame>)>>,
+    available_cache: Mutex<Option<(Instant, bool)>>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -38,11 +43,12 @@ impl Epic {
     pub fn detect() -> Self {
         Self {
             owned_cache: Mutex::new(None),
+            available_cache: Mutex::new(None),
         }
     }
 
     fn owned_games(&self) -> Vec<EpicGame> {
-        let mut cache = self.owned_cache.lock().unwrap();
+        let mut cache = self.owned_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, games)) = cache.as_ref() {
             if at.elapsed() < OWNED_CACHE_TTL {
                 return games.clone();
@@ -70,8 +76,17 @@ impl Source for Epic {
     fn available(&self) -> bool {
         // Detected live (not cached at startup) so installing legendary or
         // signing in is picked up without restarting the daemon. "Connected"
-        // means legendary is present *and* you're logged in.
-        legendary_present() && legendary_logged_in()
+        // means legendary is present *and* you're logged in. Cached with a
+        // short TTL so a library refresh doesn't spawn a subprocess each call.
+        let mut cache = self.available_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, ok)) = cache.as_ref() {
+            if at.elapsed() < AVAILABLE_CACHE_TTL {
+                return *ok;
+            }
+        }
+        let ok = legendary_present() && legendary_logged_in();
+        *cache = Some((Instant::now(), ok));
+        ok
     }
 
     fn rows(&self) -> Vec<Row> {
@@ -112,21 +127,22 @@ impl Source for Epic {
 
     fn launch(&self, item_id: &str) -> Result<(), String> {
         let app = item_id.strip_prefix("epic:").unwrap_or_default();
+        // The app id becomes a legendary CLI argument, so it must not look like
+        // a flag or be empty — reject before it reaches the process.
+        let app = validate_app_name(app)?;
         // Engine-level upscaler defaults (FSR4 on AMD, NVAPI/DLSS on NVIDIA).
         launcher::spawn_detached_env("legendary", &["launch", app], &crate::upscale::game_env())
             .map_err(|e| format!("could not run legendary: {e}"))
     }
 
     fn install(&self, item_id: &str, jobs: &InstallManager) -> Result<(), String> {
-        let app = item_id
-            .strip_prefix("epic:")
-            .unwrap_or_default()
-            .to_string();
-        let title = self
-            .owned_games()
-            .iter()
-            .find(|g| g.app_name == app)
-            .map_or_else(|| app.clone(), |g| g.title.clone());
+        let app = item_id.strip_prefix("epic:").unwrap_or_default();
+        let app = validate_app_name(app)?.to_string();
+        // Prefer an app id we actually know the account owns; fall back to the
+        // validated id (it may just be missing from a stale owned cache).
+        let owned = self.owned_games();
+        let known = owned.iter().find(|g| g.app_name == app);
+        let title = known.map_or_else(|| app.clone(), |g| g.title.clone());
 
         let mut cmd = Command::new("legendary");
         cmd.args(["install", &app, "-y"]);
@@ -146,6 +162,19 @@ impl EpicGame {
     }
 }
 
+/// Rejects empty or flag-like Epic app ids before they become legendary CLI
+/// arguments (argument injection). Real Epic app names are alphanumeric with
+/// underscores; a leading `-` would be parsed as an option.
+fn validate_app_name(app: &str) -> Result<&str, String> {
+    if app.is_empty() {
+        return Err("missing Epic app id".to_string());
+    }
+    if app.starts_with('-') {
+        return Err(format!("invalid Epic app id '{app}'"));
+    }
+    Ok(app)
+}
+
 /// Is the legendary CLI installed (on PATH)?
 fn legendary_present() -> bool {
     Command::new("legendary")
@@ -157,10 +186,30 @@ fn legendary_present() -> bool {
 }
 
 /// Has the user signed in (legendary stores credentials in user.json)?
+/// Honors legendary's own config-path overrides so a non-default setup is
+/// still detected: LEGENDARY_CONFIG_PATH points straight at the config dir,
+/// otherwise XDG_CONFIG_HOME (falling back to ~/.config).
 fn legendary_logged_in() -> bool {
-    std::env::var("HOME")
-        .map(|h| std::path::Path::new(&h).join(".config/legendary/user.json").exists())
+    legendary_config_dir()
+        .map(|dir| dir.join("user.json").exists())
         .unwrap_or(false)
+}
+
+/// The directory legendary keeps its config (incl. user.json) in.
+fn legendary_config_dir() -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("LEGENDARY_CONFIG_PATH") {
+        if !explicit.is_empty() {
+            return Some(std::path::PathBuf::from(explicit));
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Some(std::path::PathBuf::from(xdg).join("legendary"));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::Path::new(&h).join(".config/legendary"))
 }
 
 fn legendary_json(args: &[&str]) -> Option<String> {

@@ -51,9 +51,29 @@ const DPAD: [number, NavAction][] = [
   [15, 'right'],
 ];
 
-const STICK_THRESHOLD = 0.5;
+// Deadzone hysteresis: cross ENTER to engage a direction, and the stick must
+// fall back below RELEASE before it lets go. A resting/worn stick idling near
+// the edge therefore can't flicker and phantom-scroll.
+const STICK_ENTER = 0.5;
+const STICK_RELEASE = 0.3;
 const REPEAT_DELAY_MS = 400;
 const REPEAT_RATE_MS = 130;
+
+// Directional actions may auto-repeat (hold-to-scroll); one-shot actions
+// (confirm/back/settings/…) must fire once per physical press, so we drop
+// OS/CEC key-repeat events for them.
+const REPEATABLE: Record<NavAction, boolean> = {
+  up: true,
+  down: true,
+  left: true,
+  right: true,
+  confirm: false,
+  back: false,
+  theme: false,
+  enhance: false,
+  settings: false,
+  search: false,
+};
 
 export function useTvInput(onAction: (action: NavAction) => void) {
   // Keep the latest handler in a ref so listeners are registered only once.
@@ -85,6 +105,10 @@ export function useTvInput(onAction: (action: NavAction) => void) {
       const action = KEY_MAP[e.key];
       if (action) {
         e.preventDefault();
+        // Ignore held-key auto-repeat for one-shot actions so holding Enter/
+        // Esc doesn't over-push/over-pop the nav stack. Directional keys keep
+        // their hold-to-scroll repeat.
+        if (e.repeat && !REPEATABLE[action]) return;
         handler.current(action);
       }
     };
@@ -100,15 +124,32 @@ export function useTvInput(onAction: (action: NavAction) => void) {
     let yWasDown = false;
     let startWasDown = false;
     let frame = 0;
+    // Remembered axis direction for deadzone hysteresis (see axisDirection).
+    let axisHeld: NavAction | null = null;
+
+    // Clears all held/edge state so a fresh (or reconnected) pad starts clean
+    // and can't leave a phantom held direction or a stuck button edge.
+    const resetPadState = () => {
+      heldDirection = null;
+      axisHeld = null;
+      aWasDown = bWasDown = xWasDown = yWasDown = startWasDown = false;
+    };
 
     const poll = (now: number) => {
       frame = requestAnimationFrame(poll);
       const pad = navigator.getGamepads().find((p) => p?.connected);
-      if (!pad) return;
+      if (!pad) {
+        resetPadState();
+        return;
+      }
 
-      const direction =
-        DPAD.find(([i]) => pad.buttons[i]?.pressed)?.[1] ??
-        axisDirection(pad.axes[0], pad.axes[1]);
+      const dpadDir = DPAD.find(([i]) => pad.buttons[i]?.pressed)?.[1] ?? null;
+      // The d-pad wins; only fall back to the stick, and reset stick hysteresis
+      // whenever the d-pad is driving so releasing it doesn't linger.
+      if (dpadDir) axisHeld = null;
+      const stickDir = dpadDir ? null : axisDirection(pad.axes[0], pad.axes[1], axisHeld);
+      axisHeld = dpadDir ? null : stickDir;
+      const direction = dpadDir ?? stickDir;
 
       if (direction !== heldDirection) {
         heldDirection = direction;
@@ -139,15 +180,27 @@ export function useTvInput(onAction: (action: NavAction) => void) {
     };
     frame = requestAnimationFrame(poll);
 
+    // Nice-to-have: clear stale held state the moment a pad is (un)plugged.
+    const onGamepadChange = () => resetPadState();
+    window.addEventListener('gamepadconnected', onGamepadChange);
+    window.addEventListener('gamepaddisconnected', onGamepadChange);
+
     return () => {
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('gamepadconnected', onGamepadChange);
+      window.removeEventListener('gamepaddisconnected', onGamepadChange);
       cancelAnimationFrame(frame);
     };
   }, []);
 }
 
-function axisDirection(x = 0, y = 0): NavAction | null {
-  if (Math.abs(x) < STICK_THRESHOLD && Math.abs(y) < STICK_THRESHOLD) return null;
+// Deadzone hysteresis: `held` is the direction currently engaged (or null).
+// Engaging needs an axis past STICK_ENTER; staying engaged only needs it above
+// STICK_RELEASE, so a stick resting just under the enter threshold — or a worn
+// one jittering around it — won't flicker on and off.
+function axisDirection(x = 0, y = 0, held: NavAction | null = null): NavAction | null {
+  const threshold = held ? STICK_RELEASE : STICK_ENTER;
+  if (Math.abs(x) < threshold && Math.abs(y) < threshold) return null;
   if (Math.abs(x) > Math.abs(y)) return x > 0 ? 'right' : 'left';
   return y > 0 ? 'down' : 'up';
 }

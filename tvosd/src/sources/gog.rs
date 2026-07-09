@@ -80,7 +80,10 @@ impl Source for Gog {
     }
 
     fn install(&self, item_id: &str, _jobs: &InstallManager) -> Result<(), String> {
-        // Heroic owns the download; the deep link opens it to install the game.
+        // Unlike Epic (a tracked `legendary install` job), this is a plain
+        // hand-off: the deep link opens Heroic on the game and Heroic runs and
+        // tracks the download itself. We don't register an install job, so the
+        // UI won't show fake progress for something we aren't managing.
         deep_link(item_id)
     }
 }

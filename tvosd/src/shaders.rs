@@ -37,7 +37,7 @@ pub fn ensure() -> bool {
     let dir = crate::upscale::shader_dir();
     let missing: Vec<&str> = REQUIRED
         .iter()
-        .filter(|name| !dir.join(name).exists())
+        .filter(|name| !present(&dir.join(name)))
         .copied()
         .collect();
     if missing.is_empty() {
@@ -51,8 +51,13 @@ pub fn ensure() -> bool {
 
     for name in missing.iter().filter(|n| n.starts_with("FSRCNNX")) {
         match fetch(&format!("{FSRCNNX_BASE}/{name}")) {
+            // Write to a temp file and rename on success so a partial/failed
+            // download never leaves a truncated .glsl that would silently
+            // corrupt the shader chain.
             Ok(bytes) => {
-                let _ = std::fs::write(dir.join(name), bytes);
+                if let Err(e) = write_atomic(&dir.join(name), &bytes) {
+                    crate::log_warn!("shader {name}: {e}");
+                }
             }
             Err(e) => crate::log_warn!("shader {name}: {e}"),
         }
@@ -65,8 +70,26 @@ pub fn ensure() -> bool {
         }
     }
 
-    REQUIRED.iter().all(|name| dir.join(name).exists())
+    // Success only when the *whole* expected set is present on disk.
+    let ok = REQUIRED.iter().all(|name| present(&dir.join(name)));
+    if !ok {
+        let still_missing: Vec<&str> = REQUIRED
+            .iter()
+            .filter(|n| !present(&dir.join(n)))
+            .copied()
+            .collect();
+        crate::log_warn!(
+            "upscaler shaders incomplete, still missing: {}",
+            still_missing.join(", ")
+        );
+    }
+    ok
 }
+
+/// Sanity cap on a single shader/zip download. Exceeding it is an *error*
+/// (the download is wrong or a redirect to something huge), not a silent
+/// truncation that would leave a broken file behind.
+const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
     let response = reqwest::blocking::Client::builder()
@@ -77,12 +100,54 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| format!("download failed: {e}"))?;
+    // Reject anything advertising more than the cap up front.
+    if let Some(len) = response.content_length() {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(format!("too large ({len} bytes) — refusing"));
+        }
+    }
+    // Read one byte past the cap so we can *detect* an overrun instead of
+    // silently truncating a body that lied about (or omitted) its length.
     let mut bytes = Vec::new();
     response
-        .take(64 * 1024 * 1024) // sanity cap
+        .take(MAX_DOWNLOAD_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err("exceeded size cap — refusing".to_string());
+    }
+    // A 0-byte (or near-empty) body is a failed/blocked download, not a valid
+    // shader — refuse it so we never persist a file that would silently break
+    // the chain when mpv tries to load it.
+    if bytes.is_empty() {
+        return Err("empty download — refusing".to_string());
+    }
     Ok(bytes)
+}
+
+/// A shader counts as installed only if it exists *and* is non-empty — a
+/// 0-byte file (a failed/interrupted download from an older build) would pass a
+/// bare existence check yet break the chain, so treat it as missing and refetch.
+fn present(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Writes `bytes` to a sibling temp file and atomically renames it into place,
+/// so readers never see a half-written shader.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    // Never publish an empty file — a 0-byte shader passes the existence check
+    // in `ensure()` but corrupts the chain at playback.
+    if bytes.is_empty() {
+        return Err("empty shader — refusing to write".to_string());
+    }
+    let tmp = dest.with_extension("glsl.part");
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 /// Writes every .glsl in the archive straight into `dir` (flattened, like
@@ -100,8 +165,9 @@ fn extract_glsl(zip_bytes: &[u8], dir: &Path) -> Result<usize, String> {
         let Some(base) = Path::new(&name).file_name() else {
             continue;
         };
-        let mut out = std::fs::File::create(dir.join(base)).map_err(|e| e.to_string())?;
-        std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        std::io::copy(&mut file, &mut buf).map_err(|e| e.to_string())?;
+        write_atomic(&dir.join(base), &buf)?;
         count += 1;
     }
     Ok(count)
@@ -118,7 +184,9 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(&mut buf);
         let opts = SimpleFileOptions::default();
-        writer.start_file("glsl/Upscale/Test_Upscale.glsl", opts).unwrap();
+        writer
+            .start_file("glsl/Upscale/Test_Upscale.glsl", opts)
+            .unwrap();
         writer.write_all(b"//shader").unwrap();
         writer.start_file("README.md", opts).unwrap();
         writer.write_all(b"docs").unwrap();

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ApiError,
   ContentItem,
   EnhanceMode,
   InstallJob,
@@ -75,9 +76,28 @@ const BLANK_SETTINGS: Settings = {
   mal_token: '',
 };
 
+// Couch-friendly error classification — never surfaces a raw exception string
+// to the living-room screen. `offline` gets its own dedicated message.
+type LoadError = 'offline' | 'timeout' | 'generic';
+
+function errorKind(e: unknown): LoadError {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return 'offline';
+  if (e instanceof ApiError) {
+    if (e.code === 'offline') return 'offline';
+    if (e.code === 'timeout') return 'timeout';
+  }
+  return 'generic';
+}
+
+const ERROR_COPY: Record<LoadError, string> = {
+  offline: "You're offline. Check the network connection and try again.",
+  timeout: "Couldn't reach TV OS in time. It may still be starting up.",
+  generic: "Something went wrong loading your library.",
+};
+
 export default function App() {
   const [rows, setRows] = useState<Row[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LoadError | null>(null);
   const [focus, setFocus] = useState<Focus>({ row: 0, col: 0 });
   const [toast, setToast] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(initialTheme);
@@ -113,9 +133,15 @@ export default function App() {
   focusRef.current = focus;
 
   const loadLibrary = useCallback(() => {
+    // fetchLibrary already applies a timeout (and retries) per request, so this
+    // resolves or rejects in bounded time — the Loading… state can't hang.
+    setError(null);
     fetchLibrary()
-      .then(setRows)
-      .catch((e) => setError(String(e)));
+      .then((r) => {
+        setRows(r);
+        setError(null);
+      })
+      .catch((e) => setError(errorKind(e)));
   }, []);
 
   useEffect(loadLibrary, [loadLibrary]);
@@ -157,6 +183,9 @@ export default function App() {
     window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 3000);
   }, []);
+
+  // Don't leave a pending toast timeout firing setState after unmount.
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   // Refreshes background data after a play/install (recommender rows, jobs).
   const onPlayed = useCallback(() => {
@@ -233,6 +262,12 @@ export default function App() {
         cycleEnhance();
         return;
       }
+      // The load-error screen: A/Enter (or ▶) retries the library fetch. The
+      // Retry button is also clickable with a pointer / mouse.
+      if (error) {
+        if (action === 'confirm') loadLibrary();
+        return;
+      }
       if (!rows || rows.length === 0) return;
 
       // Focus is in the left sidebar: ▲▼ walk the entries, A activates,
@@ -297,8 +332,10 @@ export default function App() {
         const len = navLength(row);
         switch (action) {
           case 'left':
-            // At the left edge of a line, slide into the sidebar.
-            if (f.col % cols === 0) {
+            // Only the true first cell slides into the sidebar. At the start of
+            // a *wrapped* line (col % cols === 0 but col > 0) step back to the
+            // previous line's last cell instead of jumping to the sidebar.
+            if (f.col === 0) {
               gridReturn.current = f;
               return { row: -1, col: 0 };
             }
@@ -314,7 +351,7 @@ export default function App() {
             const lastLine = Math.floor((plen - 1) / pcols);
             return {
               row: f.row - 1,
-              col: Math.min(lastLine * pcols + Math.min(f.col % cols, pcols - 1), plen - 1),
+              col: Math.max(0, Math.min(lastLine * pcols + Math.min(f.col % cols, pcols - 1), plen - 1)),
             };
           }
           case 'down': {
@@ -327,7 +364,7 @@ export default function App() {
             const next = rows[f.row + 1];
             return {
               row: f.row + 1,
-              col: Math.min(Math.min(f.col % cols, colsFor(next) - 1), navLength(next) - 1),
+              col: Math.max(0, Math.min(Math.min(f.col % cols, colsFor(next) - 1), navLength(next) - 1)),
             };
           }
           default:
@@ -335,7 +372,7 @@ export default function App() {
         }
       });
     },
-    [rows, showToast, theme, settings, settingsLoaded, settingsOpen, searchOpen, detailsItem, expandedRow, cycleEnhance, toggleMode, pushDetails],
+    [rows, error, loadLibrary, showToast, theme, settings, settingsLoaded, settingsOpen, searchOpen, detailsItem, expandedRow, cycleEnhance, toggleMode, pushDetails],
   );
   useTvInput(onAction);
 
@@ -371,7 +408,18 @@ export default function App() {
   // even on a fresh, empty install. Only the central body changes.
   let body;
   if (error) {
-    body = <div className="screen-message">{error}</div>;
+    body = (
+      <div className="screen-message">
+        <p>{ERROR_COPY[error]}</p>
+        <button
+          className="tv-retry"
+          autoFocus
+          onClick={loadLibrary}
+        >
+          Retry
+        </button>
+      </div>
+    );
   } else if (!rows) {
     body = <div className="screen-message">Loading…</div>;
   } else if (rows.length === 0) {
@@ -396,8 +444,8 @@ export default function App() {
           </div>
           {previewImages.length > 0 && (
             <div className="hero-images">
-              {previewImages.map((src) => (
-                <img key={src} className="hero-shot" src={src} alt="" loading="lazy" />
+              {previewImages.map((src, i) => (
+                <img key={`${i}-${src}`} className="hero-shot" src={src} alt="" loading="lazy" />
               ))}
             </div>
           )}
@@ -406,7 +454,7 @@ export default function App() {
         <main className="rows">
           {rows.map((row, i) => (
             <MediaRow
-              key={row.title}
+              key={`${i}-${row.title}`}
               row={row}
               focusedCol={i === focus.row ? focus.col : null}
               jobs={jobs}
@@ -465,7 +513,7 @@ export default function App() {
       ) : (
         <DesktopHome
           rows={rows}
-          error={error}
+          error={error ? ERROR_COPY[error] : null}
           onOpen={pushDetails}
           onSearch={() => setSearchOpen(true)}
           onSettings={() => setSettingsOpen(true)}
@@ -528,6 +576,9 @@ function useInstallJobs(onFinished: () => void) {
   onFinishedRef.current = onFinished;
   const runningIds = useRef<Set<string>>(new Set());
   const running = jobs.some((j) => j.status === 'running');
+  // Consecutive empty/idle polls — used to back the idle cadence off so we
+  // don't hammer /api/installs forever on a box that never installs anything.
+  const idleStreak = useRef(0);
 
   const refresh = useCallback(() => {
     fetchInstalls()
@@ -538,16 +589,28 @@ function useInstallJobs(onFinished: () => void) {
         runningIds.current = new Set(
           next.filter((j) => j.status === 'running').map((j) => j.id),
         );
+        // Any activity (a job present, running or just-finished) resets the
+        // idle backoff so the next install polls promptly again.
+        idleStreak.current = next.length > 0 ? 0 : idleStreak.current + 1;
         setJobs(next);
       })
       .catch(() => {});
   }, []);
 
   useEffect(() => {
-    refresh();
-    // Poll fast while a download runs, lazily otherwise.
-    const interval = window.setInterval(refresh, running ? 2000 : 15000);
-    return () => window.clearInterval(interval);
+    // Self-scheduling poll: fast (2s) while a download runs; when idle it
+    // starts at 15s and eases toward a 2min ceiling so a jobless box goes
+    // effectively quiet instead of polling forever.
+    let timer: number;
+    const tick = () => {
+      refresh();
+      const delay = running
+        ? 2000
+        : Math.min(120_000, 15_000 * Math.max(1, idleStreak.current));
+      timer = window.setTimeout(tick, delay);
+    };
+    tick();
+    return () => window.clearTimeout(timer);
   }, [running, refresh]);
 
   return { jobs, refresh };
@@ -571,8 +634,9 @@ function useHeroPreview(item: ContentItem | undefined): Meta | null {
     }
     setMeta(null);
     let cancelled = false;
+    const controller = new AbortController();
     const t = window.setTimeout(() => {
-      fetchMeta(id)
+      fetchMeta(id, controller.signal)
         .then((m) => {
           if (cancelled) return;
           cache.current.set(id, m);
@@ -583,6 +647,9 @@ function useHeroPreview(item: ContentItem | undefined): Meta | null {
     return () => {
       cancelled = true;
       window.clearTimeout(t);
+      // Abort the in-flight request too, not just ignore its result, so fast
+      // scrolling doesn't leave a pile of stale meta fetches racing.
+      controller.abort();
     };
   }, [id]);
   return meta;

@@ -137,10 +137,22 @@ pub fn resolve(mode: EnhanceMode, target: &str) -> Profile {
 /// build that supports PROTON_FSR4_UPGRADE, e.g. Proton-CachyOS).
 pub fn game_env() -> Vec<(&'static str, &'static str)> {
     match gpu() {
-        Gpu::Amd => vec![("PROTON_FSR4_UPGRADE", "1")],
+        // PROTON_FSR4_UPGRADE only helps on FSR4-capable AMD (RDNA4+); on
+        // RDNA2/3 it's unsupported and can break launches. Only set it when a
+        // capability signal is present or the user explicitly opts in, so older
+        // AMD cards are left alone.
+        Gpu::Amd if fsr4_supported() => vec![("PROTON_FSR4_UPGRADE", "1")],
+        Gpu::Amd => Vec::new(),
         Gpu::Nvidia => vec![("PROTON_ENABLE_NVAPI", "1")],
         Gpu::None => Vec::new(),
     }
+}
+
+/// Whether to enable the Proton FSR4 upgrade. Off by default (safe for
+/// RDNA2/3); enabled by the explicit `TVOS_FSR4=1` opt-in — the capability
+/// signal the launcher/setup can set once it knows the card is FSR4-capable.
+fn fsr4_supported() -> bool {
+    matches!(std::env::var("TVOS_FSR4").as_deref(), Ok("1"))
 }
 
 /// Auto picks quality when there's a real GPU to drive it.
@@ -192,7 +204,23 @@ pub fn shader_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_SHADER_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/tvos/shaders")
+    // Honor XDG_DATA_HOME; fall back to an absolute home so shaders never land
+    // in a relative path (which would depend on the daemon's cwd) if HOME is
+    // unset.
+    let data_home = match std::env::var("XDG_DATA_HOME") {
+        Ok(v) if v.starts_with('/') => PathBuf::from(v),
+        _ => home_dir().join(".local/share"),
+    };
+    data_home.join("tvos/shaders")
+}
+
+/// An absolute home directory, falling back to `/root` rather than a relative
+/// path when HOME is unset.
+fn home_dir() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => PathBuf::from("/root"),
+    }
 }
 
 /// Anime detection without metadata: fansub-style "[Group] Title - 01" names
@@ -200,10 +228,18 @@ pub fn shader_dir() -> PathBuf {
 /// general-purpose chain, so this only needs to be roughly right.
 fn looks_like_anime(target: &str) -> bool {
     let lower = target.to_lowercase();
-    if lower.split(['/', '\\']).any(|seg| seg == "anime") || lower.contains("anime") {
+    // A path/URL *segment* that is exactly "anime" (a genre folder), not any
+    // path that merely contains the substring (e.g. ".../Reanimated/…" or a
+    // movie literally called "Anime"): match whole components only, splitting
+    // on both separators so Windows-style paths work too.
+    if lower
+        .split(['/', '\\'])
+        .any(|seg| seg == "anime" || seg == "animes")
+    {
         return true;
     }
-    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    // Fansub-style release names: "[Group] Title - 01".
+    let name = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
     name.starts_with('[') && name.contains(']')
 }
 
@@ -248,6 +284,11 @@ fn gpu() -> Gpu {
     *GPU.get_or_init(detect_gpu)
 }
 
+/// PCI vendor ids in DRM sysfs.
+const VENDOR_AMD: &str = "0x1002";
+const VENDOR_NVIDIA: &str = "0x10de";
+const VENDOR_INTEL: &str = "0x8086";
+
 fn detect_gpu() -> Gpu {
     match std::env::var("TVOS_GPU").as_deref() {
         Ok("nvidia") => return Gpu::Nvidia,
@@ -255,21 +296,64 @@ fn detect_gpu() -> Gpu {
         Ok("none") => return Gpu::None,
         _ => {}
     }
+
+    // Prefer the DRM device the compositor is actually driving. WLR/most
+    // Wayland compositors honor WLR_DRM_DEVICE / the card bound to the session;
+    // classify by *that* card's vendor so a secondary/idle GPU doesn't win.
+    if let Some(gpu) = compositor_gpu() {
+        return gpu;
+    }
+
+    // nvidia-smi -L prints one "GPU 0: …" line per card; a 0 exit with no such
+    // line (some stub/driver states) is *not* a usable NVIDIA GPU.
     let nvidia = Command::new("nvidia-smi")
         .arg("-L")
         .output()
-        .is_ok_and(|o| o.status.success());
+        .is_ok_and(|o| {
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GPU ")
+        });
     if nvidia {
         return Gpu::Nvidia;
     }
-    // AMD: any DRM card with the AMD PCI vendor id (0x1002).
-    for card in 0..4 {
-        let vendor = format!("/sys/class/drm/card{card}/device/vendor");
-        if std::fs::read_to_string(vendor).is_ok_and(|v| v.trim() == "0x1002") {
-            return Gpu::Amd;
+
+    // Fall back to scanning DRM cards by PCI vendor. NVIDIA first (its shaders
+    // want the NVAPI path), then AMD; Intel is deliberately *not* mapped to
+    // NVIDIA — it has no usable NVIDIA/AMD engine path here, so it's None.
+    for card in 0..8 {
+        match card_vendor(&format!("card{card}")).as_deref() {
+            Some(VENDOR_NVIDIA) => return Gpu::Nvidia,
+            Some(VENDOR_AMD) => return Gpu::Amd,
+            _ => {}
         }
     }
     Gpu::None
+}
+
+/// The GPU vendor of the DRM node the compositor is bound to, if we can tell.
+/// Reads WLR_DRM_DEVICE (or a caller-provided TVOS_DRM_DEVICE) — a path like
+/// /dev/dri/renderD128 or /dev/dri/card0 — and resolves it back to a sysfs
+/// vendor id.
+fn compositor_gpu() -> Option<Gpu> {
+    let node = std::env::var("TVOS_DRM_DEVICE")
+        .or_else(|_| std::env::var("WLR_DRM_DEVICE"))
+        .ok()?;
+    let name = Path::new(&node).file_name()?.to_str()?;
+    // renderD* nodes and card* nodes both expose the vendor under the same
+    // /sys/class/drm/<name>/device/vendor path.
+    match card_vendor(name).as_deref() {
+        Some(VENDOR_NVIDIA) => Some(Gpu::Nvidia),
+        Some(VENDOR_AMD) => Some(Gpu::Amd),
+        Some(VENDOR_INTEL) => Some(Gpu::None), // Intel: no NVIDIA/AMD path
+        _ => None,
+    }
+}
+
+/// The PCI vendor id string for a DRM node name (e.g. "card0", "renderD128").
+fn card_vendor(name: &str) -> Option<String> {
+    let path = format!("/sys/class/drm/{name}/device/vendor");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|v| v.trim().to_string())
 }
 
 #[cfg(test)]
@@ -294,8 +378,12 @@ mod tests {
     fn detects_anime_style_names() {
         assert!(looks_like_anime("/media/anime/show/episode 01.mkv"));
         assert!(looks_like_anime("[SubGroup] Some Show - 01 (1080p).mkv"));
+        assert!(looks_like_anime(r"D:\Anime\Show\ep01.mkv")); // windows separators
         assert!(!looks_like_anime("/media/movies/Heat (1995).mkv"));
         assert!(!looks_like_anime("https://example.com/movie.mp4"));
+        // Substring "anime" inside another word must not false-positive.
+        assert!(!looks_like_anime("/media/movies/Reanimated (2020).mkv"));
+        assert!(!looks_like_anime("/tv/The Animeals Show/ep.mkv"));
     }
 
     #[test]

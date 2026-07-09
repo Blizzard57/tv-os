@@ -10,7 +10,12 @@ import '@fontsource/inter/800.css';
 import App from './App';
 import './styles.css';
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+const rootEl = document.getElementById('root');
+if (!rootEl) {
+  throw new Error('TV OS shell: #root element missing from index.html — cannot mount.');
+}
+
+ReactDOM.createRoot(rootEl).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>,

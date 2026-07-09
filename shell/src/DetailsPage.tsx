@@ -59,6 +59,13 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const [strip, setStrip] = useState<{ zone: StripZone; idx: number } | null>(null);
   const [similar, setSimilar] = useState<ContentItem[]>([]);
   const [extras, setExtras] = useState<GameExtras>({});
+  const [metaError, setMetaError] = useState(false);
+  // Monotonic tokens so a late stream/meta response for a previous item can
+  // never overwrite the current one.
+  const streamToken = useRef(0);
+  const metaToken = useRef(0);
+  // Track pending status/flash timeouts so we can clear them on unmount.
+  const flashTimer = useRef<number | null>(null);
   const shotRefs = useRef<(HTMLImageElement | null)[]>([]);
   const simRefs = useRef<(HTMLDivElement | null)[]>([]);
   const achRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -101,11 +108,16 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   }, [item.id]);
 
   useEffect(() => {
-    let cancelled = false;
+    const token = ++metaToken.current;
+    // Reset per-item view state so a stale stage/selection can't leak across.
     setStrip(null);
+    setMeta(null);
+    setMetaError(false);
+    setEpisode(null);
+    setSel(0);
     fetchMeta(item.id)
       .then((m) => {
-        if (cancelled) return;
+        if (token !== metaToken.current) return; // superseded by a newer item
         setMeta(m);
         const isSeries = (m.kind || item.kind) === 'series';
         if (isShopItem(item.id)) {
@@ -123,20 +135,28 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           loadStreams(item.id);
         }
       })
-      .catch(() => setMeta({ ...emptyMeta(item) }));
-    return () => {
-      cancelled = true;
-    };
+      .catch(() => {
+        if (token !== metaToken.current) return;
+        setMetaError(true);
+        setMeta({ ...emptyMeta(item) });
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item.id]);
 
   const loadStreams = useCallback((id: string) => {
+    const token = ++streamToken.current;
     setStreams(null);
     setSel(0);
     setStrip(null);
     fetchStreams(id)
-      .then(setStreams)
-      .catch(() => setStreams([]));
+      .then((s) => {
+        if (token !== streamToken.current) return; // a newer load won
+        setStreams(s);
+      })
+      .catch(() => {
+        if (token !== streamToken.current) return;
+        setStreams([]);
+      });
   }, []);
 
   const seasons = useMemo(
@@ -150,8 +170,20 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
   const flash = useCallback((msg: string) => {
     setStatus(msg);
-    window.setTimeout(() => setStatus((s) => (s === msg ? null : s)), 3500);
+    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
+    flashTimer.current = window.setTimeout(() => {
+      flashTimer.current = null;
+      setStatus((s) => (s === msg ? null : s));
+    }, 3500);
   }, []);
+
+  // Clear any pending status timeout so we never setState after unmount.
+  useEffect(
+    () => () => {
+      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
+    },
+    [],
+  );
 
   // The precise id being watched: for an episode it's `strm:series:<imdb>:s:e`
   // so Trakt/AniList scrobble the exact episode (the show `item` still drives
@@ -319,7 +351,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   useEffect(() => {
     if (strip) return;
     selRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [sel, stage, strip, streams, episodesInSeason]);
+  }, [sel, stage, strip, streams, episode, episodesInSeason]);
 
   useEffect(() => {
     if (!strip) return;
@@ -428,8 +460,17 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 ))}
               </div>
             )}
-            {meta?.description && <p className="details-desc">{meta.description}</p>}
-            {!meta && <p className="details-desc">Loading…</p>}
+            {metaError ? (
+              <p className="details-desc">
+                Couldn't load the details for this title — the daemon may be busy or offline.
+                Press <span className="key">B</span> / Esc to go back and try again.
+              </p>
+            ) : (
+              <>
+                {meta?.description && <p className="details-desc">{meta.description}</p>}
+                {!meta && <p className="details-desc">Loading…</p>}
+              </>
+            )}
           </div>
         </div>
 

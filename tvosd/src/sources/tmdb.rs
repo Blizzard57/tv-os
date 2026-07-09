@@ -8,7 +8,7 @@
 //! title. Results are cached so the home screen stays fast.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -20,6 +20,43 @@ use crate::util::percent_encode;
 
 const CACHE_TTL: Duration = Duration::from_secs(900);
 const ROW_LIMIT: usize = 25;
+/// Cap on simultaneous TMDB requests across the parallel catalog fan-out, so we
+/// stay well under TMDB's rate limit instead of firing a dozen at once.
+const MAX_CONCURRENT_FETCHES: usize = 4;
+
+/// A tiny counting semaphore for bounding fan-out concurrency. `acquire`
+/// returns a guard that releases the permit on drop.
+struct Semaphore {
+    count: Mutex<usize>,
+    cvar: Condvar,
+}
+
+struct Permit<'a>(&'a Semaphore);
+
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Semaphore {
+            count: Mutex::new(permits),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> Permit<'_> {
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        while *count == 0 {
+            count = self.cvar.wait(count).unwrap();
+        }
+        *count -= 1;
+        Permit(self)
+    }
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        *self.0.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.cvar.notify_one();
+    }
+}
 
 #[derive(Default)]
 pub struct Tmdb {
@@ -35,16 +72,56 @@ pub struct Tmdb {
 const CATALOGS: &[(&str, &str, &str)] = &[
     ("Trending Movies", "movie", "trending/movie/week"),
     ("Trending Shows", "tv", "trending/tv/week"),
-    ("Popular Movies", "movie", "discover/movie?sort_by=popularity.desc&vote_count.gte=300"),
-    ("Anime", "tv", "discover/tv?with_genres=16&with_original_language=ja&sort_by=popularity.desc"),
-    ("Anime Movies", "movie", "discover/movie?with_genres=16&with_original_language=ja&sort_by=popularity.desc"),
-    ("Cartoons", "tv", "discover/tv?with_genres=16&with_original_language=en&sort_by=popularity.desc"),
-    ("K-Dramas", "tv", "discover/tv?with_original_language=ko&without_genres=16&sort_by=popularity.desc"),
-    ("C-Dramas", "tv", "discover/tv?with_original_language=zh&without_genres=16&sort_by=popularity.desc"),
-    ("J-Dramas", "tv", "discover/tv?with_original_language=ja&without_genres=16&sort_by=popularity.desc"),
-    ("Popular on Netflix", "tv", "discover/tv?with_watch_providers=8&watch_region=US&sort_by=popularity.desc"),
-    ("Popular on Disney+", "tv", "discover/tv?with_watch_providers=337&watch_region=US&sort_by=popularity.desc"),
-    ("Popular on Prime Video", "tv", "discover/tv?with_watch_providers=9&watch_region=US&sort_by=popularity.desc"),
+    (
+        "Popular Movies",
+        "movie",
+        "discover/movie?sort_by=popularity.desc&vote_count.gte=300",
+    ),
+    (
+        "Anime",
+        "tv",
+        "discover/tv?with_genres=16&with_original_language=ja&sort_by=popularity.desc",
+    ),
+    (
+        "Anime Movies",
+        "movie",
+        "discover/movie?with_genres=16&with_original_language=ja&sort_by=popularity.desc",
+    ),
+    (
+        "Cartoons",
+        "tv",
+        "discover/tv?with_genres=16&with_original_language=en&sort_by=popularity.desc",
+    ),
+    (
+        "K-Dramas",
+        "tv",
+        "discover/tv?with_original_language=ko&without_genres=16&sort_by=popularity.desc",
+    ),
+    (
+        "C-Dramas",
+        "tv",
+        "discover/tv?with_original_language=zh&without_genres=16&sort_by=popularity.desc",
+    ),
+    (
+        "J-Dramas",
+        "tv",
+        "discover/tv?with_original_language=ja&without_genres=16&sort_by=popularity.desc",
+    ),
+    (
+        "Popular on Netflix",
+        "tv",
+        "discover/tv?with_watch_providers=8&watch_region=US&sort_by=popularity.desc",
+    ),
+    (
+        "Popular on Disney+",
+        "tv",
+        "discover/tv?with_watch_providers=337&watch_region=US&sort_by=popularity.desc",
+    ),
+    (
+        "Popular on Prime Video",
+        "tv",
+        "discover/tv?with_watch_providers=9&watch_region=US&sort_by=popularity.desc",
+    ),
 ];
 
 impl Tmdb {
@@ -59,7 +136,12 @@ impl Tmdb {
     fn catalog(&self, key: &str, media: &str, path: &str) -> Vec<ContentItem> {
         let sep = if path.contains('?') { '&' } else { '?' };
         let url = format!("https://api.themoviedb.org/3/{path}{sep}api_key={key}");
-        if let Some((at, items)) = self.cache.lock().unwrap().get(&url) {
+        if let Some((at, items)) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&url)
+        {
             if at.elapsed() < CACHE_TTL {
                 return items.clone();
             }
@@ -70,7 +152,7 @@ impl Tmdb {
         if !items.is_empty() {
             self.cache
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(url, (Instant::now(), items.clone()));
         }
         items
@@ -90,21 +172,33 @@ impl Source for Tmdb {
         let Some(key) = self.api_key() else {
             return Vec::new();
         };
-        // Fetch every catalog in parallel so a dozen rows don't load serially.
+        // Fetch catalogs in parallel, but cap concurrency so we don't open a
+        // dozen simultaneous connections to TMDB and trip its rate limiter.
+        let gate = Semaphore::new(MAX_CONCURRENT_FETCHES);
         std::thread::scope(|scope| {
             let handles: Vec<_> = CATALOGS
                 .iter()
                 .map(|&(title, media, path)| {
                     let key = &key;
-                    scope.spawn(move || Row {
-                        title: title.to_string(),
-                        items: self.catalog(key, media, path),
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        let _permit = gate.acquire();
+                        Row {
+                            title: title.to_string(),
+                            items: self.catalog(key, media, path),
+                        }
                     })
                 })
                 .collect();
             handles
                 .into_iter()
-                .filter_map(|h| h.join().ok())
+                .filter_map(|h| match h.join() {
+                    Ok(row) => Some(row),
+                    Err(_) => {
+                        crate::log_warn!("tmdb: a catalog fetch thread panicked — skipping");
+                        None
+                    }
+                })
                 .collect()
         })
     }
@@ -156,17 +250,32 @@ fn imdb_id(key: &str, media: &str, tmdb_id: &str) -> Option<String> {
 }
 
 fn fetch(url: &str) -> Option<String> {
-    reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-        .ok()?
-        .get(url)
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .text()
-        .ok()
+        .ok()?;
+    // A couple of retries with backoff on HTTP 429 (TMDB's rate limiter),
+    // honoring Retry-After when present. Other statuses fail fast as before.
+    let mut backoff = Duration::from_millis(500);
+    for attempt in 0..3 {
+        let resp = client.get(url).send().ok()?;
+        if resp.status().as_u16() == 429 {
+            let wait = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(backoff);
+            if attempt < 2 {
+                std::thread::sleep(wait.min(Duration::from_secs(5)));
+                backoff *= 2;
+                continue;
+            }
+        }
+        return resp.error_for_status().ok()?.text().ok();
+    }
+    None
 }
 
 /// TMDB key from settings, falling back to the env var (headless setups).
@@ -175,12 +284,10 @@ fn api_key() -> Option<String> {
     if !from_settings.is_empty() {
         return Some(from_settings);
     }
-    std::env::var("TVOS_TMDB_KEY").ok().filter(|k| !k.is_empty())
+    std::env::var("TVOS_TMDB_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
 }
-
-/// Cache for recommendation rows, keyed by the request URL.
-static REC_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<ContentItem>)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The embedding recommender's candidate corpus (rebuilt hourly).
 static CORPUS: LazyLock<Mutex<Option<(Instant, Vec<(ContentItem, String)>)>>> =
@@ -197,7 +304,10 @@ const CORPUS_TTL: Duration = Duration::from_secs(3600);
 /// "all" means the items carry their own media_type (trending/all).
 const CORPUS_SOURCES: &[(&str, &str)] = &[
     ("all", "trending/all/week"),
-    ("movie", "discover/movie?sort_by=popularity.desc&vote_count.gte=300"),
+    (
+        "movie",
+        "discover/movie?sort_by=popularity.desc&vote_count.gte=300",
+    ),
     ("tv", "discover/tv?sort_by=popularity.desc"),
     ("movie", "movie/top_rated"),
     ("tv", "tv/top_rated"),
@@ -227,7 +337,7 @@ fn for_you_embeddings(key: &str, recent: &[ContentItem]) -> Vec<Row> {
     embed_corpus(&corpus);
 
     let watched: std::collections::HashSet<&str> = recent.iter().map(|i| i.id.as_str()).collect();
-    let cache = EMB_CACHE.lock().unwrap();
+    let cache = EMB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let mut scored: Vec<(f32, ContentItem)> = corpus
         .iter()
         .filter(|(item, _)| !watched.contains(item.id.as_str()))
@@ -277,12 +387,19 @@ fn profile_vector(key: &str, recent: &[ContentItem]) -> Option<Vec<f32>> {
 /// overview) for video; games fall back to their title (so taste still crosses
 /// domains, e.g. an anime habit nudging anime games).
 fn ensure_embedding(key: &str, item: &ContentItem) -> Option<Vec<f32>> {
-    if let Some(v) = EMB_CACHE.lock().unwrap().get(&item.id) {
+    if let Some(v) = EMB_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&item.id)
+    {
         return Some(v.clone());
     }
     let text = item_text(key, item)?;
     let vec = crate::embed::embed(vec![text])?.into_iter().next()?;
-    EMB_CACHE.lock().unwrap().insert(item.id.clone(), vec.clone());
+    EMB_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(item.id.clone(), vec.clone());
     Some(vec)
 }
 
@@ -321,7 +438,7 @@ fn detail_text(key: &str, media: &str, tmdb_id: &str) -> Option<String> {
 /// Embeds any corpus items not yet cached, in one batch.
 fn embed_corpus(corpus: &[(ContentItem, String)]) {
     let missing: Vec<(String, String)> = {
-        let cache = EMB_CACHE.lock().unwrap();
+        let cache = EMB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         corpus
             .iter()
             .filter(|(item, _)| !cache.contains_key(&item.id))
@@ -333,7 +450,7 @@ fn embed_corpus(corpus: &[(ContentItem, String)]) {
     }
     let texts: Vec<String> = missing.iter().map(|(_, t)| t.clone()).collect();
     if let Some(vecs) = crate::embed::embed(texts) {
-        let mut cache = EMB_CACHE.lock().unwrap();
+        let mut cache = EMB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         for ((id, _), vec) in missing.into_iter().zip(vecs) {
             cache.insert(id, vec);
         }
@@ -343,7 +460,7 @@ fn embed_corpus(corpus: &[(ContentItem, String)]) {
 /// The candidate pool: a broad, varied set of TMDB titles with rich text for
 /// embedding, deduped and cached.
 fn candidate_corpus(key: &str) -> Vec<(ContentItem, String)> {
-    if let Some((at, corpus)) = CORPUS.lock().unwrap().as_ref() {
+    if let Some((at, corpus)) = CORPUS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if at.elapsed() < CORPUS_TTL {
             return corpus.clone();
         }
@@ -363,12 +480,16 @@ fn candidate_corpus(key: &str) -> Vec<(ContentItem, String)> {
         }
     }
     if !out.is_empty() {
-        *CORPUS.lock().unwrap() = Some((Instant::now(), out.clone()));
+        *CORPUS.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), out.clone()));
     }
     out
 }
 
-fn parse_rich(json: &str, default_media: &str, genres: &HashMap<i64, String>) -> Vec<(ContentItem, String)> {
+fn parse_rich(
+    json: &str,
+    default_media: &str,
+    genres: &HashMap<i64, String>,
+) -> Vec<(ContentItem, String)> {
     let Ok(value) = serde_json::from_str::<Value>(json) else {
         return Vec::new();
     };
@@ -386,7 +507,11 @@ fn parse_rich(json: &str, default_media: &str, genres: &HashMap<i64, String>) ->
             if media != "movie" && media != "tv" {
                 return None;
             }
-            let title = m.get("title").or_else(|| m.get("name"))?.as_str()?.to_string();
+            let title = m
+                .get("title")
+                .or_else(|| m.get("name"))?
+                .as_str()?
+                .to_string();
             let art = art_of(m)?;
             let overview = m.get("overview").and_then(|o| o.as_str()).unwrap_or("");
             let genre_names = m
@@ -402,7 +527,11 @@ fn parse_rich(json: &str, default_media: &str, genres: &HashMap<i64, String>) ->
                 .unwrap_or_default();
             let item = ContentItem {
                 id: format!("tmdb:{media}:{}", m.get("id")?.as_i64()?),
-                kind: if media == "tv" { Kind::Series } else { Kind::Movie },
+                kind: if media == "tv" {
+                    Kind::Series
+                } else {
+                    Kind::Movie
+                },
                 title: title.clone(),
                 art: Some(art),
                 action: Action::Play,
@@ -414,7 +543,7 @@ fn parse_rich(json: &str, default_media: &str, genres: &HashMap<i64, String>) ->
 
 /// TMDB genre id → name (movie + tv), fetched once and cached.
 fn genre_map(key: &str) -> HashMap<i64, String> {
-    if let Some(map) = GENRES.lock().unwrap().as_ref() {
+    if let Some(map) = GENRES.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         return map.clone();
     }
     let mut map = HashMap::new();
@@ -436,53 +565,38 @@ fn genre_map(key: &str) -> HashMap<i64, String> {
         }
     }
     if !map.is_empty() {
-        *GENRES.lock().unwrap() = Some(map.clone());
+        *GENRES.lock().unwrap_or_else(|e| e.into_inner()) = Some(map.clone());
     }
     map
 }
 
 /// The "For You" row. Uses the on-box embedding recommender (PLAN.md §6) once
-/// the model is warm; otherwise falls back to a TMDB content-based blend.
+/// the model is warm to surface *new* titles by taste similarity; otherwise
+/// falls back to the documented local scorer (frequency × 14-day recency decay
+/// + time-of-day boost) over your own event log — see [`recommend::EventLog::recommended`].
 pub fn for_you(recent: &[ContentItem]) -> Vec<Row> {
-    let Some(key) = api_key() else {
-        return Vec::new();
-    };
     if crate::embed::ready() {
-        let rows = for_you_embeddings(&key, recent);
-        if !rows.is_empty() {
-            return rows;
+        if let Some(key) = api_key() {
+            let rows = for_you_embeddings(&key, recent);
+            if !rows.is_empty() {
+                return rows;
+            }
         }
     }
-    for_you_blended(&key, recent)
+    for_you_fallback()
 }
 
-/// Fallback recommender: blends TMDB's own recommendations across recent watches
-/// (recency-weighted, cross-seed agreement), excluding things already watched.
-fn for_you_blended(key: &str, recent: &[ContentItem]) -> Vec<Row> {
-    let watched: std::collections::HashSet<&str> = recent.iter().map(|i| i.id.as_str()).collect();
-    let mut scored: Vec<(f64, ContentItem)> = Vec::new();
-    for (idx, item) in recent.iter().take(6).enumerate() {
-        let Some((media, tmdb_id)) = seed(key, item) else {
-            continue;
-        };
-        let weight = 1.0 / (idx as f64 + 1.0); // most recent watch counts most
-        for cand in recommend_for(key, &media, &tmdb_id) {
-            if watched.contains(cand.id.as_str()) {
-                continue; // don't recommend something already watched
-            }
-            match scored.iter_mut().find(|(_, c)| c.id == cand.id) {
-                Some((score, _)) => *score += weight,
-                None => scored.push((weight, cand)),
-            }
-        }
-    }
-    if scored.is_empty() {
+/// Fallback recommender (no embeddings, no network): the documented local
+/// scorer over the launch log. Frequency × recency decay (half-life 14 days)
+/// with a time-of-day boost, excluding the item leading Continue.
+fn for_you_fallback() -> Vec<Row> {
+    let items = crate::recommend::LOG.recommended(25);
+    if items.is_empty() {
         return Vec::new();
     }
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     vec![Row {
         title: "For You".to_string(),
-        items: scored.into_iter().take(25).map(|(_, c)| c).collect(),
+        items,
     }]
 }
 
@@ -512,34 +626,17 @@ fn find_tmdb(key: &str, imdb: &str, media: &str) -> Option<String> {
     let url =
         format!("https://api.themoviedb.org/3/find/{imdb}?external_source=imdb_id&api_key={key}");
     let json: Value = serde_json::from_str(&fetch(&url)?).ok()?;
-    let field = if media == "tv" { "tv_results" } else { "movie_results" };
+    let field = if media == "tv" {
+        "tv_results"
+    } else {
+        "movie_results"
+    };
     json.get(field)?
         .as_array()?
         .first()?
         .get("id")?
         .as_i64()
         .map(|id| id.to_string())
-}
-
-/// TMDB recommendations for a seed title, cached.
-fn recommend_for(key: &str, media: &str, tmdb_id: &str) -> Vec<ContentItem> {
-    let url =
-        format!("https://api.themoviedb.org/3/{media}/{tmdb_id}/recommendations?api_key={key}");
-    if let Some((at, items)) = REC_CACHE.lock().unwrap().get(&url) {
-        if at.elapsed() < CACHE_TTL {
-            return items.clone();
-        }
-    }
-    let items = fetch(&url)
-        .map(|json| parse_trending(&json, media))
-        .unwrap_or_default();
-    if !items.is_empty() {
-        REC_CACHE
-            .lock()
-            .unwrap()
-            .insert(url, (Instant::now(), items.clone()));
-    }
-    items
 }
 
 /// Poster (preferred) or backdrop image URL, if the item has any artwork.
@@ -579,7 +676,9 @@ pub fn multi_search(query: &str) -> (Vec<ContentItem>, Vec<Person>) {
         "https://api.themoviedb.org/3/search/multi?api_key={key}&include_adult=false&query={}",
         percent_encode(query)
     );
-    fetch(&url).map(|json| parse_search(&json)).unwrap_or_default()
+    fetch(&url)
+        .map(|json| parse_search(&json))
+        .unwrap_or_default()
 }
 
 fn parse_search(json: &str) -> (Vec<ContentItem>, Vec<Person>) {
@@ -596,11 +695,19 @@ fn parse_search(json: &str) -> (Vec<ContentItem>, Vec<Person>) {
             if media != "movie" && media != "tv" {
                 return None;
             }
-            let title = m.get("title").or_else(|| m.get("name"))?.as_str()?.to_string();
+            let title = m
+                .get("title")
+                .or_else(|| m.get("name"))?
+                .as_str()?
+                .to_string();
             let art = art_of(m)?; // skip results with no artwork
             Some(ContentItem {
                 id: format!("tmdb:{media}:{}", m.get("id")?.as_i64()?),
-                kind: if media == "tv" { Kind::Series } else { Kind::Movie },
+                kind: if media == "tv" {
+                    Kind::Series
+                } else {
+                    Kind::Movie
+                },
                 title,
                 art: Some(art),
                 action: Action::Play,
@@ -630,9 +737,8 @@ pub fn person_credits(person_id: i64) -> Vec<ContentItem> {
     let Some(key) = api_key() else {
         return Vec::new();
     };
-    let url = format!(
-        "https://api.themoviedb.org/3/person/{person_id}/combined_credits?api_key={key}"
-    );
+    let url =
+        format!("https://api.themoviedb.org/3/person/{person_id}/combined_credits?api_key={key}");
     let Some(json) = fetch(&url) else {
         return Vec::new();
     };
@@ -665,18 +771,29 @@ pub fn person_credits(person_id: i64) -> Vec<ContentItem> {
                 return None;
             }
             if media == "tv"
-                && m.get("episode_count").and_then(|e| e.as_i64()).unwrap_or(i64::MAX) <= 2
+                && m.get("episode_count")
+                    .and_then(|e| e.as_i64())
+                    .unwrap_or(i64::MAX)
+                    <= 2
             {
                 return None;
             }
-            let title = m.get("title").or_else(|| m.get("name"))?.as_str()?.to_string();
+            let title = m
+                .get("title")
+                .or_else(|| m.get("name"))?
+                .as_str()?
+                .to_string();
             let art = art_of(m)?;
             let popularity = m.get("popularity").and_then(|p| p.as_f64()).unwrap_or(0.0);
             Some((
                 popularity,
                 ContentItem {
                     id: format!("tmdb:{media}:{}", m.get("id")?.as_i64()?),
-                    kind: if media == "tv" { Kind::Series } else { Kind::Movie },
+                    kind: if media == "tv" {
+                        Kind::Series
+                    } else {
+                        Kind::Movie
+                    },
                     title,
                     art: Some(art),
                     action: Action::Play,
@@ -719,7 +836,9 @@ pub fn keyword_ids(text: &str) -> Vec<(i64, String)> {
         .map(|results| {
             results
                 .iter()
-                .filter_map(|k| Some((k.get("id")?.as_i64()?, k.get("name")?.as_str()?.to_string())))
+                .filter_map(|k| {
+                    Some((k.get("id")?.as_i64()?, k.get("name")?.as_str()?.to_string()))
+                })
                 .take(5)
                 .collect()
         })
@@ -754,13 +873,12 @@ pub fn personalize(rows: &mut [Row], recent: &[ContentItem]) {
         None
     };
 
-    let skip =
-        |title: &str| title.starts_with("Continue") || title.starts_with("YouTube");
+    let skip = |title: &str| title.starts_with("Continue") || title.starts_with("YouTube");
 
     // One batched model call for every title we haven't embedded yet.
     if profile.is_some() {
         let missing: Vec<String> = {
-            let cache = TITLE_EMB.lock().unwrap();
+            let cache = TITLE_EMB.lock().unwrap_or_else(|e| e.into_inner());
             rows.iter()
                 .filter(|r| !skip(&r.title))
                 .flat_map(|r| r.items.iter())
@@ -772,7 +890,7 @@ pub fn personalize(rows: &mut [Row], recent: &[ContentItem]) {
         };
         if !missing.is_empty() {
             if let Some(vecs) = crate::embed::embed(missing.clone()) {
-                let mut cache = TITLE_EMB.lock().unwrap();
+                let mut cache = TITLE_EMB.lock().unwrap_or_else(|e| e.into_inner());
                 for (title, vec) in missing.into_iter().zip(vecs) {
                     cache.insert(title, vec);
                 }
@@ -784,7 +902,7 @@ pub fn personalize(rows: &mut [Row], recent: &[ContentItem]) {
         if skip(&row.title) || row.items.len() < 3 {
             continue;
         }
-        let cache = TITLE_EMB.lock().unwrap();
+        let cache = TITLE_EMB.lock().unwrap_or_else(|e| e.into_inner());
         let mut scored: Vec<(f32, ContentItem)> = row
             .items
             .drain(..)
@@ -814,9 +932,12 @@ pub fn similar(media: &str, tmdb_id: i64) -> Vec<ContentItem> {
         return Vec::new();
     };
     for path in ["recommendations", "similar"] {
-        let url =
-            format!("https://api.themoviedb.org/3/{media}/{tmdb_id}/{path}?api_key={key}");
-        if let Some((at, items)) = SIMILAR_CACHE.lock().unwrap().get(&url) {
+        let url = format!("https://api.themoviedb.org/3/{media}/{tmdb_id}/{path}?api_key={key}");
+        if let Some((at, items)) = SIMILAR_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&url)
+        {
             if at.elapsed() < CACHE_TTL {
                 if items.is_empty() {
                     continue;
@@ -829,7 +950,7 @@ pub fn similar(media: &str, tmdb_id: i64) -> Vec<ContentItem> {
             .unwrap_or_default();
         SIMILAR_CACHE
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(url, (Instant::now(), items.clone()));
         if !items.is_empty() {
             return items;
@@ -876,7 +997,10 @@ pub fn discover(
         return Vec::new();
     };
     let join = |ids: &[i64], sep: &str| {
-        ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(sep)
+        ids.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(sep)
     };
     let mut url = format!(
         "https://api.themoviedb.org/3/discover/{media}?api_key={key}&include_adult=false&sort_by=popularity.desc&vote_count.gte={min_votes}"

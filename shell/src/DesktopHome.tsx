@@ -28,7 +28,12 @@ interface Props {
 
 /** Pointer-first home: top bar with search, collapsible sidebar, filter
  *  chips, and one big card grid over the entire library — every row the
- *  daemon knows, flattened, filterable by kind or by origin row. */
+ *  daemon knows, flattened, filterable by kind or by origin row.
+ *
+ *  CAVEAT: this layout is mouse/touch only — it has NO controller/d-pad
+ *  focus navigation (unlike the TV home). A controller user who lands here
+ *  after a mode switch can't move focus; the "TV mode" pill (and the S/T
+ *  shortcuts handled upstream) are the way back to the navigable layout. */
 export function DesktopHome({
   rows,
   error,
@@ -57,8 +62,12 @@ export function DesktopHome({
 
   const rowTitles = useMemo(() => (rows ?? []).map((r) => r.title), [rows]);
   const isKind = (f: string): f is Kind => KIND_FILTERS.some((k) => k.id === f);
-  const visible = entries.filter(({ item, origin }) =>
-    filter === 'All' ? true : isKind(filter) ? item.kind === filter : origin === filter,
+  const visible = useMemo(
+    () =>
+      entries.filter(({ item, origin }) =>
+        filter === 'All' ? true : isKind(filter) ? item.kind === filter : origin === filter,
+      ),
+    [entries, filter],
   );
 
   const navItem = (
@@ -112,8 +121,8 @@ export function DesktopHome({
           <>
             <div className="dt-nav-sep" />
             <div className="dt-nav-head">Your rows</div>
-            {rowTitles.map((t) =>
-              navItem('·', t, filter === t, () => setFilter(t), `row-${t}`),
+            {rowTitles.map((t, i) =>
+              navItem('·', t, filter === t, () => setFilter(t), `row-${i}`),
             )}
           </>
         )}
@@ -123,9 +132,9 @@ export function DesktopHome({
 
       <main className="dt-content">
         <div className="dt-chips">
-          {['All', ...rowTitles].map((c) => (
+          {['All', ...rowTitles].map((c, i) => (
             <button
-              key={c}
+              key={i === 0 ? 'all' : `chip-${i - 1}`}
               className={`dt-chip ${filter === c ? 'active' : ''}`}
               onClick={() => setFilter(c)}
             >

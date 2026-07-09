@@ -55,16 +55,23 @@ export const ACCENT_PRESETS = [
 
 /** Sets the system accent CSS variable (and a translucent glow derived from it). */
 export function applyAccent(accent: string): void {
-  const color = accent && accent.trim() ? accent.trim() : DEFAULT_ACCENT;
+  // Validate once so --accent and --accent-glow can never disagree: an invalid
+  // value must fall back to the default for BOTH, not set --accent to garbage
+  // while the glow silently reverts to violet.
+  const trimmed = accent?.trim() ?? '';
+  const rgb = parseHex(trimmed);
+  const color = rgb ? trimmed : DEFAULT_ACCENT;
+  const [r, g, b] = rgb ?? parseHex(DEFAULT_ACCENT)!;
   const root = document.documentElement;
   root.style.setProperty('--accent', color);
-  root.style.setProperty('--accent-glow', hexToRgba(color, 0.35));
+  root.style.setProperty('--accent-glow', `rgba(${r}, ${g}, ${b}, 0.35)`);
 }
 
-function hexToRgba(hex: string, alpha: number): string {
+/** Parses `#rgb`/`#rrggbb` into [r,g,b], or null if it isn't a valid hex. */
+function parseHex(hex: string): [number, number, number] | null {
   const m = hex.replace('#', '');
   const full = m.length === 3 ? m.split('').map((c) => c + c).join('') : m;
+  if (full.length !== 6 || !/^[0-9a-fA-F]{6}$/.test(full)) return null;
   const n = parseInt(full, 16);
-  if (Number.isNaN(n) || full.length !== 6) return `rgba(139,92,246,${alpha})`;
-  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }

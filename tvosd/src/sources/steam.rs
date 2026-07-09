@@ -56,21 +56,26 @@ impl Steam {
         };
         let creds = (s.steam_api_key.clone(), steamid.clone());
 
-        let mut cache = self.owned.lock().unwrap();
+        let mut cache = self.owned.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cache.as_ref() {
             if c.creds == creds && c.at.elapsed() < OWNED_TTL {
                 return c.items.clone();
             }
         }
-        let items = fetch_owned(&creds.0, &creds.1).unwrap_or_default();
-        if !items.is_empty() {
-            *cache = Some(OwnedCache {
-                creds,
-                at: Instant::now(),
-                items: items.clone(),
-            });
+        // Cache a *successful* fetch even when the library is genuinely empty,
+        // so an empty account doesn't re-hit the network on every call; only a
+        // hard error (network/API failure) skips caching and retries next time.
+        match fetch_owned(&creds.0, &creds.1) {
+            Ok(items) => {
+                *cache = Some(OwnedCache {
+                    creds,
+                    at: Instant::now(),
+                    items: items.clone(),
+                });
+                items
+            }
+            Err(_) => Vec::new(),
         }
-        items
     }
 }
 
@@ -115,14 +120,26 @@ impl Source for Steam {
     }
 
     fn launch(&self, item_id: &str) -> Result<(), String> {
-        let appid = item_id.strip_prefix("steam:").unwrap_or_default();
+        let appid = valid_appid(item_id)?;
         run_steam_url(&format!("steam://rungameid/{appid}"))
     }
 
     fn install(&self, item_id: &str, _jobs: &InstallManager) -> Result<(), String> {
-        let appid = item_id.strip_prefix("steam:").unwrap_or_default();
+        let appid = valid_appid(item_id)?;
         // Steam owns the download; this opens its install dialog.
         run_steam_url(&format!("steam://install/{appid}"))
+    }
+}
+
+/// The numeric appid from a `steam:<appid>` id, or an error. Steam appids are
+/// always positive integers; a non-numeric or empty id would otherwise fire a
+/// malformed steam:// URL (silent no-op).
+fn valid_appid(item_id: &str) -> Result<&str, String> {
+    let appid = item_id.strip_prefix("steam:").unwrap_or_default();
+    if !appid.is_empty() && appid.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(appid)
+    } else {
+        Err(format!("invalid Steam appid in '{item_id}'"))
     }
 }
 
@@ -373,7 +390,7 @@ static PLAYTIME_CACHE: std::sync::LazyLock<
 pub fn playtime_minutes(appid: &str) -> Option<i64> {
     const TTL: std::time::Duration = std::time::Duration::from_secs(600);
     {
-        let cache = PLAYTIME_CACHE.lock().unwrap();
+        let cache = PLAYTIME_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, map)) = &*cache {
             if at.elapsed() < TTL {
                 return map.get(appid).copied();
@@ -404,7 +421,7 @@ pub fn playtime_minutes(appid: &str) -> Option<i64> {
         })
         .collect();
     let minutes = map.get(appid).copied();
-    *PLAYTIME_CACHE.lock().unwrap() = Some((std::time::Instant::now(), map));
+    *PLAYTIME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), map));
     minutes
 }
 
@@ -586,7 +603,7 @@ fn is_hidden(appid: &str, name: &str) -> bool {
 /// Extracts `"path"` values from libraryfolders.vdf.
 fn parse_library_folders(text: &str) -> Vec<PathBuf> {
     quoted_pairs(text)
-        .filter(|(key, _)| *key == "path")
+        .filter(|(key, _)| key.as_str() == "path")
         .map(|(_, value)| PathBuf::from(value))
         .collect()
 }
@@ -596,9 +613,9 @@ fn parse_acf(text: &str) -> Option<(String, String)> {
     let mut appid = None;
     let mut name = None;
     for (key, value) in quoted_pairs(text) {
-        match key {
-            "appid" if appid.is_none() => appid = Some(value.to_string()),
-            "name" if name.is_none() => name = Some(value.to_string()),
+        match key.as_str() {
+            "appid" if appid.is_none() => appid = Some(value),
+            "name" if name.is_none() => name = Some(value),
             _ => {}
         }
     }
@@ -606,16 +623,43 @@ fn parse_acf(text: &str) -> Option<(String, String)> {
 }
 
 /// Yields every `"key" "value"` pair found on a single line of VDF text.
-/// Keys with nested-block values (no value on the line) are skipped.
-fn quoted_pairs(text: &str) -> impl Iterator<Item = (&str, &str)> {
+/// Keys with nested-block values (no value on the line) are skipped. VDF
+/// escapes `\"` and `\\` inside quoted strings, so a naive split on `"` would
+/// truncate a name like `Sid Meier's "Civilization"`; this unescapes them.
+fn quoted_pairs(text: &str) -> impl Iterator<Item = (String, String)> + '_ {
     text.lines().filter_map(|line| {
-        let mut parts = line.split('"');
-        let _before = parts.next()?;
-        let key = parts.next()?;
-        let _between = parts.next()?;
-        let value = parts.next()?;
+        let mut chars = line.chars().peekable();
+        let key = next_quoted(&mut chars)?;
+        let value = next_quoted(&mut chars)?;
         Some((key, value))
     })
+}
+
+/// Reads the next `"…"` token from `chars`, decoding VDF `\"` / `\\` escapes.
+/// Returns None if there is no further quoted token on the line.
+fn next_quoted(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    // Advance to the opening quote.
+    for c in chars.by_ref() {
+        if c == '"' {
+            break;
+        }
+    }
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => return Some(out),
+            },
+            _ => out.push(c),
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -671,6 +715,16 @@ mod tests {
     #[test]
     fn acf_without_name_is_rejected() {
         assert_eq!(parse_acf("\"appid\" \"42\""), None);
+    }
+
+    #[test]
+    fn parses_acf_name_with_escaped_quotes() {
+        // VDF escapes an embedded quote as \" — the value must keep it.
+        let acf = "\t\"appid\"\t\t\"8930\"\n\t\"name\"\t\t\"Sid Meier's \\\"Civilization\\\" V\"\n";
+        assert_eq!(
+            parse_acf(acf),
+            Some(("8930".to_string(), "Sid Meier's \"Civilization\" V".to_string()))
+        );
     }
 
     #[test]

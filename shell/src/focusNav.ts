@@ -6,13 +6,21 @@
 /** Focusable controls inside `root`, in document order, visible only. */
 export function focusables(root: HTMLElement): HTMLElement[] {
   return Array.from(
-    root.querySelectorAll<HTMLElement>('button, input, select, [tabindex]'),
+    root.querySelectorAll<HTMLElement>(
+      'button, input, select, [tabindex]:not([tabindex="-1"])',
+    ),
   ).filter((el) => el.offsetParent !== null && !el.hasAttribute('disabled'));
 }
 
 /** Moves focus within `root` in the given direction; focuses the first
- *  control when nothing inside is focused yet. */
-export function moveFocus(root: HTMLElement, dir: 'up' | 'down' | 'left' | 'right'): void {
+ *  control when nothing inside is focused yet. Pass `smooth=false` for
+ *  rapid held-repeat steps so overlapping smooth scrolls don't queue up
+ *  and jank; defaults to smooth to preserve existing callers. */
+export function moveFocus(
+  root: HTMLElement,
+  dir: 'up' | 'down' | 'left' | 'right',
+  smooth = true,
+): void {
   const els = focusables(root);
   if (els.length === 0) return;
   const active = document.activeElement as HTMLElement | null;
@@ -43,7 +51,7 @@ export function moveFocus(root: HTMLElement, dir: 'up' | 'down' | 'left' | 'righ
 
   if (next && next !== active) {
     next.focus();
-    next.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    next.scrollIntoView({ block: 'nearest', behavior: smooth ? 'smooth' : 'auto' });
   }
 }
 

@@ -41,24 +41,17 @@ export function MediaRow({ row, focusedCol, jobs, onExpand, onPick }: Props) {
   const hasMore = row.items.length > shown;
   const wide = cols !== 8; // any non-poster column count is a wide-card row
 
-  // Scroll ONLY the rows container. Always anchor the whole section (title
-  // first — never a half-cropped line of the previous artwork above); only
-  // when the section genuinely doesn't fit does the view slide just enough
-  // to keep the focused card fully visible.
+  // Keep the focused card on screen. The .rows container is the one scrollable
+  // area; scroll-margin on the card (styles.css) keeps it clear of the fixed
+  // top bar / bottom legend so the browser never crops it. The whole home grid
+  // relies on this — App drives focus and lets MediaRow do the scrolling.
   useEffect(() => {
     if (!active || focusedCol === null) return;
-    const section = ref.current;
-    const box = section?.parentElement; // .rows — the one scrollable area
-    if (!section || !box) return;
-    const sectionTop = Math.max(0, section.offsetTop - 12);
     const card = gridRef.current?.children[focusedCol] as HTMLElement | undefined;
-    let target = sectionTop;
-    if (card) {
-      const needed = card.offsetTop + card.offsetHeight - box.clientHeight + 20;
-      target = Math.max(sectionTop, needed);
-    }
-    box.scrollTo({ top: target, behavior: 'smooth' });
-  }, [active, focusedCol, cols]);
+    card?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // row.items.length is a dep: an install job that moves an item shifts the
+    // grid layout, so we must re-scroll the focused card back into view.
+  }, [active, focusedCol, cols, row.items.length]);
 
   return (
     <section ref={ref} className={`row ${active ? 'row-active' : ''}`}>

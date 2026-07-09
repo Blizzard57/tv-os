@@ -34,6 +34,18 @@ fn local_score(query: &str, title: &str) -> Option<i32> {
     fuzzy::score(query, title).filter(|s| *s >= LOCAL_FLOOR)
 }
 
+/// Unwraps a scoped-thread join result, logging a warning (instead of silently
+/// swallowing) when the pool thread panicked, then falling back to a default.
+fn joined<T: Default>(result: std::thread::Result<T>, pool: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(_) => {
+            crate::log_warn!("search pool {pool} panicked — skipping its results");
+            T::default()
+        }
+    }
+}
+
 static DEEP_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<Row>)>>> =
     LazyLock::new(Mutex::default);
 
@@ -51,8 +63,8 @@ pub fn flat(query: &str, library: Vec<Row>) -> Vec<ContentItem> {
         let tmdb = s.spawn(|| tmdb::search(query));
         let addon = s.spawn(|| stremio::search(query));
         (
-            tmdb.join().unwrap_or_default(),
-            addon.join().unwrap_or_default(),
+            joined(tmdb.join(), "tmdb::search"),
+            joined(addon.join(), "stremio::search"),
         )
     });
 
@@ -101,7 +113,7 @@ pub fn deep(query: &str, library: Vec<Row>) -> Vec<Row> {
     if query.is_empty() {
         return Vec::new();
     }
-    if let Some((at, rows)) = DEEP_CACHE.lock().unwrap().get(&query) {
+    if let Some((at, rows)) = DEEP_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&query) {
         if at.elapsed() < DEEP_TTL {
             return rows.clone();
         }
@@ -131,11 +143,11 @@ pub fn deep(query: &str, library: Vec<Row>) -> Vec<Row> {
         let disc = s.spawn(|| discover_sections(&query, plan.as_ref()));
         let yt = s.spawn(|| youtube::search(&query));
         (
-            multi.join().unwrap_or_default(),
-            addon.join().unwrap_or_default(),
+            joined(multi.join(), "tmdb::multi_search"),
+            joined(addon.join(), "stremio::search"),
             (
-                disc.join().unwrap_or_default(),
-                yt.join().unwrap_or_default(),
+                joined(disc.join(), "discover_sections"),
+                joined(yt.join(), "youtube::search"),
             ),
         )
     });
@@ -202,7 +214,7 @@ pub fn deep(query: &str, library: Vec<Row>) -> Vec<Row> {
     // with the catalog sections above.
     push("YouTube".into(), yt_items, &mut rows);
 
-    let mut cache = DEEP_CACHE.lock().unwrap();
+    let mut cache = DEEP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() > 32 {
         cache.clear();
     }

@@ -1,4 +1,4 @@
-import { MutableRefObject, useCallback, useEffect, useRef, useState } from 'react';
+import { MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ContentItem, Row, searchCatalog, searchDeep } from './api';
 import { NavAction } from './input';
 
@@ -11,6 +11,14 @@ const KB_ROWS = ['abcdefghi', 'jklmnopqr', 'stuvwxyz0', '123456789'];
 const SPECIAL_ROW = 4;
 const SPECIALS = ['Space', '⌫ Delete', 'Clear', '🔍 Search all'] as const;
 const SEARCH_ALL_KEY = 3;
+
+/** Map a column between two rows of differing length by relative position, so
+ *  moving up/down between rows lands under (roughly) the same spot instead of
+ *  jumping via magic multipliers. */
+export function mapCol(col: number, fromLen: number, toLen: number): number {
+  if (fromLen <= 1) return 0;
+  return Math.round((col / (fromLen - 1)) * (toLen - 1));
+}
 
 // Where focus lives: the query line, the on-screen keys, the quick-result
 // grid, or the deep-search sections.
@@ -92,6 +100,10 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
   const deepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Monotonic request ids so an older in-flight fetch can't clobber newer
+  // results (the debounce only clears the timer, not the pending request).
+  const quickToken = useRef(0);
+  const deepToken = useRef(0);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -100,22 +112,29 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
   // Debounced quick search (titles) while typing.
   useEffect(() => {
     const handle = window.setTimeout(() => {
+      // Invalidate any earlier in-flight quick search regardless of length.
+      const token = ++quickToken.current;
       if (query.trim().length < 2) {
         setResults([]);
         return;
       }
       searchCatalog(query)
         .then((r) => {
+          if (token !== quickToken.current) return; // a newer query superseded us
           setResults(r);
           setSel(0);
         })
-        .catch(() => setResults([]));
+        .catch(() => {
+          if (token !== quickToken.current) return;
+          setResults([]);
+        });
     }, 250);
     return () => window.clearTimeout(handle);
   }, [query]);
 
-  // Editing the query invalidates a previous deep search.
+  // Editing the query invalidates a previous deep search (and any in-flight one).
   useEffect(() => {
+    deepToken.current++;
     setDeepRows(null);
   }, [query]);
 
@@ -130,17 +149,22 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
     if (q.length < 2 || deepBusy) return;
     inputRef.current?.blur();
     setDeepBusy(true);
+    const token = ++deepToken.current;
     searchDeep(q)
       .then((rows) => {
+        if (token !== deepToken.current) return; // query changed / newer deep search
         setDeepRows(rows);
         setDSel({ row: 0, col: 0 });
         setZone(rows.length > 0 ? 'deep' : 'kb');
       })
       .catch(() => {
+        if (token !== deepToken.current) return;
         setDeepRows([]);
         setZone('kb');
       })
-      .finally(() => setDeepBusy(false));
+      .finally(() => {
+        if (token === deepToken.current) setDeepBusy(false);
+      });
   }, [query, deepBusy]);
 
   const exitDeep = useCallback(() => {
@@ -239,7 +263,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
               setZone('input');
               inputRef.current?.focus();
             } else if (kb.row === SPECIAL_ROW) {
-              setKb((k) => ({ row: SPECIAL_ROW - 1, col: Math.min(8, k.col * 2 + 1) }));
+              setKb((k) => ({ row: SPECIAL_ROW - 1, col: mapCol(k.col, SPECIALS.length, KB_ROWS[SPECIAL_ROW - 1].length) }));
             } else {
               setKb((k) => ({ ...k, row: k.row - 1 }));
             }
@@ -250,7 +274,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
             } else if (kb.row === SPECIAL_ROW - 1) {
               setKb((k) => ({
                 row: SPECIAL_ROW,
-                col: Math.min(SPECIALS.length - 1, Math.floor(k.col / 2.5)),
+                col: mapCol(k.col, KB_ROWS[SPECIAL_ROW - 1].length, SPECIALS.length),
               }));
             } else {
               setKb((k) => ({ ...k, row: k.row + 1 }));
@@ -400,7 +424,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
             )}
             {deepRows.map((row, r) => (
               <section
-                key={row.title}
+                key={`${r}:${row.title}`}
                 className={`search-section ${
                   zone === 'deep' && r === dSel.row ? 'section-active' : ''
                 }`}
@@ -490,6 +514,174 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
             </div>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ---- Reusable on-screen keyboard for editing a single text field ----
+
+// Letters + digits, with a symbols row so URLs and API keys are typable on a
+// controller. Uppercase is a shift toggle applied to the letter rows.
+const OSK_LETTERS = ['abcdefghi', 'jklmnopqr', 'stuvwxyz'];
+const OSK_DIGITS = '0123456789';
+const OSK_SYMBOLS = '.:/-_@+=?&%#';
+const OSK_ACTIONS = ['Shift', 'Space', '⌫ Delete', 'Clear', 'Done'] as const;
+
+/** Full-screen on-screen keyboard for entering/editing one field's value with
+ *  a controller or remote. A physical keyboard still types straight into the
+ *  value. The parent forwards controller NavActions by storing the handler
+ *  written to `actionRef`. Commit happens on Done; Back/Esc cancels. */
+export function OnScreenKeyboard({
+  label,
+  initialValue,
+  masked = false,
+  onCommit,
+  onCancel,
+  actionRef,
+}: {
+  label: string;
+  initialValue: string;
+  masked?: boolean;
+  onCommit: (value: string) => void;
+  onCancel: () => void;
+  actionRef: MutableRefObject<((a: NavAction) => void) | null>;
+}) {
+  const [value, setValue] = useState(initialValue);
+  const [shift, setShift] = useState(false);
+  const [pos, setPos] = useState({ row: 0, col: 0 });
+
+  // The key grid: three letter rows, a digits row, a symbols row, then actions.
+  const rows = useMemo(() => {
+    const letters = OSK_LETTERS.map((r) =>
+      (shift ? r.toUpperCase() : r).split(''),
+    );
+    return [...letters, OSK_DIGITS.split(''), OSK_SYMBOLS.split(''), [...OSK_ACTIONS]];
+  }, [shift]);
+  const actionRow = rows.length - 1;
+
+  const press = useCallback(
+    (row: number, col: number) => {
+      if (row === actionRow) {
+        const kind = OSK_ACTIONS[col];
+        if (kind === 'Shift') setShift((s) => !s);
+        else if (kind === 'Space') setValue((v) => v + ' ');
+        else if (kind === '⌫ Delete') setValue((v) => v.slice(0, -1));
+        else if (kind === 'Clear') setValue('');
+        else if (kind === 'Done') onCommit(value);
+        return;
+      }
+      const ch = rows[row]?.[col];
+      if (typeof ch === 'string') setValue((v) => v + ch);
+    },
+    [actionRow, rows, value, onCommit],
+  );
+
+  const handle = useCallback(
+    (action: NavAction) => {
+      if (action === 'back') {
+        onCancel();
+        return;
+      }
+      if (action === 'confirm') {
+        press(pos.row, pos.col);
+        return;
+      }
+      setPos((p) => {
+        const rowLen = rows[p.row].length;
+        switch (action) {
+          case 'left':
+            return { ...p, col: Math.max(0, p.col - 1) };
+          case 'right':
+            return { ...p, col: Math.min(rowLen - 1, p.col + 1) };
+          case 'up': {
+            if (p.row === 0) return p;
+            const r = p.row - 1;
+            return { row: r, col: mapCol(p.col, rowLen, rows[r].length) };
+          }
+          case 'down': {
+            if (p.row === rows.length - 1) return p;
+            const r = p.row + 1;
+            return { row: r, col: mapCol(p.col, rowLen, rows[r].length) };
+          }
+          default:
+            return p;
+        }
+      });
+    },
+    [pos, press, rows, onCancel],
+  );
+
+  // Controller path: the parent forwards d-pad / A / B here.
+  useEffect(() => {
+    actionRef.current = handle;
+    return () => {
+      actionRef.current = null;
+    };
+  }, [actionRef, handle]);
+
+  // Physical keyboard path — typing still works directly for keyboard users.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        e.preventDefault();
+        onCancel();
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.stopPropagation();
+        e.preventDefault();
+        onCommit(value);
+        return;
+      }
+      if (e.key === 'Backspace') {
+        e.stopPropagation();
+        e.preventDefault();
+        setValue((v) => v.slice(0, -1));
+        return;
+      }
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.stopPropagation();
+        e.preventDefault();
+        setValue((v) => v + e.key);
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [value, onCommit, onCancel]);
+
+  const shown = masked ? '•'.repeat(value.length) : value;
+
+  return (
+    <div className="osk-scrim" onClick={onCancel}>
+      <div className="osk-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="osk-modal-label">{label}</div>
+        <div className="osk-modal-value">
+          {shown}
+          <span className="osk-caret" />
+        </div>
+        <div className="osk">
+          {rows.map((row, r) => (
+            <div key={r} className={`osk-row ${r === actionRow ? 'osk-row-actions' : ''}`}>
+              {row.map((ch, c) => (
+                <button
+                  key={`${r}:${c}`}
+                  className={`osk-key ${r === actionRow ? 'osk-key-wide' : ''} ${
+                    pos.row === r && pos.col === c ? 'focused' : ''
+                  } ${r === actionRow && ch === 'Shift' && shift ? 'osk-key-accent' : ''}`}
+                  tabIndex={-1}
+                  onClick={() => press(r, c)}
+                >
+                  {ch}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+        <div className="search-hint">
+          <span className="key">A</span> Type · <span className="key">B</span>/Esc Cancel · Done to save
+        </div>
       </div>
     </div>
   );

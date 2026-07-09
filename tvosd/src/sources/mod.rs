@@ -78,6 +78,7 @@ impl Registry {
                 Box::new(steam::Steam::new()),
                 Box::new(epic::Epic::detect()),
                 Box::new(gog::Gog),
+                Box::new(retro::Retro::new()),
                 Box::new(videos::Videos),
                 Box::new(stremio::Stremio::default()),
                 Box::new(tmdb::Tmdb::default()),

@@ -19,6 +19,7 @@ import {
 } from './api';
 import { activateFocused, moveFocus, stepSelect } from './focusNav';
 import { NavAction } from './input';
+import { OnScreenKeyboard } from './SearchOverlay';
 import { ACCENT_PRESETS, DEFAULT_ACCENT, Theme, UiMode, applyAccent } from './theme';
 
 interface Props {
@@ -59,6 +60,27 @@ const GAME_REGIONS = [
   'BR', 'MX', 'AR', 'IN', 'JP', 'KR', 'AU', 'NZ', 'TR', 'ZA',
 ];
 
+/** Secret fields the daemon returns BLANKED — never echoed back. We only send
+ *  one on PUT when the user actually types a new value, so leaving it untouched
+ *  keeps the stored secret. Each maps to a sibling `<field>_set` boolean the
+ *  daemon may include; we fall back to "value is non-empty" when it's absent. */
+const SECRET_FIELDS = [
+  'steam_api_key',
+  'tmdb_key',
+  'trakt_client_secret',
+  'trakt_token',
+  'anilist_token',
+  'mal_token',
+] as const;
+type SecretField = (typeof SECRET_FIELDS)[number];
+
+/** Raw settings response may carry `<secret>_set` booleans alongside blanked
+ *  secrets. Kept loose since the exact flag names are owned by the backend. */
+type SettingsResponse = Settings & Record<string, unknown>;
+
+const isSecret = (key: string): key is SecretField =>
+  (SECRET_FIELDS as readonly string[]).includes(key);
+
 export function SettingsPanel({
   onClose,
   reload,
@@ -73,6 +95,20 @@ export function SettingsPanel({
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [version, setVersion] = useState<string | null>(null);
+  // Which secret fields already have a stored value on the daemon (their value
+  // arrives blanked). Drives the "configured/•••" display.
+  const [configured, setConfigured] = useState<Record<string, boolean>>({});
+  // Secret fields the user has actually typed into this session — only these
+  // are sent on PUT, so an untouched secret is never overwritten with "".
+  const touched = useRef<Set<string>>(new Set());
+  // A field being edited via the on-screen keyboard (controller/remote).
+  const [osk, setOsk] = useState<{
+    label: string;
+    value: string;
+    masked: boolean;
+    commit: (v: string) => void;
+  } | null>(null);
+  const oskAction = useRef<((a: NavAction) => void) | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   // The <select> currently in "edit mode": Enter opens it, Arrows then change
   // its value, Enter again commits. Held in a ref (not state) because the DOM
@@ -88,6 +124,16 @@ export function SettingsPanel({
     // blank form when the daemon is unreachable would wipe saved keys.
     fetchSettings()
       .then((s) => {
+        const resp = s as SettingsResponse;
+        // A secret counts as configured if the daemon flags `<field>_set`, or
+        // (fallback) if it echoed a non-empty value.
+        const conf: Record<string, boolean> = {};
+        for (const key of SECRET_FIELDS) {
+          const flag = resp[`${key}_set`];
+          conf[key] =
+            typeof flag === 'boolean' ? flag : (s[key] ?? '').trim() !== '';
+        }
+        setConfigured(conf);
         setForm({ ...BLANK, ...s });
         setLoaded(true);
       })
@@ -115,6 +161,7 @@ export function SettingsPanel({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (osk) return; // the OSK owns Escape while it's open
         e.stopPropagation();
         if (editingSelect.current) stopEditing();
         else onClose();
@@ -122,10 +169,15 @@ export function SettingsPanel({
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, stopEditing]);
+  }, [onClose, stopEditing, osk]);
 
   const handleAction = useCallback(
     (action: NavAction) => {
+      // The on-screen keyboard takes over all input while open.
+      if (osk) {
+        oskAction.current?.(action);
+        return;
+      }
       const panel = panelRef.current;
       if (!panel) return;
       const active = document.activeElement as HTMLElement | null;
@@ -152,7 +204,7 @@ export function SettingsPanel({
         moveFocus(panel, action);
       }
     },
-    [stopEditing],
+    [stopEditing, osk],
   );
 
   useEffect(() => {
@@ -163,12 +215,44 @@ export function SettingsPanel({
   }, [actionRef, handleAction]);
 
   // Land focus on the first control so the focus ring is visible immediately.
+  // In the error branch there are no fields, so make sure the (always-present)
+  // Close button gets focus — otherwise a controller user is stranded.
   useEffect(() => {
     if (loaded || loadError) moveFocus(panelRef.current!, 'down');
   }, [loaded, loadError]);
 
   const refreshAddons = () => fetchAddons().then(setAddons).catch(() => {});
-  const update = (patch: Partial<Settings>) => setForm((f) => ({ ...f, ...patch }));
+  const update = (patch: Partial<Settings>) => {
+    // Any secret in the patch was typed by the user → mark it for sending.
+    for (const key of Object.keys(patch)) if (isSecret(key)) touched.current.add(key);
+    setForm((f) => ({ ...f, ...patch }));
+  };
+
+  /** Save the form to the daemon, omitting any secret the user hasn't touched
+   *  this session so blanked-but-stored secrets aren't wiped. `override` lets
+   *  instant fields (accent/enhance) save the freshest value without a
+   *  setState round-trip. */
+  const submit = useCallback(
+    async (override?: Partial<Settings>) => {
+      const merged = { ...form, ...override };
+      const payload: Partial<Settings> = { ...merged };
+      for (const key of SECRET_FIELDS) {
+        const typedHere = touched.current.has(key) || (override && key in override);
+        // Don't send an untouched secret — leaving it out keeps the stored one.
+        if (!typedHere) delete payload[key];
+      }
+      await saveSettings(payload);
+    },
+    [form],
+  );
+
+  /** Open the on-screen keyboard to edit a field with a controller/remote. */
+  const openOsk = useCallback(
+    (label: string, value: string, masked: boolean, commit: (v: string) => void) => {
+      setOsk({ label, value, masked, commit });
+    },
+    [],
+  );
 
   return (
     <div className="settings-scrim" onClick={onClose}>
@@ -192,16 +276,19 @@ export function SettingsPanel({
           <p className="settings-muted">Loading…</p>
         ) : (
           <>
-            <SteamSection form={form} update={update} reload={reload} />
-            <GameLibrariesSection />
-            <TmdbSection form={form} update={update} reload={reload} />
-            <YouTubeSection form={form} update={update} reload={reload} />
-            <TrackingSection form={form} update={update} reload={reload} />
-            <AddonSection addons={addons} refresh={refreshAddons} reload={reload} />
+            <SteamSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+            <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />
+            <TmdbSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+            <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+            <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+            <AddonSection addons={addons} refresh={refreshAddons} reload={reload} openOsk={openOsk} />
             <AppearanceSection
               form={form}
               update={update}
               reload={reload}
+              submit={submit}
+              configured={configured}
+              openOsk={openOsk}
               theme={theme}
               onToggleTheme={onToggleTheme}
               mode={mode}
@@ -210,6 +297,20 @@ export function SettingsPanel({
           </>
         )}
       </div>
+
+      {osk && (
+        <OnScreenKeyboard
+          label={osk.label}
+          initialValue={osk.value}
+          masked={osk.masked}
+          actionRef={oskAction}
+          onCommit={(v) => {
+            osk.commit(v);
+            setOsk(null);
+          }}
+          onCancel={() => setOsk(null)}
+        />
+      )}
     </div>
   );
 }
@@ -218,9 +319,15 @@ type SectionProps = {
   form: Settings;
   update: (patch: Partial<Settings>) => void;
   reload: () => void;
+  /** Save the form, omitting untouched secrets (#6). */
+  submit: (override?: Partial<Settings>) => Promise<void>;
+  /** Which secret fields are already stored on the daemon (shown as •••). */
+  configured: Record<string, boolean>;
+  /** Open the on-screen keyboard to edit a field with a controller/remote. */
+  openOsk: (label: string, value: string, masked: boolean, commit: (v: string) => void) => void;
 };
 
-function SteamSection({ form, update, reload }: SectionProps) {
+function SteamSection({ form, update, reload, submit, configured, openOsk }: SectionProps) {
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -228,7 +335,7 @@ function SteamSection({ form, update, reload }: SectionProps) {
     setBusy(true);
     setStatus('Connecting…');
     try {
-      await saveSettings(form);
+      await submit();
       const s = await fetchSteamStatus();
       setStatus(s.connected ? `Connected — ${s.count} games in your library` : (s.error ?? 'Failed'));
       reload();
@@ -250,12 +357,15 @@ function SteamSection({ form, update, reload }: SectionProps) {
         label="Web API key"
         masked
         value={form.steam_api_key}
+        configured={configured.steam_api_key}
+        openOsk={openOsk}
         onChange={(v) => update({ steam_api_key: v })}
         placeholder="0123456789ABCDEF…"
       />
       <LockedField
         label="SteamID or profile name"
         value={form.steam_id}
+        openOsk={openOsk}
         onChange={(v) => update({ steam_id: v })}
         placeholder="76561197960287930 or gabelogannewell"
       />
@@ -269,13 +379,15 @@ function SteamSection({ form, update, reload }: SectionProps) {
   );
 }
 
-function TmdbSection({ form, update, reload }: SectionProps) {
+function TmdbSection({ form, update, reload, submit, configured, openOsk }: SectionProps) {
   const [status, setStatus] = useState<string | null>(null);
 
   const save = async () => {
     try {
-      await saveSettings(form);
-      setStatus(form.tmdb_key ? 'Saved — Movies & Shows rows enabled' : 'Saved');
+      await submit();
+      setStatus(
+        form.tmdb_key || configured.tmdb_key ? 'Saved — Movies & Shows rows enabled' : 'Saved',
+      );
       reload();
     } catch (e) {
       setStatus(`Error: ${(e as Error).message}`);
@@ -293,6 +405,8 @@ function TmdbSection({ form, update, reload }: SectionProps) {
         label="TMDB API key"
         masked
         value={form.tmdb_key}
+        configured={configured.tmdb_key}
+        openOsk={openOsk}
         onChange={(v) => update({ tmdb_key: v })}
         placeholder="TMDB API key (v3 auth)"
       />
@@ -306,13 +420,13 @@ function TmdbSection({ form, update, reload }: SectionProps) {
   );
 }
 
-function YouTubeSection({ form, update, reload }: SectionProps) {
+function YouTubeSection({ form, update, reload, submit, openOsk }: SectionProps) {
   const [status, setStatus] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
 
   const save = async () => {
     try {
-      await saveSettings(form);
+      await submit();
       setStatus(
         form.youtube_account || form.youtube_channels.trim()
           ? 'Saved — YouTube rows will appear on Home'
@@ -325,9 +439,10 @@ function YouTubeSection({ form, update, reload }: SectionProps) {
   };
 
   // Sign-in happens inside TV OS's own browser window — that profile's
-  // cookies are what the daemon reads for the personal feeds.
+  // cookies are what the daemon reads for the personal feeds. Route through the
+  // daemon's open endpoint so it works in kiosk/gamescope (no _blank there).
   const signIn = () => {
-    window.open('https://www.youtube.com', '_blank');
+    openUrl('https://www.youtube.com').catch(() => {});
     setStatus('Sign in in the window that opened, close it, then check the connection.');
   };
 
@@ -356,6 +471,7 @@ function YouTubeSection({ form, update, reload }: SectionProps) {
       <LockedField
         label="Channels"
         value={form.youtube_channels}
+        openOsk={openOsk}
         onChange={(v) => update({ youtube_channels: v })}
         placeholder="@veritasium, @kurzgesagt, youtube.com/@mkbhd"
       />
@@ -389,9 +505,12 @@ function YouTubeSection({ form, update, reload }: SectionProps) {
 
 /// Watch tracking: Trakt (movies & shows), AniList and MAL (anime). Finished
 /// titles are pushed automatically once a service is connected.
-function TrackingSection({ form, update }: SectionProps) {
+function TrackingSection({ form, update, submit, configured, openOsk }: SectionProps) {
   const [status, setStatus] = useState<string | null>(null);
   const [connected, setConnected] = useState({ trakt: false, anilist: false, mal: false });
+  // Trakt device-flow poll handles, cleared on unmount so we don't keep hitting
+  // /api/tracking/status for 10 minutes after the panel closes (#7).
+  const pollTimers = useRef<{ interval: number; timeout: number } | null>(null);
 
   const refreshStatus = () =>
     fetchTrackingStatus()
@@ -399,11 +518,17 @@ function TrackingSection({ form, update }: SectionProps) {
       .catch(() => {});
   useEffect(() => {
     refreshStatus();
+    return () => {
+      if (pollTimers.current) {
+        window.clearInterval(pollTimers.current.interval);
+        window.clearTimeout(pollTimers.current.timeout);
+      }
+    };
   }, []);
 
   const save = async () => {
     try {
-      await saveSettings(form);
+      await submit();
       setStatus('Saved');
       refreshStatus();
     } catch (e) {
@@ -413,18 +538,30 @@ function TrackingSection({ form, update }: SectionProps) {
 
   const connectTrakt = async () => {
     try {
-      await saveSettings(form);
+      await submit();
       const { user_code, url } = await traktConnect();
       setStatus(`Go to ${url} and enter code ${user_code} — this panel updates when approved.`);
-      const poll = window.setInterval(async () => {
+      if (pollTimers.current) {
+        window.clearInterval(pollTimers.current.interval);
+        window.clearTimeout(pollTimers.current.timeout);
+      }
+      const interval = window.setInterval(async () => {
         const s = await fetchTrackingStatus().catch(() => null);
         if (s?.trakt) {
-          window.clearInterval(poll);
+          if (pollTimers.current) {
+            window.clearInterval(pollTimers.current.interval);
+            window.clearTimeout(pollTimers.current.timeout);
+            pollTimers.current = null;
+          }
           setStatus('Trakt connected ✓');
           refreshStatus();
         }
       }, 5000);
-      window.setTimeout(() => window.clearInterval(poll), 600_000);
+      const timeout = window.setTimeout(() => {
+        window.clearInterval(interval);
+        pollTimers.current = null;
+      }, 600_000);
+      pollTimers.current = { interval, timeout };
     } catch (e) {
       setStatus(`Error: ${(e as Error).message}`);
     }
@@ -432,8 +569,13 @@ function TrackingSection({ form, update }: SectionProps) {
 
   const connectMal = async () => {
     try {
-      await saveSettings(form);
-      window.open('/api/mal/login', '_blank');
+      await submit();
+      // Route through the daemon's open endpoint — kiosk/gamescope has no
+      // window manager for _blank (#8). /api/open only accepts absolute
+      // http(s) URLs, so resolve the daemon's own login-redirect endpoint
+      // against our origin (the shell is served by tvosd) rather than passing
+      // a relative path it would reject.
+      await openUrl(new URL('/api/mal/login', window.location.origin).href).catch(() => {});
       setStatus('Approve in the window that opened, then reopen Settings.');
     } catch (e) {
       setStatus(`Error: ${(e as Error).message}`);
@@ -458,6 +600,7 @@ function TrackingSection({ form, update }: SectionProps) {
       <LockedField
         label="Trakt client id (trakt.tv/oauth/applications)"
         value={form.trakt_client_id}
+        openOsk={openOsk}
         onChange={(v) => update({ trakt_client_id: v })}
         placeholder="create an app on trakt.tv, paste its client id"
       />
@@ -465,18 +608,23 @@ function TrackingSection({ form, update }: SectionProps) {
         label="Trakt client secret"
         masked
         value={form.trakt_client_secret}
+        configured={configured.trakt_client_secret}
+        openOsk={openOsk}
         onChange={(v) => update({ trakt_client_secret: v })}
       />
       <LockedField
         label="AniList access token"
         masked
         value={form.anilist_token}
+        configured={configured.anilist_token}
+        openOsk={openOsk}
         onChange={(v) => update({ anilist_token: v })}
         placeholder="from your AniList API client (implicit grant)"
       />
       <LockedField
         label="MyAnimeList client id (redirect URI: http://localhost:8484/api/mal/callback)"
         value={form.mal_client_id}
+        openOsk={openOsk}
         onChange={(v) => update({ mal_client_id: v })}
       />
       <div className="settings-actions">
@@ -495,7 +643,16 @@ function TrackingSection({ form, update }: SectionProps) {
   );
 }
 
-function GameLibrariesSection() {
+function GameLibrariesSection({
+  form,
+  update,
+  submit,
+}: {
+  form: Settings;
+  update: (patch: Partial<Settings>) => void;
+  submit: SectionProps['submit'];
+  openOsk: SectionProps['openOsk'];
+}) {
   const [sources, setSources] = useState<SourceStatus[]>([]);
   useEffect(() => {
     fetchSources().then(setSources).catch(() => {});
@@ -509,7 +666,7 @@ function GameLibrariesSection() {
         Connected stores show up in the “Games” and “Ready to Install” rows — view,
         install and launch right from the couch.
       </p>
-      <GameRegionField />
+      <GameRegionField form={form} update={update} submit={submit} />
       <div className="lib-list">
         <LibRow
           name="Steam"
@@ -534,29 +691,33 @@ function GameLibrariesSection() {
 }
 
 /// Store region for game pricing ("Games for you" + Where-to-buy pages).
-/// Saves immediately — a region change should reprice on the next look.
-function GameRegionField() {
-  const [region, setRegion] = useState('US');
-  useEffect(() => {
-    fetchSettings()
-      .then((s) => setRegion(s.game_region?.trim().toUpperCase() || 'US'))
-      .catch(() => {});
-  }, []);
+/// Driven by the shared form (#5) so it never clobbers unsaved edits; saves
+/// immediately via the guarded submit so a change reprices on the next look.
+function GameRegionField({
+  form,
+  update,
+  submit,
+}: {
+  form: Settings;
+  update: (patch: Partial<Settings>) => void;
+  submit: SectionProps['submit'];
+}) {
+  const region = form.game_region?.trim().toUpperCase() || 'US';
+  const options = GAME_REGIONS.includes(region) ? GAME_REGIONS : [region, ...GAME_REGIONS];
 
-  const change = async (next: string) => {
-    setRegion(next);
-    try {
-      const current = await fetchSettings();
-      await saveSettings({ ...current, game_region: next });
-    } catch {
+  const change = (next: string) => {
+    update({ game_region: next });
+    // Persist just this change through the guarded save (omits untouched
+    // secrets, keeps the rest of the user's in-progress form intact).
+    submit({ game_region: next }).catch(() => {
       /* daemon unreachable — the select still shows the choice */
-    }
+    });
   };
 
   return (
     <Field label="Store region (game prices — Games for you & Where to buy)">
       <select value={region} onChange={(e) => change(e.target.value)}>
-        {GAME_REGIONS.map((r) => (
+        {options.map((r) => (
           <option key={r} value={r}>
             {r}
           </option>
@@ -599,10 +760,12 @@ function AddonSection({
   addons,
   refresh,
   reload,
+  openOsk,
 }: {
   addons: Addon[];
   refresh: () => void;
   reload: () => void;
+  openOsk: SectionProps['openOsk'];
 }) {
   const [url, setUrl] = useState('');
   const [status, setStatus] = useState<string | null>(null);
@@ -643,6 +806,7 @@ function AddonSection({
           type="text"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
+          onClick={() => openOsk('Manifest URL', url, false, setUrl)}
           placeholder="https://…/manifest.json"
         />
       </Field>
@@ -687,6 +851,7 @@ function AppearanceSection({
   form,
   update,
   reload,
+  submit,
   theme,
   onToggleTheme,
   mode,
@@ -699,14 +864,14 @@ function AppearanceSection({
 }) {
   const setEnhance = async (enhance: EnhanceMode) => {
     update({ enhance });
-    await saveSettings({ ...form, enhance }).catch(() => {});
+    await submit({ enhance }).catch(() => {});
     reload();
   };
 
   const setAccent = async (accent: string) => {
     update({ accent });
     applyAccent(accent); // instant preview
-    await saveSettings({ ...form, accent }).catch(() => {});
+    await submit({ accent }).catch(() => {});
     reload();
   };
 
@@ -769,29 +934,40 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 /** A field that's already configured shows a quiet locked row (masked for
- *  secrets) with an explicit Edit step; empty fields are directly editable. */
+ *  secrets) with an explicit Edit step; empty fields are directly editable.
+ *  `configured` (#6): a secret can be set on the daemon yet arrive blanked —
+ *  show the locked "•••" state on that flag even when `value` is empty, and
+ *  leaving it untouched keeps the stored secret. Focusing the input and
+ *  pressing A/Enter (or clicking it) opens the on-screen keyboard so a
+ *  controller/remote can type; keyboard users can also type in place. */
 function LockedField({
   label,
   value,
   onChange,
+  openOsk,
+  configured,
   masked = false,
   placeholder,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
+  openOsk: SectionProps['openOsk'];
+  configured?: boolean;
   masked?: boolean;
   placeholder?: string;
 }) {
   const [editing, setEditing] = useState(false);
-  const configured = value.trim() !== '';
+  // Locked when the user has typed something, OR the daemon flags it stored.
+  const isSet = value.trim() !== '' || !!configured;
 
-  if (configured && !editing) {
-    const shown = masked
-      ? '·······························'
-      : value.length > 46
-        ? `${value.slice(0, 46)}…`
-        : value;
+  if (isSet && !editing) {
+    const shown =
+      masked || (configured && value.trim() === '')
+        ? '••••••••••••••••••••  configured'
+        : value.length > 46
+          ? `${value.slice(0, 46)}…`
+          : value;
     return (
       <div className="settings-field">
         <span className="settings-field-label">{label}</span>
@@ -814,6 +990,7 @@ function LockedField({
           value={value}
           autoFocus={editing}
           onChange={(e) => onChange(e.target.value)}
+          onClick={() => openOsk(label, value, masked, onChange)}
           placeholder={placeholder}
         />
         {editing && (

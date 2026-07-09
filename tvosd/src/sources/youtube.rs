@@ -95,7 +95,14 @@ impl Source for YouTube {
         let url = format!("https://www.youtube.com/watch?v={video}");
         let mode = settings::STORE.get().enhance;
         let profile = upscale::resolve(mode, "youtube");
-        launcher::play_video(&url, &profile, mode, "YouTube", Some(item_id), Some(item_id))
+        launcher::play_video(
+            &url,
+            &profile,
+            mode,
+            "YouTube",
+            Some(item_id),
+            Some(item_id),
+        )
     }
 }
 
@@ -130,7 +137,10 @@ pub fn account_status() -> (bool, String) {
         Some(json) => {
             let n = parse_entries(&json).len();
             if n > 0 {
-                (true, format!("Connected — your subscriptions feed works"))
+                (
+                    true,
+                    "Connected — your subscriptions feed works".to_string(),
+                )
             } else {
                 (
                     false,
@@ -150,7 +160,7 @@ pub fn account_status() -> (bool, String) {
 fn feed_row(title: &str, target: &str) -> Option<Row> {
     let profile = browser_profile()?;
     {
-        let cache = CHANNEL_CACHE.lock().unwrap();
+        let cache = CHANNEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, _, items)) = cache.get(target) {
             if at.elapsed() < CHANNEL_TTL {
                 return row_of_titled(title, items.clone());
@@ -161,8 +171,11 @@ fn feed_row(title: &str, target: &str) -> Option<Row> {
     let items = parse_entries(&json);
     CHANNEL_CACHE
         .lock()
-        .unwrap()
-        .insert(target.to_string(), (Instant::now(), title.to_string(), items.clone()));
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            target.to_string(),
+            (Instant::now(), title.to_string(), items.clone()),
+        );
     row_of_titled(title, items)
 }
 
@@ -198,7 +211,7 @@ fn channel_handles(raw: &str) -> Vec<String> {
 fn channel_row(handle: &str) -> Option<Row> {
     let url = format!("https://www.youtube.com/{handle}/videos");
     {
-        let cache = CHANNEL_CACHE.lock().unwrap();
+        let cache = CHANNEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, name, items)) = cache.get(&url) {
             if at.elapsed() < CHANNEL_TTL {
                 return row_of(name, items.clone());
@@ -215,7 +228,7 @@ fn channel_row(handle: &str) -> Option<Row> {
     let items = parse_entries(&json);
     CHANNEL_CACHE
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(url, (Instant::now(), name.clone(), items.clone()));
     row_of(&name, items)
 }
@@ -234,7 +247,11 @@ pub fn search(query: &str) -> Vec<ContentItem> {
         return Vec::new();
     }
     let cache_key = query.to_lowercase();
-    if let Some((at, items)) = SEARCH_CACHE.lock().unwrap().get(&cache_key) {
+    if let Some((at, items)) = SEARCH_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
         if at.elapsed() < SEARCH_TTL {
             return items.clone();
         }
@@ -242,7 +259,7 @@ pub fn search(query: &str) -> Vec<ContentItem> {
     let items = flat_playlist(&format!("ytsearch{SEARCH_LIMIT}:{query}"), SEARCH_LIMIT)
         .map(|json| parse_entries(&json))
         .unwrap_or_default();
-    let mut cache = SEARCH_CACHE.lock().unwrap();
+    let mut cache = SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() > 64 {
         cache.clear();
     }
@@ -260,13 +277,22 @@ pub fn video_meta(item_id: &str) -> Option<Meta> {
     if video.is_empty() {
         return None;
     }
-    if let Some((at, meta)) = META_CACHE.lock().unwrap().get(video) {
+    if let Some((at, meta)) = META_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(video)
+    {
         if at.elapsed() < CHANNEL_TTL {
             return Some(meta.clone());
         }
     }
     let out = Command::new("timeout")
-        .args([YTDLP_TIMEOUT_SECS, "yt-dlp", "--dump-single-json", "--no-playlist"])
+        .args([
+            YTDLP_TIMEOUT_SECS,
+            "yt-dlp",
+            "--dump-single-json",
+            "--no-playlist",
+        ])
         .arg(format!("https://www.youtube.com/watch?v={video}"))
         .output()
         .ok()?;
@@ -300,7 +326,7 @@ pub fn video_meta(item_id: &str) -> Option<Meta> {
     };
     META_CACHE
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(video.to_string(), (Instant::now(), meta.clone()));
     Some(meta)
 }
@@ -322,8 +348,13 @@ fn flat_playlist(target: &str, limit: usize) -> Option<Value> {
 /// (the signed-in feeds need them); None = anonymous.
 fn flat_playlist_auth(target: &str, limit: usize, profile: Option<&str>) -> Option<Value> {
     let mut cmd = Command::new("timeout");
-    cmd.args([YTDLP_TIMEOUT_SECS, "yt-dlp", "--flat-playlist", "--dump-single-json"])
-        .args(["--playlist-items", &format!("1-{limit}")]);
+    cmd.args([
+        YTDLP_TIMEOUT_SECS,
+        "yt-dlp",
+        "--flat-playlist",
+        "--dump-single-json",
+    ])
+    .args(["--playlist-items", &format!("1-{limit}")]);
     if let Some(profile) = profile {
         cmd.args(["--cookies-from-browser", &format!("chromium:{profile}")]);
     }

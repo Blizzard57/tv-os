@@ -27,6 +27,16 @@ const CATALOG_TTL: Duration = Duration::from_secs(600);
 const ROW_LIMIT: usize = 25;
 const CATALOGS_PER_ADDON: usize = 2;
 
+/// Short caches for the resolver results so re-opening a details page (or the
+/// auto-picker firing right after the UI) doesn't refetch every addon.
+const META_TTL: Duration = Duration::from_secs(300);
+const STREAM_TTL: Duration = Duration::from_secs(60);
+
+static META_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Option<Meta>)>>> =
+    std::sync::LazyLock::new(Mutex::default);
+static STREAM_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Vec<Stream>)>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
 /// Well-known, high-population public trackers added to every magnet so peers
 /// are found fast (quicker start) even when the addon supplies few or none.
 const DEFAULT_TRACKERS: [&str; 8] = [
@@ -82,43 +92,100 @@ impl Source for Stremio {
 // ---- Public resolver API used by the details endpoints (main.rs) ----
 
 /// Full metadata (incl. episode list) from the first meta-capable addon that
-/// answers. `kind` is "movie" / "series"; `id` is an IMDb-style id.
+/// answers. `kind` is "movie" / "series"; `id` is an IMDb-style id. Addons are
+/// queried in parallel so one slow addon can't hold up the details page, and
+/// the result is cached briefly.
 pub fn meta(kind: &str, id: &str) -> Option<Meta> {
-    for addon in addons::STORE.list().iter().filter(|a| a.meta) {
-        let url = format!(
-            "{}/meta/{}/{}.json",
-            addon.base,
-            percent_encode(kind),
-            percent_encode(id)
-        );
-        if let Ok(json) = addons::http_get(&url) {
-            if let Some(meta) = parse_meta(&json) {
-                return Some(meta);
-            }
+    let cache_key = format!("{kind}:{id}");
+    if let Some((at, meta)) = META_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
+        if at.elapsed() < META_TTL {
+            return meta.clone();
         }
     }
-    None
+
+    let addons = addons::STORE.list();
+    let meta = std::thread::scope(|scope| {
+        let handles: Vec<_> = addons
+            .iter()
+            .filter(|a| a.meta)
+            .map(|addon| {
+                scope.spawn(move || {
+                    let url = format!(
+                        "{}/meta/{}/{}.json",
+                        addon.base,
+                        percent_encode(kind),
+                        percent_encode(id)
+                    );
+                    addons::http_get(&url).ok().and_then(|json| parse_meta(&json))
+                })
+            })
+            .collect();
+        // First addon (in list order) that returned metadata wins.
+        handles
+            .into_iter()
+            .find_map(|h| h.join().ok().flatten())
+    });
+
+    let mut cache = META_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 64 {
+        cache.clear();
+    }
+    cache.insert(cache_key, (Instant::now(), meta.clone()));
+    meta
 }
 
 /// Every stream from every stream-capable addon, ranked best-first. `id` is a
-/// movie id (`tt…`) or an episode id (`tt…:S:E`).
+/// movie id (`tt…`) or an episode id (`tt…:S:E`). Addons are queried in
+/// parallel so playback isn't held up by the slowest one, and results are
+/// cached for a short window.
 pub fn streams(kind: &str, id: &str) -> Vec<Stream> {
-    let mut all: Vec<Stream> = addons::STORE
-        .list()
-        .iter()
-        .filter(|a| a.streams)
-        .filter_map(|addon| {
-            let url = format!(
-                "{}/stream/{}/{}.json",
-                addon.base,
-                percent_encode(kind),
-                percent_encode(id)
-            );
-            addons::http_get(&url).ok().map(|json| parse_streams(&json))
-        })
-        .flatten()
-        .collect();
+    let cache_key = format!("{kind}:{id}");
+    if let Some((at, streams)) = STREAM_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
+        if at.elapsed() < STREAM_TTL {
+            return streams.clone();
+        }
+    }
+
+    let addons = addons::STORE.list();
+    let mut all: Vec<Stream> = std::thread::scope(|scope| {
+        let handles: Vec<_> = addons
+            .iter()
+            .filter(|a| a.streams)
+            .map(|addon| {
+                scope.spawn(move || {
+                    let url = format!(
+                        "{}/stream/{}/{}.json",
+                        addon.base,
+                        percent_encode(kind),
+                        percent_encode(id)
+                    );
+                    addons::http_get(&url)
+                        .ok()
+                        .map(|json| parse_streams(&json))
+                        .unwrap_or_default()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
     rank(&mut all);
+
+    let mut cache = STREAM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 64 {
+        cache.clear();
+    }
+    cache.insert(cache_key, (Instant::now(), all.clone()));
     all
 }
 
@@ -136,7 +203,7 @@ pub fn search(query: &str) -> Vec<ContentItem> {
     if query.is_empty() {
         return Vec::new();
     }
-    if let Some((at, items)) = SEARCH_CACHE.lock().unwrap().get(&query.to_lowercase()) {
+    if let Some((at, items)) = SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&query.to_lowercase()) {
         if at.elapsed() < SEARCH_TTL {
             return items.clone();
         }
@@ -180,7 +247,7 @@ pub fn search(query: &str) -> Vec<ContentItem> {
         }
     });
 
-    let mut cache = SEARCH_CACHE.lock().unwrap();
+    let mut cache = SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() > 64 {
         cache.clear(); // crude but sufficient: queries are tiny and short-lived
     }
@@ -307,7 +374,7 @@ impl Stremio {
             percent_encode(kind),
             percent_encode(catalog_id)
         );
-        let mut cache = self.catalog_cache.lock().unwrap();
+        let mut cache = self.catalog_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, items)) = cache.get(&url) {
             if at.elapsed() < CATALOG_TTL {
                 return items.clone();
@@ -437,8 +504,12 @@ fn stream_score(s: &Stream) -> f64 {
     let text = describe(s);
     let height = resolution_height(&text.to_lowercase());
     match s.kind {
-        // Instant, reliable sources first; still prefer higher resolution.
-        StreamKind::Direct => 1_000_000_000.0 + height,
+        // Instant, reliable sources first; still prefer higher resolution, and
+        // (per the docs) nudge https above plain http on an otherwise tie.
+        StreamKind::Direct => {
+            let https_bonus = if s.url.starts_with("https") { 1.0 } else { 0.0 };
+            1_000_000_000.0 + height + https_bonus
+        }
         StreamKind::Youtube => 500_000_000.0,
         // Official "watch on …" services (WatchHub): visible above the
         // torrent pile so they read as recommendations, not buried under 50
@@ -465,21 +536,42 @@ fn stream_score(s: &Stream) -> f64 {
 }
 
 /// The numeric resolution height advertised in the source name (2160, 1080, …),
-/// used so the best quality sorts to the top of its tier.
+/// used so the best quality sorts to the top of its tier. Tokens must sit on a
+/// word boundary so short ones ("4k"/"uhd") don't match inside a title (e.g.
+/// "H4KER" or a movie literally named "UHD").
 fn resolution_height(lower: &str) -> f64 {
-    if lower.contains("2160p") || lower.contains("4k") || lower.contains("uhd") {
+    if has_token(lower, "2160p") || has_token(lower, "4k") || has_token(lower, "uhd") {
         2160.0
-    } else if lower.contains("1440p") {
+    } else if has_token(lower, "1440p") {
         1440.0
-    } else if lower.contains("1080p") || lower.contains("1080i") {
+    } else if has_token(lower, "1080p") || has_token(lower, "1080i") {
         1080.0
-    } else if lower.contains("720p") {
+    } else if has_token(lower, "720p") {
         720.0
-    } else if lower.contains("480p") {
+    } else if has_token(lower, "480p") {
         480.0
     } else {
         600.0 // unknown — between SD and HD
     }
+}
+
+/// Whether `token` appears in `haystack` bounded by non-alphanumeric
+/// characters (or the string edges) — a lightweight word-boundary match so a
+/// short quality tag can't hit letters inside an unrelated word.
+fn has_token(haystack: &str, token: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(token) {
+        let start = from + rel;
+        let end = start + token.len();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// Seeder count from a Torrentio-style "👤 89" label, if present.
@@ -711,6 +803,30 @@ mod tests {
         let order: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(order, vec!["direct", "netflix", "4k", "1080p", "720p", "4k weak"]);
         assert_eq!(streams[0].kind, StreamKind::Direct);
+    }
+
+    #[test]
+    fn resolution_tokens_need_word_boundaries() {
+        // Real quality tags match…
+        assert_eq!(resolution_height("movie.2160p.remux"), 2160.0);
+        assert_eq!(resolution_height("show 4k hdr"), 2160.0);
+        assert_eq!(resolution_height("great.uhd.rip"), 2160.0);
+        assert_eq!(resolution_height("thing 1080p"), 1080.0);
+        // …but the same letters buried inside a title do not.
+        assert_eq!(resolution_height("h4ker the movie"), 600.0);
+        assert_eq!(resolution_height("uhded up"), 600.0);
+    }
+
+    #[test]
+    fn direct_https_outranks_http_on_a_tie() {
+        let mk = |url: &str| Stream {
+            kind: StreamKind::Direct,
+            url: url.into(),
+            name: "src".into(),
+            title: "Movie 1080p".into(),
+            file_idx: None,
+        };
+        assert!(stream_score(&mk("https://cdn/x.mp4")) > stream_score(&mk("http://cdn/x.mp4")));
     }
 
     #[test]

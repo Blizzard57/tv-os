@@ -7,7 +7,8 @@
 # This builds the daemon + UI and installs a real, pacman-managed package
 # (uninstall with: sudo pacman -R tvos).
 pkgname=tvos
-pkgver=0.8.2
+# Placeholder; the real version comes from tvosd/Cargo.toml via pkgver() below.
+pkgver=0.0.0
 pkgrel=1
 pkgdesc="Couch interface for all your games, movies and shows"
 arch=('x86_64')

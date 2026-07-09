@@ -20,24 +20,30 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-# Find a Chromium-family browser for the kiosk UI.
-if command -v chromium >/dev/null 2>&1; then
-  BROWSER=(chromium)
-elif command -v chromium-browser >/dev/null 2>&1; then
-  BROWSER=(chromium-browser)
-elif command -v google-chrome >/dev/null 2>&1; then
-  BROWSER=(google-chrome)
-elif flatpak info org.chromium.Chromium >/dev/null 2>&1; then
-  BROWSER=(flatpak run org.chromium.Chromium)
-else
+# Find a Chromium-family browser for the kiosk UI (same list as tvos-app so
+# both entry points cover the same browsers).
+pick_browser() {
+  local b f
+  for b in chromium chromium-browser google-chrome google-chrome-stable \
+           brave brave-browser vivaldi-stable microsoft-edge-stable; do
+    command -v "$b" >/dev/null 2>&1 && { BROWSER=("$b"); return 0; }
+  done
+  for f in org.chromium.Chromium com.brave.Browser com.google.Chrome; do
+    flatpak info "$f" >/dev/null 2>&1 && { BROWSER=(flatpak run "$f"); return 0; }
+  done
+  return 1
+}
+if ! pick_browser; then
   echo "tvos-shell: no Chromium-family browser found." >&2
   echo "Install one, e.g.: flatpak install flathub org.chromium.Chromium" >&2
   exit 1
 fi
 
+# gamescope is a Wayland compositor; run the browser natively on Wayland so
+# HDR/VRR pass through (x11 here would force XWayland and undermine them).
 exec "${BROWSER[@]}" \
   --kiosk "$URL" \
   --no-first-run \
   --disable-session-crashed-bubble \
   --password-store=basic \
-  --ozone-platform=x11
+  --ozone-platform=wayland

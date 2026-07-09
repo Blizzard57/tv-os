@@ -6,6 +6,7 @@
 # For the full boot-to-TV-box *session* instead, see "Install on the gaming
 # PC" in README.md (system/install.sh + the gamescope session files).
 set -euo pipefail
+: "${HOME:?HOME must be set}"
 cd "$(dirname "$0")"
 
 BIN="$HOME/.local/bin"

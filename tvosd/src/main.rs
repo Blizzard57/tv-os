@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -45,8 +45,67 @@ use tower_http::services::{ServeDir, ServeFile};
 /// Default listen address; `TVOS_LISTEN` overrides it (dev/test instances).
 const LISTEN_ADDR: &str = "127.0.0.1:8484";
 
+/// Upper bound on any request body — the API only carries small JSON.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Upper bound on user-supplied URLs (addon manifests, play/open URLs).
+const MAX_URL_LEN: usize = 2048;
+
 fn listen_addr() -> String {
     std::env::var("TVOS_LISTEN").unwrap_or_else(|_| LISTEN_ADDR.to_string())
+}
+
+/// Optional shared secret. When set, mutating endpoints require it (Bearer
+/// header or `?token=`). Required before we'll bind a non-loopback address.
+fn auth_token() -> Option<String> {
+    std::env::var("TVOS_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Whether every socket address `addr` resolves to is loopback. A non-loopback
+/// bind exposes the API to the network, so it demands an auth token.
+fn addr_is_loopback(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match addr.to_socket_addrs() {
+        Ok(it) => {
+            let addrs: Vec<_> = it.collect();
+            !addrs.is_empty() && addrs.iter().all(|s| s.ip().is_loopback())
+        }
+        // Unresolvable here — let the actual bind below fail with a clear error.
+        Err(_) => false,
+    }
+}
+
+/// Middleware: reject mutating requests (POST/PUT) that don't carry the token,
+/// as `Authorization: Bearer <token>` or `?token=<token>`. Reads are unguarded.
+async fn require_auth(
+    axum::extract::State(token): axum::extract::State<Arc<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::Method;
+    use axum::response::IntoResponse;
+    let mutating = matches!(req.method(), &Method::POST | &Method::PUT | &Method::DELETE);
+    if !mutating {
+        return next.run(req).await;
+    }
+    let header_ok = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| t == token.as_str());
+    let query_ok = req.uri().query().is_some_and(|q| {
+        q.split('&')
+            .filter_map(|kv| kv.strip_prefix("token="))
+            .any(|t| t == token.as_str())
+    });
+    if header_ok || query_ok {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "missing or invalid auth token").into_response()
+    }
 }
 
 struct App {
@@ -63,14 +122,17 @@ impl App {
     /// Fresh source rows; also refreshes the search cache.
     fn refresh_library(&self) -> Vec<model::Row> {
         let rows = self.sources.library();
-        *self.library_cache.lock().unwrap() = Some((Instant::now(), rows.clone()));
+        *self
+            .library_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), rows.clone()));
         rows
     }
 
     /// Source rows for search: the cached snapshot if it's recent, else fresh.
     fn cached_library(&self) -> Vec<model::Row> {
         {
-            let cache = self.library_cache.lock().unwrap();
+            let cache = self.library_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((at, rows)) = &*cache {
                 if at.elapsed() < LIBRARY_CACHE_TTL {
                     return rows.clone();
@@ -124,6 +186,7 @@ async fn main() {
         .route("/api/launch", post(post_launch))
         .route("/api/install", post(post_install))
         .route("/api/installs", get(get_installs))
+        .route("/api/installs/cancel", post(post_install_cancel))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/steam/status", get(get_steam_status))
         .route("/api/addons", get(get_addons).post(post_addon))
@@ -145,14 +208,57 @@ async fn main() {
         .route("/api/version", get(get_version))
         .fallback_service(serve_ui)
         .layer(axum::middleware::map_response(no_html_cache))
+        // Cap request bodies — the API only ever carries small JSON payloads.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(app);
 
     let addr = listen_addr();
+    let token = auth_token();
+    let loopback = addr_is_loopback(&addr);
+
+    // Refuse to expose the API to the network without an auth token: the
+    // endpoints launch programs and open URLs, so an open non-loopback bind is
+    // remote-code-execution-by-design.
+    if !loopback && token.is_none() {
+        panic!(
+            "refusing to bind non-loopback address {addr} without TVOS_AUTH_TOKEN set \
+             (the API can launch programs); set a token or bind 127.0.0.1"
+        );
+    }
+
+    // When a token is configured, guard all mutating endpoints with it. On a
+    // loopback bind with no token we keep the original open behavior.
+    let router = match &token {
+        Some(t) => {
+            if !loopback {
+                log_warn!(
+                    "tvosd binding non-loopback address {addr}: mutating endpoints require \
+                     the TVOS_AUTH_TOKEN (Bearer header or ?token=)"
+                );
+            }
+            router.layer(axum::middleware::from_fn_with_state(
+                Arc::new(t.clone()),
+                require_auth,
+            ))
+        }
+        None => router,
+    };
+
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
     log_info!("tvosd listening on http://{addr} (ui: {})", ui_dir.display());
     axum::serve(listener, router).await.expect("server error");
+}
+
+/// Unwraps a `spawn_blocking` join result, logging the `JoinError` (a panicked
+/// or cancelled blocking task) before falling back to the default so silent
+/// failures on read endpoints become observable in the log.
+fn join_or_default<T: Default>(what: &str, result: Result<T, tokio::task::JoinError>) -> T {
+    result.unwrap_or_else(|e| {
+        log_error!("{what} task failed: {e}");
+        T::default()
+    })
 }
 
 /// The shell is served from disk and swapped in place by install.sh — never
@@ -204,7 +310,8 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
     // Recommendations ("Because you watched …") and the source catalogs both hit
     // the network, so build them on a blocking thread. Recs come right after
     // Continue, then everything else.
-    rows.extend(
+    rows.extend(join_or_default(
+        "library",
         tokio::task::spawn_blocking(move || {
             // Seed recommendations from what you've watched *anywhere*: recent
             // local plays first, then your Trakt history (a no-op/blocking call
@@ -280,9 +387,8 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             sources::tmdb::personalize(&mut r, &recent);
             r
         })
-        .await
-        .unwrap_or_default(),
-    );
+        .await,
+    ));
     // No blank movie/show cards: drop catalog items without artwork. Games are
     // kept regardless (you want to see your whole library, art or not).
     for row in &mut rows {
@@ -306,8 +412,24 @@ async fn get_installs(State(app): State<Shared>) -> Json<Vec<install::Job>> {
     Json(app.installs.jobs())
 }
 
-async fn get_settings() -> Json<settings::Settings> {
-    Json(settings::STORE.get())
+/// Cancel a running download job by id; the worker aborts cooperatively and
+/// removes its partial file.
+async fn post_install_cancel(
+    State(app): State<Shared>,
+    Json(req): Json<ItemRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    app.installs
+        .cancel(&req.id)
+        .map(|()| StatusCode::ACCEPTED)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+/// Secrets (steam_api_key, trakt_client_secret, trakt_token, anilist_token,
+/// mal_token) are write-only: this returns them blanked, with sibling
+/// `<field>_set` booleans so the UI can still show "configured". PUT keeps the
+/// full values; an empty secret on PUT is treated as "unchanged".
+async fn get_settings() -> Json<serde_json::Value> {
+    Json(settings::STORE.get().redacted())
 }
 
 async fn put_settings(
@@ -378,7 +500,11 @@ async fn post_launch(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if let Err(e) = &result {
-        log_error!("launch '{}' failed: {e}", req.id);
+        log_error!(
+            "launch '{}' failed: {}",
+            req.id,
+            util::scrub_secrets(&e.to_string())
+        );
     }
     if result.is_ok() {
         if let (Some(title), Some(kind)) = (req.title, req.kind) {
@@ -417,9 +543,10 @@ struct IdQuery {
 /// episode list. Video items resolve through stream addons (Cinemeta etc.);
 /// Steam games use the public storefront API; others return a minimal stub.
 async fn get_meta(Query(q): Query<IdQuery>) -> Json<media::Meta> {
-    let meta = tokio::task::spawn_blocking(move || meta_for(&q.id))
-        .await
-        .unwrap_or_default();
+    let meta = join_or_default(
+        "meta",
+        tokio::task::spawn_blocking(move || meta_for(&q.id)).await,
+    );
     Json(meta)
 }
 
@@ -477,12 +604,14 @@ async fn get_search(
     State(app): State<Shared>,
     Query(query): Query<SearchQuery>,
 ) -> Json<Vec<model::ContentItem>> {
-    let items = tokio::task::spawn_blocking(move || {
-        let library = app.cached_library();
-        search::flat(&query.q, library)
-    })
-    .await
-    .unwrap_or_default();
+    let items = join_or_default(
+        "search",
+        tokio::task::spawn_blocking(move || {
+            let library = app.cached_library();
+            search::flat(&query.q, library)
+        })
+        .await,
+    );
     Json(items)
 }
 
@@ -493,12 +622,14 @@ async fn get_search_deep(
     State(app): State<Shared>,
     Query(query): Query<SearchQuery>,
 ) -> Json<Vec<model::Row>> {
-    let rows = tokio::task::spawn_blocking(move || {
-        let library = app.cached_library();
-        search::deep(&query.q, library)
-    })
-    .await
-    .unwrap_or_default();
+    let rows = join_or_default(
+        "deep search",
+        tokio::task::spawn_blocking(move || {
+            let library = app.cached_library();
+            search::deep(&query.q, library)
+        })
+        .await,
+    );
     Json(rows)
 }
 
@@ -545,7 +676,10 @@ async fn get_game(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
         })
     })
     .await
-    .unwrap_or_else(|_| serde_json::json!({}));
+    .unwrap_or_else(|e| {
+        log_error!("game extras task failed: {e}");
+        serde_json::json!({})
+    });
     Json(value)
 }
 
@@ -597,7 +731,10 @@ async fn get_mal_callback(Query(q): Query<MalCallback>) -> axum::response::Html<
 async fn get_youtube_status() -> Json<serde_json::Value> {
     let (connected, detail) = tokio::task::spawn_blocking(sources::youtube::account_status)
         .await
-        .unwrap_or((false, "status check failed".to_string()));
+        .unwrap_or_else(|e| {
+            log_error!("youtube status task failed: {e}");
+            (false, "status check failed".to_string())
+        });
     Json(serde_json::json!({ "connected": connected, "detail": detail }))
 }
 
@@ -605,9 +742,10 @@ async fn get_youtube_status() -> Json<serde_json::Value> {
 /// TMDB recommendations (addon items map IMDb → TMDB first); other kinds
 /// (games) have no similar-content source yet and return empty.
 async fn get_similar(Query(q): Query<IdQuery>) -> Json<Vec<model::ContentItem>> {
-    let items = tokio::task::spawn_blocking(move || similar_for(&q.id))
-        .await
-        .unwrap_or_default();
+    let items = join_or_default(
+        "similar",
+        tokio::task::spawn_blocking(move || similar_for(&q.id)).await,
+    );
     Json(items)
 }
 
@@ -652,17 +790,19 @@ async fn get_resume(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
 /// Sources for an item: streams for videos/episodes (ranked best-first), or
 /// "where to buy" offers for unowned games (GameHub, cheapest first).
 async fn get_streams(Query(q): Query<IdQuery>) -> Json<Vec<media::Stream>> {
-    let streams = tokio::task::spawn_blocking(move || {
-        if let Some(appid) = q.id.strip_prefix("gshop:") {
-            return sources::gamehub::offers(appid);
-        }
-        match sources::resolve_video(&q.id) {
-            Ok((kind, id)) => sources::stremio::streams(&kind, &id),
-            Err(_) => Vec::new(),
-        }
-    })
-    .await
-    .unwrap_or_default();
+    let streams = join_or_default(
+        "streams",
+        tokio::task::spawn_blocking(move || {
+            if let Some(appid) = q.id.strip_prefix("gshop:") {
+                return sources::gamehub::offers(appid);
+            }
+            match sources::resolve_video(&q.id) {
+                Ok((kind, id)) => sources::stremio::streams(&kind, &id),
+                Err(_) => Vec::new(),
+            }
+        })
+        .await,
+    );
     Json(streams)
 }
 
@@ -687,6 +827,9 @@ struct ItemMeta {
 
 /// Plays a stream the user picked on the details page.
 async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCode, String)> {
+    if req.stream.url.len() > MAX_URL_LEN {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "stream URL is too long".to_string()));
+    }
     let stream = req.stream;
     let item_id = req.item.as_ref().map(|i| i.id.clone());
     let track_id = req.track_id.clone();
@@ -696,7 +839,7 @@ async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCo
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if let Err(e) = &result {
-        log_error!("play failed: {e}");
+        log_error!("play failed: {}", util::scrub_secrets(&e.to_string()));
     }
     if result.is_ok() {
         if let Some(item) = req.item {
@@ -715,8 +858,30 @@ async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCo
 }
 
 /// Opens a URL with the system handler — an addon's /configure page, etc.
+/// Only http(s) URLs are handed to xdg-open; anything else (file:, custom
+/// schemes, shell tricks) is refused so a client can't open arbitrary handlers.
 async fn post_open(Json(req): Json<AddonRequest>) -> Result<StatusCode, (StatusCode, String)> {
+    validate_web_url(&req.url)?;
     launcher::open_external(&req.url)
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+/// Accepts only `http`/`https` URLs of a sane length, for endpoints that hand a
+/// client-supplied URL to an external program (xdg-open) or player.
+fn validate_web_url(url: &str) -> Result<(), (StatusCode, String)> {
+    if url.len() > MAX_URL_LEN {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "URL is too long".to_string()));
+    }
+    let scheme = url
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if scheme != "http" && scheme != "https" {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "only http and https URLs are allowed".to_string(),
+        ));
+    }
+    Ok(())
 }

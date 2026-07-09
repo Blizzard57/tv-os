@@ -40,6 +40,10 @@ textarea {
      theme (a hardcoded dark gradient smudges a light background). */
   --rail: linear-gradient(to right, rgba(0, 0, 0, 0.35), transparent);
   --title-shadow: 0 2px 24px rgba(0, 0, 0, 0.25);
+  /* TV overscan safe area: many TVs crop ~5% of each edge. Edge-pinned
+     elements pad by the display's real safe-area inset when the browser
+     reports one, otherwise fall back to this margin. */
+  --overscan: 24px;
 }
 
 [data-theme='light'] {
@@ -223,7 +227,8 @@ body {
 }
 
 .hero-shot {
-  height: 200px;
+  /* Fluid so a windowed shell doesn't crop the preview strip. */
+  height: clamp(140px, 18vw, 200px);
   border-radius: 12px;
   object-fit: cover;
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
@@ -335,6 +340,9 @@ body {
   transition: transform 0.18s ease, box-shadow 0.18s ease;
   outline: 3px solid transparent;
   cursor: pointer;
+  /* Keep the focused card clear of the container edges when scrolled into
+     view (home grid scroll-into-view — see MediaRow). */
+  scroll-margin: 96px 24px;
 }
 
 /* Wide 16:9 card for videos — the thumbnail is shown uncropped-ish, the
@@ -622,8 +630,8 @@ body {
 /* The living-room clock — always visible, interactive with nothing. */
 .tv-clock {
   position: fixed;
-  top: 20px;
-  right: 24px;
+  top: calc(20px + env(safe-area-inset-top, var(--overscan)));
+  right: calc(24px + env(safe-area-inset-right, var(--overscan)));
   z-index: 6;
 }
 
@@ -1338,12 +1346,39 @@ body {
 .screen-message {
   height: 100vh;
   display: flex;
+  flex-direction: column;
+  gap: 22px;
   align-items: center;
   justify-content: center;
   font-size: 24px;
   color: var(--text-dim);
   text-align: center;
   padding: 0 10vw;
+}
+
+/* Retry button on App.tsx's full-screen error state. Matches the app's
+   primary-button look and shares the same accent focus ring so a controller
+   user (it's autoFocused) sees where they are. */
+.tv-retry {
+  padding: 12px 30px;
+  font-size: 18px;
+  font-family: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  cursor: pointer;
+  outline: 3px solid transparent;
+  outline-offset: 2px;
+  transition: outline-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.tv-retry:hover,
+.tv-retry:focus,
+.tv-retry:focus-visible {
+  outline-color: var(--accent);
+  box-shadow: 0 8px 30px var(--accent-glow);
 }
 
 /* ---- Details page ---- */
@@ -1374,8 +1409,8 @@ body {
 
 .details-back {
   position: fixed;
-  top: 24px;
-  left: 28px;
+  top: calc(24px + env(safe-area-inset-top, var(--overscan)));
+  left: calc(28px + env(safe-area-inset-left, var(--overscan)));
   z-index: 2;
 }
 
@@ -1397,8 +1432,11 @@ body {
 }
 
 .details-poster {
-  width: 260px;
-  height: 390px;
+  /* Fluid poster: scales with the viewport but capped so it never dominates
+     a large TV or crop on a small window (2:3 kept via aspect-ratio). */
+  width: clamp(180px, 16vw, 260px);
+  aspect-ratio: 2 / 3;
+  height: auto;
   object-fit: cover;
   border-radius: 14px;
   flex-shrink: 0;
@@ -1490,8 +1528,10 @@ body {
 
 .shot {
   flex: 0 0 auto;
-  width: 460px;
-  height: 259px; /* 16:9 */
+  /* Fluid 16:9 screenshot — width scales with the viewport, height follows. */
+  width: clamp(320px, 32vw, 460px);
+  height: auto;
+  aspect-ratio: 16 / 9;
   object-fit: cover;
   border-radius: 12px;
   background: var(--surface);
@@ -1639,8 +1679,8 @@ body {
 /* Persistent, minimal control legend — the whole grammar in one glance. */
 .details-legend {
   position: fixed;
-  right: 28px;
-  bottom: 22px;
+  right: calc(28px + env(safe-area-inset-right, var(--overscan)));
+  bottom: calc(22px + env(safe-area-inset-bottom, var(--overscan)));
   z-index: 2;
   display: flex;
   gap: 18px;
@@ -2189,5 +2229,99 @@ body {
     padding: 2px 0 0;
     font-size: 14px;
     line-height: 1.35;
+  }
+}
+
+/* ---- On-screen keyboard modal (Settings field editing) ---- */
+
+.osk-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5vh 5vw;
+  background: var(--scrim);
+  backdrop-filter: blur(8px);
+  animation: fade-in 0.18s ease;
+}
+
+.osk-modal {
+  width: min(760px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 28px;
+  border-radius: 18px;
+  background: var(--panel);
+  border: 1px solid var(--overlay-border);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+}
+
+.osk-modal-label {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.osk-modal-value {
+  min-height: 30px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+  font-size: 20px;
+  word-break: break-all;
+}
+
+.osk-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  animation: osk-blink 1s step-end infinite;
+}
+
+@keyframes osk-blink {
+  50% { opacity: 0; }
+}
+
+.osk-modal .osk {
+  flex: none;
+}
+
+.osk-row-actions .osk-key {
+  text-transform: none;
+  font-size: 15px;
+}
+
+/* ---- Reduced motion: honor the OS setting (calms drift/sweep/scale) ---- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Kill the infinite ambient/loading motion outright. */
+  .loading-art,
+  .loading-bar-fill,
+  .osk-caret {
+    animation: none !important;
+  }
+
+  /* Focus should still read clearly, but without the scale pop. */
+  .card-focused,
+  .shot.focused,
+  .sim-card.focused {
+    transform: none !important;
   }
 }

@@ -13,6 +13,11 @@ set -euo pipefail
 URL="http://127.0.0.1:8484"
 TVOSD="${TVOSD:-$HOME/.local/bin/tvosd}"
 [ -x "$TVOSD" ] || TVOSD="$(command -v tvosd || echo "$TVOSD")"
+if [ ! -x "$TVOSD" ]; then
+  echo "TV OS: tvosd binary not found or not executable ($TVOSD)." >&2
+  echo "Run ./install.sh, or set TVOSD=/path/to/tvosd." >&2
+  exit 1
+fi
 PROFILE_DIR="$HOME/.local/share/tvos/browser"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/tvosd.log"
 
@@ -33,7 +38,11 @@ if ! curl -fsS "$URL/api/version" >/dev/null 2>&1; then
   daemon_pid=$!
   started=1
 fi
-cleanup() { [ "$started" = 1 ] && kill "${daemon_pid:-}" 2>/dev/null || true; }
+cleanup() {
+  if [ "$started" = 1 ] && [ -n "${daemon_pid:-}" ]; then
+    kill "$daemon_pid" 2>/dev/null || true
+  fi
+}
 trap cleanup EXIT
 
 for _ in $(seq 1 50); do

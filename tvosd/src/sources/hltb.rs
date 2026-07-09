@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 const TTL: Duration = Duration::from_secs(86_400);
+/// Failures (network hiccup, HLTB changing their scheme, or a title we simply
+/// couldn't match) get a much shorter TTL so a transient miss isn't cached for
+/// a whole day.
+const FAILURE_TTL: Duration = Duration::from_secs(900);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
 static CACHE: LazyLock<Mutex<HashMap<String, (Instant, Option<Times>)>>> =
@@ -36,15 +40,18 @@ fn client() -> Option<reqwest::blocking::Client> {
 
 pub fn lookup(title: &str) -> Option<Times> {
     let key = title.to_lowercase();
-    if let Some((at, times)) = CACHE.lock().unwrap().get(&key) {
-        if at.elapsed() < TTL {
+    if let Some((at, times)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        // A hit lives for the full day; a cached miss expires quickly so we
+        // retry soon (the miss may have been a transient failure).
+        let ttl = if times.is_some() { TTL } else { FAILURE_TTL };
+        if at.elapsed() < ttl {
             return times.clone();
         }
     }
     let times = search(title);
     CACHE
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(key, (Instant::now(), times.clone()));
     times
 }

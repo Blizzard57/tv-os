@@ -119,7 +119,7 @@ fn owned_sets(library: &[Row]) -> (HashSet<String>, HashSet<i64>) {
 /// Does the portrait box-art capsule exist for this app? Checked once and
 /// remembered — a store item without it would render as a cropped banner.
 fn has_portrait(appid: i64) -> bool {
-    if let Some(&ok) = PORTRAIT_CACHE.lock().unwrap().get(&appid) {
+    if let Some(&ok) = PORTRAIT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&appid) {
         return ok;
     }
     let ok = reqwest::blocking::Client::builder()
@@ -129,7 +129,7 @@ fn has_portrait(appid: i64) -> bool {
         .ok()
         .and_then(|c| c.head(crate::sources::steam::art_url(appid)).send().ok())
         .is_some_and(|r| r.status().is_success());
-    PORTRAIT_CACHE.lock().unwrap().insert(appid, ok);
+    PORTRAIT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(appid, ok);
     ok
 }
 
@@ -243,7 +243,7 @@ pub fn genre_row(slug: &str, library: &[Row], limit: usize) -> Vec<ContentItem> 
 /// Name for an appid, only when it's a normal game with portrait box art.
 fn app_brief(appid: i64) -> Option<String> {
     {
-        let cache = BRIEF_CACHE.lock().unwrap();
+        let cache = BRIEF_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((name, _)) = cache.get(&appid) {
             return (!name.is_empty()).then(|| name.clone());
         }
@@ -274,7 +274,7 @@ fn app_brief(appid: i64) -> Option<String> {
 /// (region, category).
 fn category(region: &str, list: &str) -> Vec<(i64, String, String)> {
     let cache_key = format!("{region}:{list}");
-    if let Some((at, items)) = CHARTS_CACHE.lock().unwrap().get(&cache_key) {
+    if let Some((at, items)) = CHARTS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&cache_key) {
         if at.elapsed() < CHARTS_TTL {
             return items.clone();
         }
@@ -325,7 +325,7 @@ fn charts(region: &str) -> Vec<(i64, String, String)> {
 pub fn offers(appid: &str) -> Vec<Stream> {
     let region = region();
     let cache_key = format!("{appid}:{region}");
-    if let Some((at, offers)) = OFFERS_CACHE.lock().unwrap().get(&cache_key) {
+    if let Some((at, offers)) = OFFERS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&cache_key) {
         if at.elapsed() < OFFERS_TTL {
             return offers.clone();
         }
@@ -361,33 +361,41 @@ pub fn offers(appid: &str) -> Vec<Stream> {
         }
     }
 
-    // GOG — regional pricing (DRM-free).
+    // GOG and CheapShark both only need the title + region, so once Steam has
+    // handed those over run the two branches concurrently rather than back to
+    // back (each is several serial HTTP calls).
     if !title.is_empty() {
-        if let Some((gog_id, slug)) = gog_lookup(&title) {
-            if let Some((amount, label)) = gog_price(gog_id, &region) {
-                priced.push((
+        let (gog, cheap) = std::thread::scope(|scope| {
+            // GOG — regional pricing (DRM-free).
+            let gog = scope.spawn(|| {
+                let (gog_id, slug) = gog_lookup(&title)?;
+                let (amount, label) = gog_price(gog_id, &region)?;
+                Some((
                     amount,
                     external(
                         &format!("GOG · {label}"),
                         "DRM-free",
                         &format!("https://www.gog.com/en/game/{slug}"),
                     ),
-                ));
-            }
-        }
-    }
-
-    // CheapShark — the multi-store aggregate (Epic, Fanatical, Humble, GMG,
-    // Battle.net, EA, Ubisoft, …). Prices are USD; outside the US they're
-    // still shown (a real number beats a "check price" link), labeled so.
-    if !title.is_empty() {
-        priced.extend(cheapshark(&title, &region));
+                ))
+            });
+            // CheapShark — the multi-store aggregate (Epic, Fanatical, Humble,
+            // GMG, Battle.net, EA, Ubisoft, …). Prices are USD; outside the US
+            // they're still shown (a real number beats a "check price" link).
+            let cheap = scope.spawn(|| cheapshark(&title, &region));
+            (
+                gog.join().ok().flatten(),
+                cheap.join().unwrap_or_default(),
+            )
+        });
+        priced.extend(gog);
+        priced.extend(cheap);
     }
 
     priced.sort_by(|a, b| a.0.total_cmp(&b.0));
     let offers: Vec<Stream> = priced.into_iter().map(|(_, s)| s).collect();
 
-    let mut cache = OFFERS_CACHE.lock().unwrap();
+    let mut cache = OFFERS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() > 64 {
         cache.clear();
     }

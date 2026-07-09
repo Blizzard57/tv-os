@@ -46,7 +46,7 @@ pub fn status() -> Value {
     let s = settings::STORE.get();
     json!({
         "trakt": !s.trakt_token.is_empty(),
-        "trakt_pending": TRAKT_PENDING.lock().unwrap().clone(),
+        "trakt_pending": TRAKT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         "anilist": !s.anilist_token.is_empty(),
         "mal": !s.mal_token.is_empty(),
     })
@@ -73,13 +73,36 @@ fn sweep_markers() {
             continue;
         }
         let item_id = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
         let item_id = item_id.trim();
-        if !item_id.is_empty() {
-            log_info!("watched: {item_id} — syncing trackers");
-            scrobble(item_id);
+        if item_id.is_empty() {
+            // Nothing to sync — drop the empty marker so it doesn't pile up.
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        log_info!("watched: {item_id} — syncing trackers");
+        // Only delete the marker once the sync actually succeeds; a transient
+        // failure (offline, service 5xx) would otherwise lose the watch
+        // forever. On failure, leave it for the next sweep to retry — unless
+        // it's unscrobblable (a game/YouTube id), which we clear immediately.
+        match scrobble(item_id) {
+            Scrobble::Synced | Scrobble::NotApplicable => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Scrobble::Failed => {
+                log_error!("watch sync failed for {item_id} — keeping marker to retry");
+            }
         }
     }
+}
+
+/// Outcome of a scrobble attempt, deciding whether the marker can be removed.
+enum Scrobble {
+    /// At least one connected service recorded the watch.
+    Synced,
+    /// Nothing to do (unscrobblable id, or no service connected/matched).
+    NotApplicable,
+    /// A connected service was tried and failed transiently — retry later.
+    Failed,
 }
 
 /// What a finished item means to the trackers.
@@ -110,7 +133,11 @@ fn parse_watched(item_id: &str) -> Option<Watched> {
             } else {
                 None
             };
-            Some(Watched { imdb, episode, title })
+            Some(Watched {
+                imdb,
+                episode,
+                title,
+            })
         }
         // TMDB catalog ids resolve to an IMDb id via TMDB. They name a whole
         // title (no episode), so only movies scrobble this way; TMDB series are
@@ -140,28 +167,57 @@ fn title_for(item_id: &str) -> Option<String> {
         .map(|i| i.title)
 }
 
-fn scrobble(item_id: &str) {
+fn scrobble(item_id: &str) -> Scrobble {
     let Some(watched) = parse_watched(item_id) else {
-        return;
+        return Scrobble::NotApplicable; // game/YouTube/unresolvable — nothing to sync
     };
     let s = settings::STORE.get();
+    let mut tried = false; // a connected service was attempted
+    let mut failed = false; // …and at least one attempt failed transiently
+    let mut synced = false; // …and at least one recorded the watch
+
     if !s.trakt_token.is_empty() && !s.trakt_client_id.is_empty() {
-        if let Err(e) = trakt_history(&s.trakt_client_id, &s.trakt_token, &watched) {
-            log_error!("trakt sync failed: {e}");
+        tried = true;
+        match trakt_history(&s.trakt_client_id, &s.trakt_token, &watched) {
+            Ok(()) => synced = true,
+            Err(e) => {
+                log_error!("trakt sync failed: {e}");
+                failed = true;
+            }
         }
     }
     // AniList/MAL track anime series by episode number.
     if let (Some((_, ep)), Some(title)) = (watched.episode, watched.title.as_deref()) {
         if !s.anilist_token.is_empty() {
-            if let Err(e) = anilist_progress(&s.anilist_token, title, ep) {
-                log_error!("anilist sync failed: {e}");
+            tried = true;
+            match anilist_progress(&s.anilist_token, title, ep) {
+                Ok(()) => synced = true,
+                Err(e) => {
+                    log_error!("anilist sync failed: {e}");
+                    failed = true;
+                }
             }
         }
         if !s.mal_token.is_empty() {
-            if let Err(e) = mal_progress(&s.mal_token, title, ep) {
-                log_error!("mal sync failed: {e}");
+            tried = true;
+            match mal_progress(&s.mal_token, title, ep) {
+                Ok(()) => synced = true,
+                Err(e) => {
+                    log_error!("mal sync failed: {e}");
+                    failed = true;
+                }
             }
         }
+    }
+
+    match (tried, synced, failed) {
+        // No connected service to try, or everything reported "no match" (Ok
+        // without a real sync): nothing more we can do — clear the marker.
+        (false, _, _) => Scrobble::NotApplicable,
+        // Something failed and nothing succeeded → keep the marker to retry.
+        (true, false, true) => Scrobble::Failed,
+        // At least one service recorded it (or all matched cleanly).
+        _ => Scrobble::Synced,
     }
 }
 
@@ -186,7 +242,9 @@ fn trakt_history(client_id: &str, token: &str, w: &Watched) -> Result<(), String
         .json(&body)
         .send()
         .map_err(|e| e.to_string())?;
-    res.error_for_status().map(|_| ()).map_err(|e| e.to_string())
+    res.error_for_status()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Your recent Trakt watch history as recommendation seeds — so the "For You"
@@ -199,7 +257,11 @@ pub fn watched_history(limit: usize) -> Vec<ContentItem> {
     if s.trakt_token.is_empty() || s.trakt_client_id.is_empty() {
         return Vec::new();
     }
-    if let Some((at, items)) = HISTORY_CACHE.lock().unwrap().as_ref() {
+    if let Some((at, items)) = HISTORY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
         if at.elapsed() < HISTORY_TTL {
             return items.clone();
         }
@@ -212,7 +274,8 @@ pub fn watched_history(limit: usize) -> Vec<ContentItem> {
         }
     };
     if !items.is_empty() {
-        *HISTORY_CACHE.lock().unwrap() = Some((Instant::now(), items.clone()));
+        *HISTORY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), items.clone()));
     }
     items
 }
@@ -296,10 +359,13 @@ pub fn trakt_connect() -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
     let device_code = v["device_code"].as_str().unwrap_or_default().to_string();
     let user_code = v["user_code"].as_str().unwrap_or_default().to_string();
-    let url = v["verification_url"].as_str().unwrap_or("https://trakt.tv/activate").to_string();
+    let url = v["verification_url"]
+        .as_str()
+        .unwrap_or("https://trakt.tv/activate")
+        .to_string();
     let interval = v["interval"].as_u64().unwrap_or(5).max(3);
     let expires = v["expires_in"].as_u64().unwrap_or(600);
-    *TRAKT_PENDING.lock().unwrap() = Some(user_code.clone());
+    *TRAKT_PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(user_code.clone());
 
     std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(expires);
@@ -333,7 +399,7 @@ pub fn trakt_connect() -> Result<Value, String> {
                 break; // 400 = still pending; anything else is fatal
             }
         }
-        *TRAKT_PENDING.lock().unwrap() = None;
+        *TRAKT_PENDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     });
 
     Ok(json!({ "user_code": user_code, "url": url }))
@@ -361,7 +427,11 @@ fn anilist_progress(token: &str, title: &str, episode: i64) -> Result<(), String
         return Ok(()); // not on AniList — not anime, skip quietly
     };
     let total = v["data"]["Media"]["episodes"].as_i64().unwrap_or(0);
-    let status = if total > 0 && episode >= total { "COMPLETED" } else { "CURRENT" };
+    let status = if total > 0 && episode >= total {
+        "COMPLETED"
+    } else {
+        "CURRENT"
+    };
     let save = json!({
         "query": "mutation($id:Int,$p:Int,$st:MediaListStatus){SaveMediaListEntry(mediaId:$id,progress:$p,status:$st){id}}",
         "variables": { "id": media_id, "p": episode, "st": status },
@@ -417,10 +487,13 @@ pub fn mal_login_url() -> Result<String, String> {
     }
     let verifier: String = {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         format!("tvos{seed:x}tvos{seed:x}tvos{seed:x}") // 43+ chars, unreserved
     };
-    *MAL_VERIFIER.lock().unwrap() = Some(verifier.clone());
+    *MAL_VERIFIER.lock().unwrap_or_else(|e| e.into_inner()) = Some(verifier.clone());
     Ok(format!(
         "https://myanimelist.net/v1/oauth2/authorize?response_type=code&client_id={}&code_challenge={verifier}&code_challenge_method=plain",
         s.mal_client_id
@@ -431,7 +504,7 @@ pub fn mal_login_url() -> Result<String, String> {
 pub fn mal_callback(code: &str) -> Result<(), String> {
     let verifier = MAL_VERIFIER
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .take()
         .ok_or("no login in progress — start again from Settings")?;
     let s = settings::STORE.get();

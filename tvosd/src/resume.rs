@@ -43,7 +43,7 @@ impl ResumeStore {
 
     /// Remembers the stream used for an item (and, for episodes, for the show).
     pub fn remember(&self, item_id: &str, stream: &Stream) {
-        let mut map = self.streams.lock().unwrap();
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         map.insert(item_id.to_string(), stream.clone());
         if let Some(series) = series_key(item_id) {
             map.insert(series, stream.clone());
@@ -58,14 +58,14 @@ impl ResumeStore {
 
     /// The stream last used for this exact item, if any.
     pub fn stream(&self, item_id: &str) -> Option<Stream> {
-        self.streams.lock().unwrap().get(item_id).cloned()
+        self.streams.lock().unwrap_or_else(|e| e.into_inner()).get(item_id).cloned()
     }
 
     /// The source last used for this item's *show* — used to keep the next
     /// episode on the same addon/quality.
     pub fn series_stream(&self, item_id: &str) -> Option<Stream> {
         let key = series_key(item_id)?;
-        self.streams.lock().unwrap().get(&key).cloned()
+        self.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
     }
 }
 

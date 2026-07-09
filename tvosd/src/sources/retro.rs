@@ -1,7 +1,4 @@
 //! Retro games: ROMs on disk + a downloadable catalog, launched in RetroArch.
-// Unregistered from the home screen by user request; the module (and its
-// tests) stay so it can be re-enabled by adding it back to Registry::detect.
-#![allow(dead_code)]
 //!
 //! ROMs live in one directory per system (EmuDeck's layout):
 //!
@@ -24,7 +21,6 @@ use crate::install::InstallManager;
 use crate::launcher;
 use crate::model::{Action, ContentItem, Kind, Row};
 use crate::sources::Source;
-use crate::util::percent_encode;
 
 /// dir name under the ROM root, display name, libretro thumbnail repo name,
 /// file extensions, libretro core candidates (best first).
@@ -36,7 +32,7 @@ struct System {
     cores: &'static [&'static str],
 }
 
-const SYSTEMS: [System; 8] = [
+const SYSTEMS: [System; 17] = [
     System {
         dir: "nes",
         name: "NES",
@@ -73,11 +69,53 @@ const SYSTEMS: [System; 8] = [
         cores: &["mgba"],
     },
     System {
+        dir: "nds",
+        name: "Nintendo DS",
+        thumb_repo: "Nintendo - Nintendo DS",
+        extensions: &["nds"],
+        cores: &["melonds", "desmume"],
+    },
+    System {
         dir: "genesis",
         name: "Sega Genesis",
         thumb_repo: "Sega - Mega Drive - Genesis",
-        extensions: &["md", "gen", "68k"],
+        extensions: &["md", "gen", "68k", "smd", "bin"],
         cores: &["genesis_plus_gx", "picodrive"],
+    },
+    System {
+        dir: "sms",
+        name: "Sega Master System",
+        thumb_repo: "Sega - Master System - Mark III",
+        extensions: &["sms"],
+        cores: &["genesis_plus_gx", "picodrive"],
+    },
+    System {
+        dir: "gg",
+        name: "Sega Game Gear",
+        thumb_repo: "Sega - Game Gear",
+        extensions: &["gg"],
+        cores: &["genesis_plus_gx"],
+    },
+    System {
+        dir: "saturn",
+        name: "Sega Saturn",
+        thumb_repo: "Sega - Saturn",
+        extensions: &["chd", "cue", "m3u"],
+        cores: &["mednafen_saturn", "kronos", "yabause"],
+    },
+    System {
+        dir: "dreamcast",
+        name: "Sega Dreamcast",
+        thumb_repo: "Sega - Dreamcast",
+        extensions: &["chd", "cdi", "gdi", "m3u"],
+        cores: &["flycast"],
+    },
+    System {
+        dir: "pcengine",
+        name: "PC Engine",
+        thumb_repo: "NEC - PC Engine - TurboGrafx 16",
+        extensions: &["pce", "chd", "cue", "m3u"],
+        cores: &["mednafen_pce", "mednafen_pce_fast"],
     },
     System {
         dir: "n64",
@@ -90,8 +128,29 @@ const SYSTEMS: [System; 8] = [
         dir: "psx",
         name: "PlayStation",
         thumb_repo: "Sony - PlayStation",
-        extensions: &["chd", "cue", "pbp"],
+        extensions: &["chd", "cue", "pbp", "m3u"],
         cores: &["swanstation", "mednafen_psx_hw", "mednafen_psx"],
+    },
+    System {
+        dir: "psp",
+        name: "PlayStation Portable",
+        thumb_repo: "Sony - PlayStation Portable",
+        extensions: &["iso", "cso", "chd", "pbp"],
+        cores: &["ppsspp"],
+    },
+    System {
+        dir: "arcade",
+        name: "Arcade",
+        thumb_repo: "MAME",
+        extensions: &["zip", "chd"],
+        cores: &["mame", "fbneo", "mame2003_plus"],
+    },
+    System {
+        dir: "dos",
+        name: "MS-DOS",
+        thumb_repo: "DOS",
+        extensions: &["zip", "exe", "bat", "conf"],
+        cores: &["dosbox_pure", "dosbox_core"],
     },
 ];
 
@@ -101,6 +160,9 @@ struct CatalogEntry {
     filename: String,
     url: String,
     art: Option<String>,
+    /// Optional lowercase-hex sha256; when present the download is verified
+    /// against it and the install fails on mismatch (No-Intro/Redump style).
+    sha256: Option<String>,
 }
 
 pub struct Retro {
@@ -130,6 +192,26 @@ impl Retro {
 
     fn rom_path(&self, system_dir: &str, filename: &str) -> PathBuf {
         self.rom_dir.join(system_dir).join(filename)
+    }
+
+    /// Builds the ROM path for launch and confirms it stays inside the
+    /// system's directory — guards against a crafted id (`..`, absolute path,
+    /// path separators) escaping the ROM tree.
+    fn safe_rom_path(&self, system_dir: &str, filename: &str) -> Result<PathBuf, String> {
+        let system_root = self.rom_dir.join(system_dir);
+        let rom = system_root.join(filename);
+        // Compare against the canonicalized system dir so symlinks and `..`
+        // can't point the ROM outside it.
+        let root = system_root
+            .canonicalize()
+            .map_err(|_| format!("no ROMs for '{system_dir}'"))?;
+        let real = rom
+            .canonicalize()
+            .map_err(|_| format!("{filename} is not installed"))?;
+        if !real.starts_with(&root) {
+            return Err(format!("bad rom id '{filename}'"));
+        }
+        Ok(real)
     }
 
     fn installed(&self) -> Vec<ContentItem> {
@@ -214,22 +296,29 @@ impl Source for Retro {
     fn launch(&self, item_id: &str) -> Result<(), String> {
         let (system_dir, filename) = parse_id(item_id)?;
         let system = system_for_dir(system_dir)?;
-        let rom = self.rom_path(system_dir, filename);
-        if !rom.exists() {
-            return Err(format!("{filename} is not installed"));
-        }
+        // Canonicalizes and verifies the ROM stays under its system dir.
+        let rom = self.safe_rom_path(system_dir, filename)?;
         let retroarch = find_retroarch().ok_or(
             "RetroArch not found — install it: flatpak install flathub org.libretro.RetroArch",
         )?;
-        let core = find_core(&retroarch, system).ok_or_else(|| {
-            format!(
-                "No {} core installed — in RetroArch: Online Updater → Core Downloader → {}",
-                system.name, system.cores[0]
-            )
-        })?;
-        retroarch
-            .run(&["-f", "-L", &core.to_string_lossy(), &rom.to_string_lossy()])
-            .map_err(|e| format!("could not start RetroArch: {e}"))
+        // Prefer one of the system's known cores; if none is installed, let
+        // RetroArch pick its own core association rather than hard-erroring.
+        match find_core(&retroarch, system) {
+            Some(core) => retroarch
+                .run(&["-f", "-L", &core.to_string_lossy(), &rom.to_string_lossy()])
+                .map_err(|e| format!("could not start RetroArch: {e}")),
+            None => {
+                crate::log_warn!(
+                    "no known {} core installed — letting RetroArch pick its default \
+                     (install one of: {})",
+                    system.name,
+                    system.cores.join(", ")
+                );
+                retroarch
+                    .run(&["-f", &rom.to_string_lossy()])
+                    .map_err(|e| format!("could not start RetroArch: {e}"))
+            }
+        }
     }
 
     fn install(&self, item_id: &str, jobs: &InstallManager) -> Result<(), String> {
@@ -244,16 +333,33 @@ impl Source for Retro {
             &entry.title,
             entry.url.clone(),
             self.rom_path(system_dir, filename),
+            entry.sha256.clone(),
         )
     }
 }
 
 /// "rom:gb/Libbet and the Magic Floor.gb" → ("gb", "Libbet and the Magic Floor.gb")
+///
+/// The filename is a single path component: reject anything containing a path
+/// separator, `..`, or that looks absolute, so a crafted id can't reference a
+/// file outside its system directory.
 fn parse_id(item_id: &str) -> Result<(&str, &str), String> {
-    item_id
+    let (system_dir, filename) = item_id
         .strip_prefix("rom:")
         .and_then(|rest| rest.split_once('/'))
-        .ok_or_else(|| format!("bad rom id '{item_id}'"))
+        .ok_or_else(|| format!("bad rom id '{item_id}'"))?;
+    let unsafe_component = |s: &str| {
+        s.is_empty()
+            || s == ".."
+            || s == "."
+            || s.contains('/')
+            || s.contains('\\')
+            || s.contains('\0')
+    };
+    if unsafe_component(system_dir) || unsafe_component(filename) {
+        return Err(format!("bad rom id '{item_id}'"));
+    }
+    Ok((system_dir, filename))
 }
 
 fn system_for_dir(dir: &str) -> Result<&'static System, String> {
@@ -275,22 +381,32 @@ impl RetroArch {
         match self {
             RetroArch::Native => vec![
                 Path::new(&home).join(".config/retroarch/cores"),
+                Path::new(&home).join(".local/share/libretro/cores"),
+                Path::new(&home).join(".local/lib/libretro"),
                 PathBuf::from("/usr/lib/libretro"),
                 PathBuf::from("/usr/lib64/libretro"),
+                PathBuf::from("/usr/local/lib/libretro"),
+                PathBuf::from("/app/lib/libretro"), // some flatpak runtimes
             ],
-            RetroArch::Flatpak => {
-                vec![Path::new(&home).join(".var/app/org.libretro.RetroArch/config/retroarch/cores")]
-            }
+            RetroArch::Flatpak => vec![
+                Path::new(&home)
+                    .join(".var/app/org.libretro.RetroArch/config/retroarch/cores"),
+                Path::new(&home)
+                    .join(".var/app/org.libretro.RetroArch/.config/retroarch/cores"),
+            ],
         }
     }
 
     fn run(&self, args: &[&str]) -> std::io::Result<()> {
+        // Route the emulator through the gamescope wrapper so it inherits the
+        // per-item TV profile (resolution/FSR/frame cap) when in the TV session;
+        // no-ops to a direct spawn in windowed/app mode.
         match self {
-            RetroArch::Native => launcher::spawn_detached("retroarch", args),
+            RetroArch::Native => launcher::spawn_detached_game("retroarch", args, &[]),
             RetroArch::Flatpak => {
                 let mut all = vec!["run", "org.libretro.RetroArch"];
                 all.extend(args);
-                launcher::spawn_detached("flatpak", &all)
+                launcher::spawn_detached_game("flatpak", &all, &[])
             }
         }
     }
@@ -343,9 +459,27 @@ fn thumbnail_url(thumb_repo: &str, game_name: &str) -> String {
         .collect();
     format!(
         "https://thumbnails.libretro.com/{}/Named_Boxarts/{}.png",
-        percent_encode(thumb_repo),
-        percent_encode(&safe)
+        encode_libretro(thumb_repo),
+        encode_libretro(&safe)
     )
+}
+
+/// Percent-encode a libretro thumbnail path segment. Matches the CDN's own
+/// convention: unreserved chars plus parentheses are left literal (No-Intro
+/// names like `(Japan)` appear verbatim in the URL); everything else — spaces
+/// especially — is percent-encoded. This intentionally differs from the strict
+/// RFC-3986 [`crate::util::percent_encode`], which would escape `(`/`)`.
+fn encode_libretro(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'(' | b')' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn parse_manifest(json: &str) -> Vec<CatalogEntry> {
@@ -364,6 +498,10 @@ fn parse_manifest(json: &str) -> Vec<CatalogEntry> {
                 filename: e.get("filename")?.as_str()?.to_string(),
                 url: e.get("url")?.as_str()?.to_string(),
                 art: e.get("art").and_then(|a| a.as_str()).map(String::from),
+                sha256: e
+                    .get("sha256")
+                    .and_then(|a| a.as_str())
+                    .map(|s| s.to_ascii_lowercase()),
             };
             // Only accept systems we can actually launch.
             system_for_dir(&entry.system).ok()?;
@@ -384,6 +522,18 @@ mod tests {
         );
         assert!(parse_id("rom:no-slash").is_err());
         assert!(parse_id("steam:620").is_err());
+    }
+
+    #[test]
+    fn parse_id_rejects_path_traversal() {
+        // A crafted filename or system dir must never carry path separators or
+        // `..`, so it can't escape the ROM tree.
+        assert!(parse_id("rom:gb/../../../etc/passwd").is_err());
+        assert!(parse_id("rom:gb/sub/rom.gb").is_err());
+        assert!(parse_id("rom:../gb/rom.gb").is_err());
+        assert!(parse_id("rom:gb/..").is_err());
+        assert!(parse_id("rom:gb/").is_err());
+        assert!(parse_id(r"rom:gb/rom\..\..\x.gb").is_err());
     }
 
     #[test]
