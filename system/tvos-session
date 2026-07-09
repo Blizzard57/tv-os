@@ -9,10 +9,52 @@
 # Set TVOS_WINDOWED=1 to get a 1920x1080 window instead of fullscreen.
 set -euo pipefail
 
+# ---- Display resolution ----------------------------------------------------
+# gamescope defaults its output to 1280x720 when no size is given, which looks
+# soft on a modern panel. Drive it at the display's native resolution instead
+# (or an explicit override from Settings → Display, saved to settings.json).
+
+cfg_file() {
+  printf '%s\n' "${TVOS_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tvos}/settings.json"
+}
+
+# "WIDTHxHEIGHT" override from settings.json, if the user set one.
+config_res() {
+  local cfg; cfg="$(cfg_file)"; [ -r "$cfg" ] || return 1
+  local val
+  val=$(sed -n 's/.*"display_resolution"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*x[0-9][0-9]*\)".*/\1/p' "$cfg" | head -n1)
+  [ -n "$val" ] && { printf '%s\n' "$val"; return 0; }
+  return 1
+}
+
+# The display's native (preferred) mode — first line of a connected output's
+# DRM modes list, e.g. "3840x2160".
+native_res() {
+  local m first
+  for m in /sys/class/drm/*/modes; do
+    [ -r "$m" ] || continue
+    IFS= read -r first < "$m" 2>/dev/null || continue
+    case "$first" in
+      [0-9]*x[0-9]*) printf '%s\n' "$first"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# HDR requested in Settings?
+config_hdr() {
+  local cfg; cfg="$(cfg_file)"; [ -r "$cfg" ] || return 1
+  grep -Eq '"display_hdr"[[:space:]]*:[[:space:]]*true' "$cfg"
+}
+
 if [ "${TVOS_WINDOWED:-0}" = "1" ]; then
   ARGS=(-W 1920 -H 1080)
 else
   ARGS=(-f)
+  if RES="$(config_res || native_res)"; then
+    ARGS+=(-W "${RES%x*}" -H "${RES#*x}")
+  fi
+  config_hdr && ARGS+=(--hdr-enabled)
 fi
 
 exec gamescope "${ARGS[@]}" -- /usr/local/bin/tvos-shell

@@ -36,6 +36,14 @@ pub struct Settings {
     /// UI accent color as a hex string (e.g. "#4f8cff"); empty = the default.
     #[serde(default)]
     pub accent: String,
+    /// Fullscreen output resolution as "WIDTHxHEIGHT" (e.g. "1920x1080");
+    /// empty = follow the display's native resolution. Read by the gamescope
+    /// launch scripts (see system/tvos-session, system/tvos-app).
+    #[serde(default)]
+    pub display_resolution: String,
+    /// Ask gamescope to enable HDR output on capable displays.
+    #[serde(default)]
+    pub display_hdr: bool,
     /// YouTube channels to follow (@handles or channel URLs, comma/space
     /// separated). Each becomes a home row via yt-dlp — no API key needed.
     #[serde(default)]

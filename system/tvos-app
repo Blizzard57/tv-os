@@ -10,6 +10,35 @@
 #                     (controller / FSR / HDR), if gamescope is installed
 set -euo pipefail
 
+# ---- Display resolution (fullscreen / --tv mode) --------------------------
+# gamescope defaults to 1280x720 when unsized; drive it at the display's native
+# resolution instead (or an override from Settings → Display).
+cfg_file() {
+  printf '%s\n' "${TVOS_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tvos}/settings.json"
+}
+config_res() {
+  local cfg; cfg="$(cfg_file)"; [ -r "$cfg" ] || return 1
+  local val
+  val=$(sed -n 's/.*"display_resolution"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*x[0-9][0-9]*\)".*/\1/p' "$cfg" | head -n1)
+  [ -n "$val" ] && { printf '%s\n' "$val"; return 0; }
+  return 1
+}
+native_res() {
+  local m first
+  for m in /sys/class/drm/*/modes; do
+    [ -r "$m" ] || continue
+    IFS= read -r first < "$m" 2>/dev/null || continue
+    case "$first" in
+      [0-9]*x[0-9]*) printf '%s\n' "$first"; return 0 ;;
+    esac
+  done
+  return 1
+}
+config_hdr() {
+  local cfg; cfg="$(cfg_file)"; [ -r "$cfg" ] || return 1
+  grep -Eq '"display_hdr"[[:space:]]*:[[:space:]]*true' "$cfg"
+}
+
 URL="http://127.0.0.1:8484"
 TVOSD="${TVOSD:-$HOME/.local/bin/tvosd}"
 [ -x "$TVOSD" ] || TVOSD="$(command -v tvosd || echo "$TVOSD")"
@@ -84,7 +113,12 @@ COMMON=(
 # 3. Launch. Foreground so window-close runs the cleanup trap.
 if [ "$tv_mode" = 1 ]; then
   if command -v gamescope >/dev/null 2>&1; then
-    gamescope -f -- "${BROWSER[@]}" "${COMMON[@]}" --start-fullscreen
+    GS=(gamescope -f)
+    if RES="$(config_res || native_res)"; then
+      GS+=(-W "${RES%x*}" -H "${RES#*x}")
+    fi
+    config_hdr && GS+=(--hdr-enabled)
+    "${GS[@]}" -- "${BROWSER[@]}" "${COMMON[@]}" --start-fullscreen
   else
     echo "TV OS: gamescope not installed; opening a fullscreen window instead." >&2
     "${BROWSER[@]}" "${COMMON[@]}" --start-fullscreen

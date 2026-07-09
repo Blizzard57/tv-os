@@ -116,6 +116,10 @@ export interface Settings {
   steam_id: string;
   tmdb_key: string;
   accent: string; // hex; "" means the default accent
+  /** Fullscreen output resolution "WxH" (e.g. "1920x1080"); "" = display native. */
+  display_resolution: string;
+  /** Ask gamescope to enable HDR output on capable displays. */
+  display_hdr: boolean;
   /** YouTube channels to follow (@handles / URLs, comma or space separated). */
   youtube_channels: string;
   /** Use the account signed in inside TV OS for For-you/Subscriptions rows. */

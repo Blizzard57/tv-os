@@ -47,6 +47,8 @@ const BLANK: Settings = {
   steam_id: '',
   tmdb_key: '',
   accent: '',
+  display_resolution: '',
+  display_hdr: false,
   youtube_channels: '',
   youtube_account: false,
   game_region: '',
@@ -288,6 +290,7 @@ export function SettingsPanel({
             <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
             <AddonSection addons={addons} refresh={refreshAddons} reload={reload} openOsk={openOsk} />
             <SourceManifestSection manifests={manifests} refresh={refreshManifests} reload={reload} openOsk={openOsk} />
+            <DisplaySection form={form} update={update} submit={submit} />
             <AppearanceSection
               form={form}
               update={update}
@@ -1019,6 +1022,74 @@ function SourceManifestSection({
           </ul>
         </div>
       ))}
+    </section>
+  );
+}
+
+/** Common fullscreen output modes; "" follows the display's native resolution. */
+const DISPLAY_RESOLUTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Auto (display native)' },
+  { value: '3840x2160', label: '3840 × 2160 · 4K UHD' },
+  { value: '2560x1440', label: '2560 × 1440 · QHD' },
+  { value: '1920x1080', label: '1920 × 1080 · Full HD' },
+  { value: '1280x720', label: '1280 × 720 · HD' },
+];
+
+/// Display output settings for fullscreen (gamescope) mode. Saved immediately;
+/// the launch scripts read them the next time TV OS opens in fullscreen.
+function DisplaySection({
+  form,
+  update,
+  submit,
+}: {
+  form: Settings;
+  update: (patch: Partial<Settings>) => void;
+  submit: SectionProps['submit'];
+}) {
+  const [status, setStatus] = useState<string | null>(null);
+  const resolution = form.display_resolution?.trim() ?? '';
+  const options = DISPLAY_RESOLUTIONS.some((o) => o.value === resolution)
+    ? DISPLAY_RESOLUTIONS
+    : [...DISPLAY_RESOLUTIONS, { value: resolution, label: resolution }];
+
+  const saved = () => setStatus('Saved — applies next time TV OS opens in fullscreen');
+  const setResolution = (value: string) => {
+    update({ display_resolution: value });
+    submit({ display_resolution: value }).then(saved).catch(() => {});
+  };
+  const setHdr = (display_hdr: boolean) => {
+    update({ display_hdr });
+    submit({ display_hdr }).then(saved).catch(() => {});
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Display</h2>
+      <p className="settings-muted">
+        Fullscreen (10-foot) mode renders at your display's native resolution by default.
+        Override it here only if you want a specific mode. Changes take effect the next time
+        TV OS opens in fullscreen.
+      </p>
+      <Field label="Resolution">
+        <select value={resolution} onChange={(e) => setResolution(e.target.value)}>
+          {options.map((o) => (
+            <option key={o.value || 'auto'} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </Field>
+      <Field label="HDR">
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={form.display_hdr}
+            onChange={(e) => setHdr(e.target.checked)}
+          />
+          Enable HDR output on capable displays
+        </label>
+      </Field>
+      {status && <p className="settings-status">{status}</p>}
     </section>
   );
 }

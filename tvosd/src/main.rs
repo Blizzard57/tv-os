@@ -630,15 +630,27 @@ struct IdQuery {
 /// Details-page metadata: description, background, and (for series) the full
 /// episode list. Video items resolve through stream addons (Cinemeta etc.);
 /// Steam games use the public storefront API; others return a minimal stub.
-async fn get_meta(Query(q): Query<IdQuery>) -> Json<media::Meta> {
+async fn get_meta(State(app): State<Shared>, Query(q): Query<IdQuery>) -> Json<media::Meta> {
+    // The item's title (for games with no storefront of their own — Epic/GOG —
+    // used to borrow metadata from Steam by name).
+    let title = title_in_library(&app.cached_library(), &q.id);
     let meta = join_or_default(
         "meta",
-        tokio::task::spawn_blocking(move || meta_for(&q.id)).await,
+        tokio::task::spawn_blocking(move || meta_for(&q.id, title.as_deref())).await,
     );
     Json(meta)
 }
 
-fn meta_for(id: &str) -> media::Meta {
+/// The title of a library item by id, if it's currently in the cached library.
+fn title_in_library(library: &[model::Row], id: &str) -> Option<String> {
+    library
+        .iter()
+        .flat_map(|r| &r.items)
+        .find(|i| i.id == id)
+        .map(|i| i.title.clone())
+}
+
+fn meta_for(id: &str, title: Option<&str>) -> media::Meta {
     let prefix = id.split(':').next().unwrap_or_default();
     match prefix {
         "strm" | "tmdb" => sources::resolve_video(id)
@@ -673,11 +685,30 @@ fn meta_for(id: &str) -> media::Meta {
                 ..Default::default()
             },
         ),
-        other => media::Meta {
-            id: id.to_string(),
-            kind: if other == "video" { "movie" } else { "game" }.to_string(),
-            ..Default::default()
-        },
+        // Owned games from stores without a storefront API of their own
+        // (Epic, GOG, retro/homebrew). Borrow rich metadata — description,
+        // screenshots, genres and the stylized logo — from Steam by matching
+        // the title, so their details page isn't a bare stub.
+        other => {
+            let kind = if other == "video" { "movie" } else { "game" };
+            if kind == "game" {
+                if let Some(t) = title.filter(|t| !t.is_empty()) {
+                    if let Some(appid) = sources::steam::store_search(t) {
+                        if let Some(mut m) = sources::steam::store_meta(&appid.to_string()) {
+                            m.id = id.to_string(); // keep the owned id, not the Steam one
+                            m.title = t.to_string(); // and the title as the library shows it
+                            return m;
+                        }
+                    }
+                }
+            }
+            media::Meta {
+                id: id.to_string(),
+                kind: kind.to_string(),
+                title: title.unwrap_or_default().to_string(),
+                ..Default::default()
+            }
+        }
     }
 }
 

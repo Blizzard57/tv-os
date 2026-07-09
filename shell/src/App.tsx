@@ -11,10 +11,8 @@ import {
   fetchLibrary,
   fetchMeta,
   fetchSettings,
-  openUrl,
   saveSettings,
 } from './api';
-import { SYS_OPEN, SYS_SETTINGS, useAppsShelf } from './AppsTab';
 import { DetailsPage } from './DetailsPage';
 import { Hero } from './Hero';
 import { NavAction, useTvInput } from './input';
@@ -56,6 +54,8 @@ const BLANK_SETTINGS: Settings = {
   steam_id: '',
   tmdb_key: '',
   accent: '',
+  display_resolution: '',
+  display_hdr: false,
   youtube_channels: '',
   youtube_account: false,
   game_region: '',
@@ -91,7 +91,6 @@ const EMPTY_TAB_COPY: Record<TabId, string> = {
   live: 'Nothing live right now — follow a channel or connect YouTube in Settings.',
   movies: 'No movies yet — add a TMDB key in Settings to fill this tab.',
   shows: 'No shows yet — add a TMDB key in Settings to fill this tab.',
-  apps: '',
   library: 'Your library is empty — connect Steam, Epic or GOG, or start watching to fill it.',
 };
 
@@ -113,15 +112,9 @@ export default function App() {
   const pushDetails = useCallback((item: ContentItem) => setDetailsStack((s) => [...s, item]), []);
   const popDetails = useCallback(() => setDetailsStack((s) => s.slice(0, -1)), []);
   const { jobs, refresh: refreshJobs } = useInstallJobs(() => loadLibrary());
-  const appsShelf = useAppsShelf();
 
-  // The shelves visible under the active tab: the tab's kind-filtered rows,
-  // plus the synthesized apps/sources shelf when on the Apps tab.
-  const shelves = useMemo<Row[]>(() => {
-    const base = rowsForTab(activeTab, rows ?? []);
-    if (activeTab === 'apps' && appsShelf) return [appsShelf, ...base];
-    return base;
-  }, [activeTab, rows, appsShelf]);
+  // The shelves visible under the active tab: the tab's kind-filtered rows.
+  const shelves = useMemo<Row[]>(() => rowsForTab(activeTab, rows ?? []), [activeTab, rows]);
 
   // Which tabs currently have anything to show (dims empty tabs in the bar).
   const enabledTabs = useMemo(() => {
@@ -228,16 +221,8 @@ export default function App() {
     gridReturn.current = { zone: 'rows', row: 0, col: 0 };
   }, []);
 
-  // Confirm on a card: system tiles route to Settings / an external URL;
-  // everything else opens its details page.
-  const activateItem = useCallback(
-    (item: ContentItem) => {
-      if (item.id === SYS_SETTINGS) setSettingsOpen(true);
-      else if (item.id.startsWith(SYS_OPEN)) openUrl(item.id.slice(SYS_OPEN.length)).catch(() => {});
-      else pushDetails(item);
-    },
-    [pushDetails],
-  );
+  // Confirm on a card opens its details page.
+  const activateItem = useCallback((item: ContentItem) => pushDetails(item), [pushDetails]);
 
   const activateTop = useCallback(
     (col: number) => {

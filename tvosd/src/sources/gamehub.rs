@@ -521,7 +521,7 @@ fn cheapshark(title: &str, region: &str) -> Vec<(f64, Stream)> {
 /// after normalization, or a prefix whose remainder is an edition-style
 /// suffix ("Ultimate Edition", "GOTY") — but not a different game that
 /// happens to share a name prefix ("Celeste" vs "Celeste Classic 2").
-fn similar_title(a: &str, b: &str) -> bool {
+pub(crate) fn similar_title(a: &str, b: &str) -> bool {
     let norm = |s: &str| {
         s.to_lowercase()
             .chars()

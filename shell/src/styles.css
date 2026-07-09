@@ -372,13 +372,13 @@ body {
 }
 
 .shelf {
-  padding: 14px 0 10px;
-  scroll-margin-top: calc(var(--topbar-h) + var(--safe-top) + 12px);
-  scroll-margin-bottom: 32px;
+  padding: 6px 0 6px;
+  scroll-margin-top: calc(var(--topbar-h) + var(--safe-top) + 24px);
+  scroll-margin-bottom: 40px;
 }
 
 .shelf-title {
-  margin: 0 var(--edge) 12px;
+  margin: 0 var(--edge) 4px;
   font-size: 20px;
   font-weight: 500;
   color: var(--text-dim);
@@ -389,10 +389,13 @@ body {
   color: var(--text);
 }
 
+/* The strip scrolls horizontally, which makes the browser clip the cross-axis
+   too — so the focus ring + 1.09 lift needs real vertical breathing room baked
+   into the padding, or it gets cropped top and bottom. */
 .shelf-strip {
   display: flex;
   gap: 16px;
-  padding: 8px var(--edge) 26px;
+  padding: 24px var(--edge) 28px;
   overflow-x: auto;
   overflow-y: hidden;
   scroll-behavior: smooth;
@@ -1057,7 +1060,7 @@ textarea:focus-visible {
   display: flex;
   gap: 14px;
   overflow-x: auto;
-  padding-bottom: 8px;
+  padding: 12px 0;
   scrollbar-width: none;
 }
 
@@ -1414,7 +1417,7 @@ textarea:focus-visible {
   display: flex;
   gap: 16px;
   overflow-x: auto;
-  padding-bottom: 8px;
+  padding: 14px 0 10px;
   scrollbar-width: none;
 }
 

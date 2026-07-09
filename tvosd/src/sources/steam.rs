@@ -176,6 +176,9 @@ fn parse_store_meta(appid: &str, json: &str) -> Option<crate::media::Meta> {
             .unwrap_or_default()
             .to_string(),
         poster: Some(art_url(appid)),
+        // Steam's stylized title treatment. Not every app has one; the UI
+        // hides it and shows the plain title if the image 404s.
+        logo: Some(logo_url(appid)),
         background: data
             .get("background_raw")
             .and_then(|b| b.as_str())
@@ -378,6 +381,28 @@ fn owned_item(game: &Value) -> Option<ContentItem> {
 /// Public Steam CDN poster art; the UI falls back to a placeholder on 404.
 pub fn art_url(appid: impl std::fmt::Display) -> String {
     format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg")
+}
+
+/// Steam's stylized logo (title treatment) shown in the details hero.
+pub fn logo_url(appid: impl std::fmt::Display) -> String {
+    format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/logo.png")
+}
+
+/// Best-effort Steam appid for a title, via the public storesearch endpoint.
+/// Used to borrow rich metadata (description, screenshots, logo) for games
+/// owned on Epic/GOG, which have no storefront of their own. Guarded by a
+/// loose title match so a wildly different result is rejected.
+pub fn store_search(title: &str) -> Option<i64> {
+    let url = format!(
+        "https://store.steampowered.com/api/storesearch/?term={}&cc=US&l=english",
+        percent_encode(title)
+    );
+    let v: Value = serde_json::from_str(&addons::http_get(&url).ok()?).ok()?;
+    v.get("items")?.as_array()?.iter().find_map(|it| {
+        let name = it.get("name")?.as_str()?;
+        let id = it.get("id")?.as_i64()?;
+        crate::sources::gamehub::similar_title(title, name).then_some(id)
+    })
 }
 
 // ---- Per-game stats for the details page (playtime, achievements) ----------
