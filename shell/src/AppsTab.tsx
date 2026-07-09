@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ContentItem, Row, fetchAddons, fetchSourceManifests } from './api';
+import { APPS_SHELF_TITLE } from './cards';
 
 // Synthetic-item id prefixes used only by the Apps tab's "apps & sources"
 // shelf. App recognises these on confirm and routes them to Settings / an
@@ -35,7 +36,7 @@ export function useAppsShelf(): Row | null {
           if (man.source_url) items.push(tile(SYS_OPEN + man.source_url, man.name));
         }
       }
-      setRow({ title: 'Your apps & sources', items });
+      setRow({ title: APPS_SHELF_TITLE, items });
     });
     return () => {
       cancelled = true;

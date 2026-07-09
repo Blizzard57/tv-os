@@ -4,7 +4,8 @@ import { TABS, TabId } from './tabs';
 
 // Top-bar focus order: [search, ...tabs, settings, theme]. App drives focus
 // with a single index into this order; these helpers keep App and TopBar in
-// agreement about what each index means.
+// agreement about what each index means. The profile avatar on the far left is
+// decorative chrome (like Google TV's account chip) and takes no focus.
 export const SEARCH_INDEX = 0;
 export const FIRST_TAB_INDEX = 1;
 export const SETTINGS_INDEX = FIRST_TAB_INDEX + TABS.length;
@@ -28,9 +29,10 @@ interface Props {
   onToggleTheme: () => void;
 }
 
-/** The Google-TV top navigation: search, the content tabs, then settings, a
- *  theme toggle and the clock. Purely presentational — App owns focus and
- *  routing; clicks call the same handlers a controller's confirm would. */
+/** The Google-TV top navigation: a profile chip, a Search pill, the content
+ *  tabs, then the clock, settings and a theme toggle. Purely presentational —
+ *  App owns focus and routing; clicks call the same handlers a controller's
+ *  confirm would. */
 export function TopBar({
   activeTab,
   focusIndex,
@@ -44,12 +46,17 @@ export function TopBar({
   const f = (i: number) => (focusIndex === i ? 'top-focused' : '');
   return (
     <header className="topbar">
+      <div className="top-avatar" aria-hidden="true">
+        <span>K</span>
+      </div>
+
       <button
-        className={`top-icon top-search ${f(SEARCH_INDEX)}`}
+        className={`top-pill top-search ${f(SEARCH_INDEX)}`}
         onClick={onSearch}
         aria-label="Search"
       >
-        <span className="top-icon-glyph">⌕</span>
+        <span className="top-search-glyph">⌕</span>
+        <span className="top-search-label">Search</span>
       </button>
 
       <nav className="top-tabs">
@@ -69,6 +76,7 @@ export function TopBar({
       </nav>
 
       <div className="top-right">
+        <Clock />
         <button
           className={`top-icon ${f(SETTINGS_INDEX)}`}
           onClick={onSettings}
@@ -83,7 +91,6 @@ export function TopBar({
         >
           <span className="top-icon-glyph">{theme === 'dark' ? '◐' : '◑'}</span>
         </button>
-        <Clock />
       </div>
     </header>
   );

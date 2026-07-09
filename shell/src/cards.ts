@@ -38,7 +38,7 @@ export const isWideRow = (items: ContentItem[]): boolean =>
 export type ShelfLayout = 'landscape' | 'poster';
 
 const CONTINUE = /continue/i;
-export const APPS_SHELF_TITLE = 'Your apps & sources';
+export const APPS_SHELF_TITLE = 'Your apps';
 
 /** Which card shape a shelf uses, the way Google TV does: 16:9 landscape for
  *  Continue watching, all-video (YouTube), and the apps/sources shelf; 2:3
