@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ApiError,
   ContentItem,
@@ -11,45 +11,36 @@ import {
   fetchLibrary,
   fetchMeta,
   fetchSettings,
+  openUrl,
   saveSettings,
 } from './api';
-import { DesktopHome } from './DesktopHome';
+import { SYS_OPEN, SYS_SETTINGS, useAppsShelf } from './AppsTab';
 import { DetailsPage } from './DetailsPage';
+import { Hero } from './Hero';
 import { NavAction, useTvInput } from './input';
-import { MediaRow, colsFor, navLength, shownCount } from './MediaRow';
 import { SearchOverlay } from './SearchOverlay';
-import { SectionPage } from './SectionPage';
 import { SettingsPanel } from './SettingsPanel';
+import { Shelf } from './Shelf';
 import {
-  Theme,
-  UiMode,
-  applyAccent,
-  applyMode,
-  applyTheme,
-  initialMode,
-  initialTheme,
-  otherMode,
-  otherTheme,
-} from './theme';
+  FIRST_TAB_INDEX,
+  SEARCH_INDEX,
+  SETTINGS_INDEX,
+  THEME_INDEX,
+  TOPBAR_COUNT,
+  TopBar,
+  tabIndex,
+} from './TopBar';
+import { TABS, TabId, rowsForTab, tabHasContent } from './tabs';
+import { Theme, applyAccent, applyTheme, initialTheme, otherTheme } from './theme';
 
-// Focus is simply "which row, which column". Each row remembers its own
-// column so moving up/down returns you to where you were in that row.
-// Row -1 is the left sidebar: press ◀ at the first column to reach it; its
-// entries are part of the same d-pad grid (col = entry index, top to bottom).
+// Focus lives in one of two zones. In `topbar`, `col` is an index into
+// [search, ...tabs, settings, theme]. In `rows`, `row` is the shelf and `col`
+// the card. Each remembers its own spot so leaving and returning is seamless.
 interface Focus {
+  zone: 'topbar' | 'rows';
   row: number;
   col: number;
 }
-
-/** Sidebar entries, top to bottom. Collapsed it shows icons; focusing (or
- *  hovering) it expands to icons + labels. */
-const SIDEBAR_ITEMS = [
-  { id: 'search', icon: '⌕', label: 'Search' },
-  { id: 'settings', icon: '⚙', label: 'Settings' },
-  { id: 'theme', icon: '◐', label: 'Theme' },
-  { id: 'enhance', icon: '✦', label: 'Enhance' },
-  { id: 'desktop', icon: '🖥', label: 'Desktop layout' },
-] as const;
 
 const ENHANCE_CYCLE: EnhanceMode[] = ['auto', 'quality', 'performance', 'off'];
 const ENHANCE_LABELS: Record<EnhanceMode, string> = {
@@ -92,49 +83,68 @@ function errorKind(e: unknown): LoadError {
 const ERROR_COPY: Record<LoadError, string> = {
   offline: "You're offline. Check the network connection and try again.",
   timeout: "Couldn't reach TV OS in time. It may still be starting up.",
-  generic: "Something went wrong loading your library.",
+  generic: 'Something went wrong loading your library.',
+};
+
+const EMPTY_TAB_COPY: Record<TabId, string> = {
+  foryou: '',
+  movies: 'No movies yet — add a TMDB key in Settings to fill this tab.',
+  shows: 'No shows yet — add a TMDB key in Settings to fill this tab.',
+  games: 'No games yet — connect Steam, Epic or GOG in Settings.',
+  apps: '',
 };
 
 export default function App() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [error, setError] = useState<LoadError | null>(null);
-  const [focus, setFocus] = useState<Focus>({ row: 0, col: 0 });
+  const [activeTab, setActiveTab] = useState<TabId>('foryou');
+  const [focus, setFocus] = useState<Focus>({ zone: 'rows', row: 0, col: 0 });
   const [toast, setToast] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [mode, setMode] = useState<UiMode>(initialMode);
   const [settings, setSettings] = useState<Settings>(BLANK_SETTINGS);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  // "Show all" page for one home section (expand tile).
-  const [expandedRow, setExpandedRow] = useState<Row | null>(null);
   // Details pages form a stack so "More like this" hops can be walked back
   // with B, one page at a time, all the way home.
   const [detailsStack, setDetailsStack] = useState<ContentItem[]>([]);
   const detailsItem = detailsStack.length > 0 ? detailsStack[detailsStack.length - 1] : null;
-  const pushDetails = useCallback(
-    (item: ContentItem) => setDetailsStack((s) => [...s, item]),
-    [],
-  );
+  const pushDetails = useCallback((item: ContentItem) => setDetailsStack((s) => [...s, item]), []);
   const popDetails = useCallback(() => setDetailsStack((s) => s.slice(0, -1)), []);
   const { jobs, refresh: refreshJobs } = useInstallJobs(() => loadLibrary());
-  // Where to land when leaving the sidebar (the grid spot you came from).
-  const gridReturn = useRef<Focus>({ row: 0, col: 0 });
+  const appsShelf = useAppsShelf();
+
+  // The shelves visible under the active tab: the tab's kind-filtered rows,
+  // plus the synthesized apps/sources shelf when on the Apps tab.
+  const shelves = useMemo<Row[]>(() => {
+    const base = rowsForTab(activeTab, rows ?? []);
+    if (activeTab === 'apps' && appsShelf) return [appsShelf, ...base];
+    return base;
+  }, [activeTab, rows, appsShelf]);
+
+  // Which tabs currently have anything to show (dims empty tabs in the bar).
+  const enabledTabs = useMemo(() => {
+    const set = new Set<TabId>();
+    for (const t of TABS) if (tabHasContent(t.id, rows ?? [])) set.add(t.id);
+    return set;
+  }, [rows]);
+
+  // Where to land in the rows when dropping down from the top bar.
+  const gridReturn = useRef<Focus>({ zone: 'rows', row: 0, col: 0 });
   const toastTimer = useRef<number>();
   // Overlays register their nav handlers here; App forwards input while open.
   const detailsActionRef = useRef<((a: NavAction) => void) | null>(null);
   const settingsActionRef = useRef<((a: NavAction) => void) | null>(null);
   const searchActionRef = useRef<((a: NavAction) => void) | null>(null);
-  const sectionActionRef = useRef<((a: NavAction) => void) | null>(null);
-  // Mirror of `focus` for event handlers: 'confirm' must read the current
-  // position without doing side effects inside a setState updater (React
-  // double-invokes updaters in dev to assert purity).
+  // Mirrors read inside event handlers (avoid stale closures / setState purity).
   const focusRef = useRef(focus);
   focusRef.current = focus;
+  const shelvesRef = useRef(shelves);
+  shelvesRef.current = shelves;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
 
   const loadLibrary = useCallback(() => {
-    // fetchLibrary already applies a timeout (and retries) per request, so this
-    // resolves or rejects in bounded time — the Loading… state can't hang.
     setError(null);
     fetchLibrary()
       .then((r) => {
@@ -146,7 +156,6 @@ export default function App() {
 
   useEffect(loadLibrary, [loadLibrary]);
   useEffect(() => applyTheme(theme), [theme]);
-  useEffect(() => applyMode(mode), [mode]);
   useEffect(() => applyAccent(settings.accent), [settings.accent]);
   useEffect(() => {
     fetchSettings()
@@ -154,11 +163,10 @@ export default function App() {
         setSettings({ ...BLANK_SETTINGS, ...s });
         setSettingsLoaded(true);
       })
-      .catch(() => {}); // daemon default is shown until it answers
+      .catch(() => {});
   }, []);
 
-  // Refetch settings + library after the panel changes something, so the
-  // home screen and the Enhance chip reflect it immediately.
+  // Refetch settings + library after the panel changes something.
   const reloadAll = useCallback(() => {
     fetchSettings()
       .then((s) => setSettings({ ...BLANK_SETTINGS, ...s }))
@@ -166,44 +174,40 @@ export default function App() {
     loadLibrary();
   }, [loadLibrary]);
 
-  // Library refreshes can shrink or reorder rows (e.g. an installed game
-  // moves from "Ready to Install" into "Games") — keep focus in bounds.
+  // Keep focus in bounds when the visible shelves change (library refresh or
+  // tab switch can shrink/replace them).
   useEffect(() => {
-    if (!rows || rows.length === 0) return;
     setFocus((f) => {
-      if (f.row < 0) return f; // sidebar focus is independent of the rows
-      const row = Math.min(f.row, rows.length - 1);
-      const col = Math.min(f.col, Math.max(0, navLength(rows[row]) - 1));
-      return row === f.row && col === f.col ? f : { row, col };
+      if (f.zone !== 'rows') return f;
+      if (shelves.length === 0) return { zone: 'rows', row: 0, col: 0 };
+      const row = Math.min(f.row, shelves.length - 1);
+      const len = shelves[row].items.length;
+      const col = Math.min(f.col, Math.max(0, len - 1));
+      return row === f.row && col === f.col ? f : { zone: 'rows', row, col };
     });
-  }, [rows]);
+  }, [shelves]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
     window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 3000);
   }, []);
-
-  // Don't leave a pending toast timeout firing setState after unmount.
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
-  // Refreshes background data after a play/install (recommender rows, jobs).
   const onPlayed = useCallback(() => {
     reloadAll();
     refreshJobs();
   }, [reloadAll, refreshJobs]);
 
-  const toggleMode = useCallback(() => {
-    setMode((m) => {
-      const next = otherMode(m);
-      showToast(next === 'desktop' ? 'Desktop layout' : 'TV layout');
+  const toggleTheme = useCallback(() => {
+    setTheme((t) => {
+      const next = otherTheme(t);
+      showToast(next === 'light' ? 'Light mode' : 'Dark mode');
       return next;
     });
   }, [showToast]);
 
   const cycleEnhance = useCallback(() => {
-    // Never save before the real settings arrive — a blank form would
-    // overwrite the saved Steam/TMDB keys on disk.
     if (!settingsLoaded) {
       showToast('Settings still loading…');
       return;
@@ -216,206 +220,194 @@ export default function App() {
     saveSettings(updated).catch((e) => showToast(`Could not save: ${e.message}`));
   }, [settings, settingsLoaded, showToast]);
 
+  // Switch tabs (live, as focus moves across the bar). Resets the rows return
+  // spot so dropping into the new tab lands at its first card.
+  const switchTab = useCallback((id: TabId) => {
+    setActiveTab(id);
+    gridReturn.current = { zone: 'rows', row: 0, col: 0 };
+  }, []);
+
+  // Confirm on a card: system tiles route to Settings / an external URL;
+  // everything else opens its details page.
+  const activateItem = useCallback(
+    (item: ContentItem) => {
+      if (item.id === SYS_SETTINGS) setSettingsOpen(true);
+      else if (item.id.startsWith(SYS_OPEN)) openUrl(item.id.slice(SYS_OPEN.length)).catch(() => {});
+      else pushDetails(item);
+    },
+    [pushDetails],
+  );
+
+  const activateTop = useCallback(
+    (col: number) => {
+      if (col === SEARCH_INDEX) setSearchOpen(true);
+      else if (col === SETTINGS_INDEX) setSettingsOpen(true);
+      else if (col === THEME_INDEX) toggleTheme();
+      else {
+        // A tab: switch to it and drop focus into its content.
+        const id = TABS[col - FIRST_TAB_INDEX]?.id;
+        if (id) {
+          switchTab(id);
+          setFocus({ zone: 'rows', row: 0, col: 0 });
+        }
+      }
+    },
+    [switchTab, toggleTheme],
+  );
+
   const onAction = useCallback(
     (action: NavAction) => {
-      // The search overlay owns the keyboard itself; the search key closes it,
-      // and everything else (d-pad, A, B) is forwarded — B first steps out of
-      // deep results, and the overlay closes itself when there's nothing to
-      // step out of.
+      // ---- Overlays own input while open ----
       if (searchOpen) {
         if (action === 'search') setSearchOpen(false);
         else searchActionRef.current?.(action);
         return;
       }
-      // While the Settings panel is open it owns input; B/Start close it, the
-      // rest is forwarded so a controller can walk the panel's controls.
       if (settingsOpen) {
         if (action === 'back' || action === 'settings') setSettingsOpen(false);
         else settingsActionRef.current?.(action);
         return;
       }
-      // While the details page is open it owns input (it closes itself on back).
       if (detailsItem) {
         detailsActionRef.current?.(action);
         return;
       }
-      // "Show all" section page — under details, over the home grid.
-      if (expandedRow) {
-        sectionActionRef.current?.(action);
-        return;
-      }
-      if (action === 'search') {
-        setSearchOpen(true);
-        return;
-      }
-      if (action === 'settings') {
-        setSettingsOpen(true);
-        return;
-      }
-      if (action === 'theme') {
-        const next = otherTheme(theme);
-        setTheme(next);
-        showToast(next === 'light' ? 'Light mode' : 'Dark mode');
-        return;
-      }
-      if (action === 'enhance') {
-        cycleEnhance();
-        return;
-      }
-      // The load-error screen: A/Enter (or ▶) retries the library fetch. The
-      // Retry button is also clickable with a pointer / mouse.
+
+      // ---- Global shortcut buttons (gamepad X/Y/Start, keyboard /,s,t,e) ----
+      if (action === 'search') return setSearchOpen(true);
+      if (action === 'settings') return setSettingsOpen(true);
+      if (action === 'theme') return toggleTheme();
+      if (action === 'enhance') return cycleEnhance();
+
       if (error) {
         if (action === 'confirm') loadLibrary();
         return;
       }
-      if (!rows || rows.length === 0) return;
+      if (!rows) return;
 
-      // Focus is in the left sidebar: ▲▼ walk the entries, A activates,
-      // ▶ / B return to the grid exactly where you left it. This is what
-      // makes Settings & co reachable by d-pad.
-      if (focusRef.current.row < 0) {
-        const col = focusRef.current.col;
+      const f = focusRef.current;
+      const list = shelvesRef.current;
+
+      // ---- Top bar ----
+      if (f.zone === 'topbar') {
         switch (action) {
-          case 'up':
-            setFocus({ row: -1, col: Math.max(0, col - 1) });
+          case 'left': {
+            const col = Math.max(0, f.col - 1);
+            setFocus({ zone: 'topbar', row: 0, col });
+            liveTab(col);
             break;
+          }
+          case 'right': {
+            const col = Math.min(TOPBAR_COUNT - 1, f.col + 1);
+            setFocus({ zone: 'topbar', row: 0, col });
+            liveTab(col);
+            break;
+          }
           case 'down':
-            setFocus({ row: -1, col: Math.min(SIDEBAR_ITEMS.length - 1, col + 1) });
+            if (list.length > 0) {
+              const back = gridReturn.current;
+              const row = Math.min(back.row, list.length - 1);
+              const col = Math.min(back.col, Math.max(0, list[row].items.length - 1));
+              setFocus({ zone: 'rows', row, col });
+            }
             break;
-          case 'right':
-          case 'back': {
-            const back = gridReturn.current;
-            const row = rows[Math.min(back.row, rows.length - 1)];
-            setFocus({
-              row: Math.min(back.row, rows.length - 1),
-              col: Math.min(back.col, navLength(row) - 1),
-            });
+          case 'back':
+            if (activeTabRef.current !== 'foryou') {
+              switchTab('foryou');
+              setFocus({ zone: 'topbar', row: 0, col: tabIndex('foryou') });
+            }
             break;
-          }
-          case 'confirm': {
-            const entry = SIDEBAR_ITEMS[col].id;
-            if (entry === 'search') setSearchOpen(true);
-            else if (entry === 'settings') setSettingsOpen(true);
-            else if (entry === 'theme') {
-              const next = otherTheme(theme);
-              setTheme(next);
-              showToast(next === 'light' ? 'Light mode' : 'Dark mode');
-            } else if (entry === 'desktop') toggleMode();
-            else cycleEnhance();
+          case 'confirm':
+            activateTop(f.col);
             break;
-          }
           default:
             break;
         }
         return;
       }
 
-      if (action === 'confirm') {
-        const f = focusRef.current;
-        const row = rows[f.row];
-        if (!row) return;
-        // The "Show all" tile sits after the shown items.
-        if (row.items.length > shownCount(row) && f.col === shownCount(row)) {
-          setExpandedRow(row);
-          return;
-        }
-        const item = row.items[f.col];
-        if (item) pushDetails(item); // open the details page for every entry
+      // ---- Rows ----
+      const row = list[f.row];
+      if (!row) {
+        // Empty tab: only route back to the bar.
+        if (action === 'up' || action === 'back') setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
         return;
       }
-      if (action === 'back') return;
-      // Sections are wrapped grids (up to 3 lines, `colsFor` per line, an
-      // expand tile at the end) — the d-pad moves by cell and by line.
-      setFocus((f) => {
-        const row = rows[f.row];
-        const cols = colsFor(row);
-        const len = navLength(row);
-        switch (action) {
-          case 'left':
-            // Only the true first cell slides into the sidebar. At the start of
-            // a *wrapped* line (col % cols === 0 but col > 0) step back to the
-            // previous line's last cell instead of jumping to the sidebar.
-            if (f.col === 0) {
-              gridReturn.current = f;
-              return { row: -1, col: 0 };
-            }
-            return { ...f, col: f.col - 1 };
-          case 'right':
-            return { ...f, col: Math.min(len - 1, f.col + 1) };
-          case 'up': {
-            if (f.col - cols >= 0) return { ...f, col: f.col - cols };
-            if (f.row === 0) return f;
-            const prev = rows[f.row - 1];
-            const pcols = colsFor(prev);
-            const plen = navLength(prev);
-            const lastLine = Math.floor((plen - 1) / pcols);
-            return {
-              row: f.row - 1,
-              col: Math.max(0, Math.min(lastLine * pcols + Math.min(f.col % cols, pcols - 1), plen - 1)),
-            };
+      switch (action) {
+        case 'left':
+          setFocus({ ...f, col: Math.max(0, f.col - 1) });
+          break;
+        case 'right':
+          setFocus({ ...f, col: Math.min(row.items.length - 1, f.col + 1) });
+          break;
+        case 'up':
+          if (f.row === 0) {
+            gridReturn.current = f;
+            setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
+          } else {
+            const prev = list[f.row - 1];
+            setFocus({ zone: 'rows', row: f.row - 1, col: Math.min(f.col, prev.items.length - 1) });
           }
-          case 'down': {
-            if (f.col + cols < len) return { ...f, col: f.col + cols };
-            const line = Math.floor(f.col / cols);
-            const lastLine = Math.floor((len - 1) / cols);
-            // A shorter final line still exists below — land on its end.
-            if (line < lastLine) return { ...f, col: len - 1 };
-            if (f.row + 1 >= rows.length) return f;
-            const next = rows[f.row + 1];
-            return {
-              row: f.row + 1,
-              col: Math.max(0, Math.min(Math.min(f.col % cols, colsFor(next) - 1), navLength(next) - 1)),
-            };
+          break;
+        case 'down':
+          if (f.row + 1 < list.length) {
+            const next = list[f.row + 1];
+            setFocus({ zone: 'rows', row: f.row + 1, col: Math.min(f.col, next.items.length - 1) });
           }
-          default:
-            return f;
+          break;
+        case 'confirm': {
+          const item = row.items[f.col];
+          if (item) activateItem(item);
+          break;
         }
-      });
+        case 'back':
+          gridReturn.current = f;
+          setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
+          break;
+        default:
+          break;
+      }
+
+      // Live tab preview while arrowing across the top bar.
+      function liveTab(col: number) {
+        if (col >= FIRST_TAB_INDEX && col < FIRST_TAB_INDEX + TABS.length) {
+          const id = TABS[col - FIRST_TAB_INDEX].id;
+          if (id !== activeTabRef.current) switchTab(id);
+        }
+      }
     },
-    [rows, error, loadLibrary, showToast, theme, settings, settingsLoaded, settingsOpen, searchOpen, detailsItem, expandedRow, cycleEnhance, toggleMode, pushDetails],
+    [
+      rows,
+      error,
+      loadLibrary,
+      searchOpen,
+      settingsOpen,
+      detailsItem,
+      toggleTheme,
+      cycleEnhance,
+      switchTab,
+      activateTop,
+      activateItem,
+    ],
   );
   useTvInput(onAction);
 
-  // While the sidebar is focused, the hero keeps previewing the item you
-  // left the grid on instead of blanking out; on the expand tile it shows
-  // the section's last visible item.
-  const heroRow = focus.row >= 0 ? focus.row : gridReturn.current.row;
-  const heroCol = focus.row >= 0 ? focus.col : gridReturn.current.col;
-  const heroItems = rows?.[heroRow]?.items;
-  const focusedItem: ContentItem | undefined =
-    heroItems && heroItems.length > 0
-      ? heroItems[Math.min(heroCol, heroItems.length - 1)]
-      : undefined;
-  const sbFocus = focus.row < 0 ? focus.col : null;
-  const preview = useHeroPreview(focusedItem);
-  // Images for the preview panel: a game's screenshots, else the backdrop.
-  const previewImages: string[] =
-    preview?.screenshots && preview.screenshots.length > 0
-      ? preview.screenshots.slice(0, 4)
-      : preview?.background
-        ? [preview.background]
-        : [];
-  const previewSub = [
-    preview?.release_info,
-    preview?.runtime,
-    preview?.rating && (focusedItem?.kind === 'game' ? `Metacritic ${preview.rating}` : `★ ${preview.rating}`),
-    preview?.genres?.slice(0, 3).join(', '),
-  ]
-    .filter(Boolean)
-    .join('  ·  ');
+  // The item the hero previews: the focused card, or (on the top bar) the first
+  // card of the active tab.
+  const inRows = focus.zone === 'rows';
+  const heroItem: ContentItem | undefined = inRows
+    ? shelves[Math.min(focus.row, shelves.length - 1)]?.items[focus.col]
+    : shelves[0]?.items[0];
+  const preview = useHeroPreview(heroItem);
 
-  // The chrome (chips, Settings) is always present so the panel is reachable
-  // even on a fresh, empty install. Only the central body changes.
-  let body;
+  const topFocus = focus.zone === 'topbar' ? focus.col : null;
+
+  let body: React.ReactNode;
   if (error) {
     body = (
       <div className="screen-message">
         <p>{ERROR_COPY[error]}</p>
-        <button
-          className="tv-retry"
-          autoFocus
-          onClick={loadLibrary}
-        >
+        <button className="tv-retry" autoFocus onClick={loadLibrary}>
           Retry
         </button>
       </div>
@@ -432,36 +424,22 @@ export default function App() {
   } else {
     body = (
       <>
-        <header className="hero">
-          <div className="hero-text">
-            <div className="hero-kind">{focusedItem?.kind.toUpperCase()}</div>
-            <h1 className="hero-title">{focusedItem?.title}</h1>
-            {previewSub && <div className="hero-sub">{previewSub}</div>}
-            {preview?.description && <p className="hero-desc">{preview.description}</p>}
-            <div className="hero-hint">
-              Press <span className="key">A</span> / <span className="key">Enter</span> to open
-            </div>
-          </div>
-          {previewImages.length > 0 && (
-            <div className="hero-images">
-              {previewImages.map((src, i) => (
-                <img key={`${i}-${src}`} className="hero-shot" src={src} alt="" loading="lazy" />
-              ))}
-            </div>
+        <Hero item={heroItem} preview={preview} onRows={inRows} />
+        <main className="home-rows">
+          {shelves.length === 0 ? (
+            <div className="screen-message">{EMPTY_TAB_COPY[activeTab] || 'Nothing here yet.'}</div>
+          ) : (
+            shelves.map((shelf, i) => (
+              <Shelf
+                key={`${activeTab}-${i}-${shelf.title}`}
+                title={shelf.title}
+                items={shelf.items}
+                focused={inRows && i === focus.row ? focus.col : null}
+                jobs={jobs}
+                onPick={activateItem}
+              />
+            ))
           )}
-        </header>
-
-        <main className="rows">
-          {rows.map((row, i) => (
-            <MediaRow
-              key={`${i}-${row.title}`}
-              row={row}
-              focusedCol={i === focus.row ? focus.col : null}
-              jobs={jobs}
-              onExpand={() => setExpandedRow(row)}
-              onPick={pushDetails}
-            />
-          ))}
         </main>
       </>
     );
@@ -469,69 +447,25 @@ export default function App() {
 
   return (
     <div className="app">
-      {mode === 'tv' && focusedItem?.art && (
-        <div
-          key={focusedItem.id}
-          className="ambient"
-          style={{ backgroundImage: `url(${focusedItem.art})` }}
-        />
-      )}
+      <TopBar
+        activeTab={activeTab}
+        focusIndex={topFocus}
+        theme={theme}
+        enabled={enabledTabs}
+        onSearch={() => setSearchOpen(true)}
+        onSelectTab={(id) => {
+          switchTab(id);
+          setFocus({ zone: 'rows', row: 0, col: 0 });
+        }}
+        onSettings={() => setSettingsOpen(true)}
+        onToggleTheme={toggleTheme}
+      />
 
-      {mode === 'tv' && (
-        <>
-          <nav className={`tv-sidebar ${sbFocus !== null ? 'open' : ''}`}>
-            {SIDEBAR_ITEMS.map((entry, i) => (
-              <button
-                key={entry.id}
-                className={`tv-sb-item ${sbFocus === i ? 'focused' : ''}`}
-                onClick={() => {
-                  if (entry.id === 'search') setSearchOpen(true);
-                  else if (entry.id === 'settings') setSettingsOpen(true);
-                  else if (entry.id === 'theme') setTheme((t) => otherTheme(t));
-                  else if (entry.id === 'desktop') toggleMode();
-                  else cycleEnhance();
-                }}
-              >
-                <span className="tv-sb-icon">{entry.icon}</span>
-                <span className="tv-sb-label">
-                  {entry.id === 'enhance'
-                    ? `Enhance · ${ENHANCE_LABELS[settings.enhance]}`
-                    : entry.label}
-                </span>
-              </button>
-            ))}
-            <div className="tv-sb-hint">◀ from the first card</div>
-          </nav>
-          <div className="tv-clock">
-            <Clock />
-          </div>
-        </>
-      )}
-
-      {mode === 'tv' ? (
-        body
-      ) : (
-        <DesktopHome
-          rows={rows}
-          error={error ? ERROR_COPY[error] : null}
-          onOpen={pushDetails}
-          onSearch={() => setSearchOpen(true)}
-          onSettings={() => setSettingsOpen(true)}
-          onToggleTheme={() => setTheme((t) => otherTheme(t))}
-          onToggleMode={toggleMode}
-        />
-      )}
+      {body}
 
       <DownloadsPanel jobs={jobs} />
       {toast && <div className="toast">{toast}</div>}
-      {expandedRow && (
-        <SectionPage
-          row={expandedRow}
-          onPick={pushDetails}
-          onClose={() => setExpandedRow(null)}
-          actionRef={sectionActionRef}
-        />
-      )}
+
       {detailsItem && (
         <DetailsPage
           key={`${detailsStack.length}-${detailsItem.id}`}
@@ -547,9 +481,7 @@ export default function App() {
           onClose={() => setSettingsOpen(false)}
           reload={reloadAll}
           theme={theme}
-          onToggleTheme={() => setTheme((t) => otherTheme(t))}
-          mode={mode}
-          onToggleMode={toggleMode}
+          onToggleTheme={toggleTheme}
           actionRef={settingsActionRef}
         />
       )}
@@ -569,15 +501,12 @@ export default function App() {
 
 /// Polls download jobs while any are running; calls onFinished when a job
 /// completes so the library can refresh (the game moves to "Games").
-/// `refresh` polls immediately — used right after starting an install.
 function useInstallJobs(onFinished: () => void) {
   const [jobs, setJobs] = useState<InstallJob[]>([]);
   const onFinishedRef = useRef(onFinished);
   onFinishedRef.current = onFinished;
   const runningIds = useRef<Set<string>>(new Set());
   const running = jobs.some((j) => j.status === 'running');
-  // Consecutive empty/idle polls — used to back the idle cadence off so we
-  // don't hammer /api/installs forever on a box that never installs anything.
   const idleStreak = useRef(0);
 
   const refresh = useCallback(() => {
@@ -586,11 +515,7 @@ function useInstallJobs(onFinished: () => void) {
         if (next.some((j) => j.status === 'done' && runningIds.current.has(j.id))) {
           onFinishedRef.current();
         }
-        runningIds.current = new Set(
-          next.filter((j) => j.status === 'running').map((j) => j.id),
-        );
-        // Any activity (a job present, running or just-finished) resets the
-        // idle backoff so the next install polls promptly again.
+        runningIds.current = new Set(next.filter((j) => j.status === 'running').map((j) => j.id));
         idleStreak.current = next.length > 0 ? 0 : idleStreak.current + 1;
         setJobs(next);
       })
@@ -598,9 +523,6 @@ function useInstallJobs(onFinished: () => void) {
   }, []);
 
   useEffect(() => {
-    // Self-scheduling poll: fast (2s) while a download runs; when idle it
-    // starts at 15s and eases toward a 2min ceiling so a jobless box goes
-    // effectively quiet instead of polling forever.
     let timer: number;
     const tick = () => {
       refresh();
@@ -623,7 +545,8 @@ function useHeroPreview(item: ContentItem | undefined): Meta | null {
   const cache = useRef<Map<string, Meta>>(new Map());
   const id = item?.id;
   useEffect(() => {
-    if (!id) {
+    // System tiles (Settings / app launchers) have no meta to fetch.
+    if (!id || id.startsWith('sys:')) {
       setMeta(null);
       return;
     }
@@ -647,26 +570,10 @@ function useHeroPreview(item: ContentItem | undefined): Meta | null {
     return () => {
       cancelled = true;
       window.clearTimeout(t);
-      // Abort the in-flight request too, not just ignore its result, so fast
-      // scrolling doesn't leave a pile of stale meta fetches racing.
       controller.abort();
     };
   }, [id]);
   return meta;
-}
-
-/// The living-room clock — a TV home screen should always show the time.
-function Clock() {
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const t = window.setInterval(() => setNow(new Date()), 15_000);
-    return () => window.clearInterval(t);
-  }, []);
-  return (
-    <div className="status-chip status-clock">
-      {now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-    </div>
-  );
 }
 
 function DownloadsPanel({ jobs }: { jobs: InstallJob[] }) {

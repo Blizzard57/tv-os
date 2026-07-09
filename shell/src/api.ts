@@ -312,6 +312,60 @@ export const addAddon = (url: string) => post('/api/addons', { url });
 export const removeAddon = (url: string) => post('/api/addons/remove', { url });
 export const openUrl = (url: string) => post('/api/open', { url });
 
+// One provider inside a source manifest, with its enable + last-probe state.
+export interface ManifestSource {
+  name: string;
+  enabled: boolean;
+  series: boolean;
+  reachable?: boolean;
+  latency_ms?: number;
+}
+
+// A CloudStream-style source manifest, as returned by /api/source-manifests.
+export interface SourceManifest {
+  id: string;
+  name: string;
+  source_url?: string;
+  sources: ManifestSource[];
+}
+
+export async function fetchSourceManifests(): Promise<SourceManifest[]> {
+  const res = await apiFetch('/api/source-manifests');
+  if (!res.ok)
+    throw new ApiError(`source manifests request failed: ${res.status}`, 'http', res.status);
+  return res.json();
+}
+
+// `text` is a manifest URL or the manifest JSON pasted directly — the daemon
+// auto-detects. Returns the installed manifest summary.
+export async function addSourceManifest(text: string): Promise<SourceManifest> {
+  const res = await apiFetch('/api/source-manifests', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+  return res.json();
+}
+
+export const removeSourceManifest = (id: string) =>
+  post('/api/source-manifests/remove', { id });
+
+export const toggleSource = (id: string, name: string, enabled: boolean) =>
+  post('/api/source-manifests/toggle', { id, name, enabled });
+
+// Probes each source for reachability, auto-disabling the unreachable ones.
+// Returns the refreshed summaries (all manifests when `id` is omitted).
+export async function testSourceManifests(id?: string): Promise<SourceManifest[]> {
+  const res = await apiFetch('/api/source-manifests/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(id ? { id } : {}),
+  });
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+  return res.json();
+}
+
 export async function fetchMeta(id: string, signal?: AbortSignal): Promise<Meta> {
   const res = await apiFetch(`/api/meta?id=${encodeURIComponent(id)}`, { signal });
   if (!res.ok) throw new ApiError(`meta request failed: ${res.status}`, 'http', res.status);

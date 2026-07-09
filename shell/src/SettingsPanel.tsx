@@ -3,24 +3,30 @@ import {
   Addon,
   EnhanceMode,
   Settings,
+  SourceManifest,
   SourceStatus,
   addAddon,
+  addSourceManifest,
   fetchAddons,
   fetchSettings,
+  fetchSourceManifests,
   fetchSources,
   fetchSteamStatus,
   fetchTrackingStatus,
   fetchVersion,
   fetchYouTubeStatus,
+  testSourceManifests,
+  toggleSource,
   traktConnect,
   openUrl,
   removeAddon,
+  removeSourceManifest,
   saveSettings,
 } from './api';
 import { activateFocused, moveFocus, stepSelect } from './focusNav';
 import { NavAction } from './input';
 import { OnScreenKeyboard } from './SearchOverlay';
-import { ACCENT_PRESETS, DEFAULT_ACCENT, Theme, UiMode, applyAccent } from './theme';
+import { ACCENT_PRESETS, DEFAULT_ACCENT, Theme, applyAccent } from './theme';
 
 interface Props {
   onClose: () => void;
@@ -28,8 +34,6 @@ interface Props {
   reload: () => void;
   theme: Theme;
   onToggleTheme: () => void;
-  mode: UiMode;
-  onToggleMode: () => void;
   /** App writes its forwarded nav handler here so a controller can drive
    *  the panel (d-pad moves focus, A activates). */
   actionRef: MutableRefObject<((a: NavAction) => void) | null>;
@@ -86,12 +90,11 @@ export function SettingsPanel({
   reload,
   theme,
   onToggleTheme,
-  mode,
-  onToggleMode,
   actionRef,
 }: Props) {
   const [form, setForm] = useState<Settings>(BLANK);
   const [addons, setAddons] = useState<Addon[]>([]);
+  const [manifests, setManifests] = useState<SourceManifest[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [version, setVersion] = useState<string | null>(null);
@@ -139,6 +142,7 @@ export function SettingsPanel({
       })
       .catch(() => setLoadError(true));
     refreshAddons();
+    refreshManifests();
   }, []);
 
   // Controller / arrow-key navigation. By default the d-pad moves focus
@@ -222,6 +226,7 @@ export function SettingsPanel({
   }, [loaded, loadError]);
 
   const refreshAddons = () => fetchAddons().then(setAddons).catch(() => {});
+  const refreshManifests = () => fetchSourceManifests().then(setManifests).catch(() => {});
   const update = (patch: Partial<Settings>) => {
     // Any secret in the patch was typed by the user → mark it for sending.
     for (const key of Object.keys(patch)) if (isSecret(key)) touched.current.add(key);
@@ -282,6 +287,7 @@ export function SettingsPanel({
             <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
             <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
             <AddonSection addons={addons} refresh={refreshAddons} reload={reload} openOsk={openOsk} />
+            <SourceManifestSection manifests={manifests} refresh={refreshManifests} reload={reload} openOsk={openOsk} />
             <AppearanceSection
               form={form}
               update={update}
@@ -291,8 +297,6 @@ export function SettingsPanel({
               openOsk={openOsk}
               theme={theme}
               onToggleTheme={onToggleTheme}
-              mode={mode}
-              onToggleMode={onToggleMode}
             />
           </>
         )}
@@ -847,6 +851,178 @@ function AddonSection({
   );
 }
 
+function SourceManifestSection({
+  manifests,
+  refresh,
+  reload,
+  openOsk,
+}: {
+  manifests: SourceManifest[];
+  refresh: () => void;
+  reload: () => void;
+  openOsk: SectionProps['openOsk'];
+}) {
+  const [text, setText] = useState('');
+  const [status, setStatus] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const add = async () => {
+    const input = text.trim();
+    if (!input) {
+      setStatus('Paste a manifest URL or its JSON first');
+      return;
+    }
+    setBusy(true);
+    setStatus('Adding…');
+    try {
+      const m = await addSourceManifest(input);
+      setText('');
+      const n = m.sources.length;
+      setStatus(`Added “${m.name}” — ${n} source${n === 1 ? '' : 's'}. Test them below.`);
+      await refresh();
+      reload();
+    } catch (e) {
+      setStatus(`Error: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Read the system clipboard into the field (controller / kiosk have no
+  // Ctrl+V); on desktop the textarea also accepts a normal paste.
+  const paste = async () => {
+    try {
+      const clip = await navigator.clipboard.readText();
+      if (clip) {
+        setText(clip);
+        setStatus(null);
+      } else {
+        setStatus('Clipboard is empty');
+      }
+    } catch {
+      setStatus('Clipboard unavailable — type or paste into the box');
+    }
+  };
+
+  const remove = async (m: SourceManifest) => {
+    await removeSourceManifest(m.id).catch(() => {});
+    await refresh();
+    reload();
+  };
+
+  const toggle = async (m: SourceManifest, name: string, enabled: boolean) => {
+    await toggleSource(m.id, name, enabled).catch(() => {});
+    await refresh();
+    reload();
+  };
+
+  const test = async (m?: SourceManifest) => {
+    setBusy(true);
+    setStatus(m ? `Testing “${m.name}”…` : 'Testing all sources…');
+    try {
+      const updated = await testSourceManifests(m?.id);
+      const flat = updated.flatMap((x) => x.sources);
+      const up = flat.filter((s) => s.reachable).length;
+      const down = flat.filter((s) => s.reachable === false).length;
+      setStatus(`Reachable: ${up} · unreachable (auto-disabled): ${down}`);
+      await refresh();
+      reload();
+    } catch (e) {
+      setStatus(`Error: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>CloudStream sources</h2>
+      <p className="settings-muted">
+        Add a CloudStream-style source manifest — paste its URL <em>or</em> the
+        raw JSON. It declares extra stream providers that are queried for the
+        title you open and merged into one ranked list alongside Torrentio and
+        WatchHub. Each source maps a movie/series to a URL template (placeholders:{' '}
+        {'{imdb}'}, {'{type}'}, {'{id}'}, {'{season}'}, {'{episode}'}) returning
+        either a Stremio {'{'}streams{'}'} body or a CloudStream link list.
+      </p>
+      <Field label="Manifest URL or JSON">
+        <textarea
+          className="settings-textarea"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onClick={() =>
+            openOsk('Manifest URL or JSON', text, false, setText)
+          }
+          placeholder="https://…/sources.json  — or paste the manifest JSON"
+          rows={3}
+        />
+      </Field>
+      <div className="settings-actions">
+        <button className="btn btn-primary" onClick={add} disabled={busy}>
+          Add sources
+        </button>
+        <button className="btn" onClick={paste} disabled={busy}>
+          Paste
+        </button>
+        {manifests.length > 0 && (
+          <button className="btn" onClick={() => test()} disabled={busy}>
+            Test all
+          </button>
+        )}
+        {status && <span className="settings-status">{status}</span>}
+      </div>
+
+      {manifests.map((m) => (
+        <div key={m.id} className="manifest-block">
+          <div className="manifest-head">
+            <div>
+              <div className="addon-name">{m.name}</div>
+              <div className="settings-muted addon-meta">
+                {m.source_url ?? 'pasted JSON'}
+              </div>
+            </div>
+            <div className="addon-buttons">
+              <button className="btn" onClick={() => test(m)} disabled={busy}>
+                Test
+              </button>
+              <button className="btn" onClick={() => remove(m)} disabled={busy}>
+                Remove
+              </button>
+            </div>
+          </div>
+          <ul className="manifest-sources">
+            {m.sources.map((s) => (
+              <li key={s.name} className="manifest-source">
+                <label className="manifest-source-toggle">
+                  <input
+                    type="checkbox"
+                    checked={s.enabled}
+                    onChange={(e) => toggle(m, s.name, e.target.checked)}
+                  />
+                  <span className="manifest-source-name">{s.name}</span>
+                </label>
+                <span className="manifest-source-meta settings-muted">
+                  {s.series ? 'movies + series' : 'movies only'}
+                  {s.reachable === true && (
+                    <span className="reach reach-ok">
+                      {' · '}✓ reachable
+                      {s.latency_ms != null ? ` (${s.latency_ms} ms)` : ''}
+                    </span>
+                  )}
+                  {s.reachable === false && (
+                    <span className="reach reach-bad">{' · '}✗ unreachable</span>
+                  )}
+                  {s.reachable == null && <span>{' · '}not tested</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </section>
+  );
+}
+
 function AppearanceSection({
   form,
   update,
@@ -854,13 +1030,9 @@ function AppearanceSection({
   submit,
   theme,
   onToggleTheme,
-  mode,
-  onToggleMode,
 }: SectionProps & {
   theme: Theme;
   onToggleTheme: () => void;
-  mode: UiMode;
-  onToggleMode: () => void;
 }) {
   const setEnhance = async (enhance: EnhanceMode) => {
     update({ enhance });
@@ -883,11 +1055,6 @@ function AppearanceSection({
       <Field label="Theme">
         <button className="btn" onClick={onToggleTheme}>
           {theme === 'dark' ? 'Dark' : 'Light'} — switch
-        </button>
-      </Field>
-      <Field label="Layout">
-        <button className="btn" onClick={onToggleMode}>
-          {mode === 'tv' ? 'TV (10-foot)' : 'Desktop'} — switch
         </button>
       </Field>
       <Field label="Accent color">

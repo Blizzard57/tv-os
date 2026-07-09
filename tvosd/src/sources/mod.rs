@@ -6,6 +6,7 @@
 //! phases move this behind the HTTP addon protocol so out-of-tree sources
 //! can be installed at runtime.
 
+pub mod cloudstream;
 pub mod epic;
 pub mod gamehub;
 pub mod gamerec;

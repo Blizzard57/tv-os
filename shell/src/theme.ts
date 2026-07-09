@@ -19,34 +19,18 @@ export function applyTheme(theme: Theme): void {
 
 export const otherTheme = (theme: Theme): Theme => (theme === 'dark' ? 'light' : 'dark');
 
-// ---- UI mode: 10-foot TV layout vs pointer-first desktop layout ----
-
-export type UiMode = 'tv' | 'desktop';
-
-const MODE_KEY = 'tvos-mode';
-
-export function initialMode(): UiMode {
-  return localStorage.getItem(MODE_KEY) === 'desktop' ? 'desktop' : 'tv';
-}
-
-/** Sets data-mode on <html> (styles.css reflows layouts on it) and persists. */
-export function applyMode(mode: UiMode): void {
-  document.documentElement.dataset.mode = mode;
-  localStorage.setItem(MODE_KEY, mode);
-}
-
-export const otherMode = (mode: UiMode): UiMode => (mode === 'tv' ? 'desktop' : 'tv');
-
 // ---- Accent color (personalization) ----
 
-export const DEFAULT_ACCENT = '#8b5cf6';
+// Google-TV's signature focus blue is the default. The picker (Settings) still
+// lets you change it; "" in settings falls back to this.
+export const DEFAULT_ACCENT = '#8ab4f8';
 
 /** Curated accent choices shown as swatches in Settings. */
 export const ACCENT_PRESETS = [
-  '#8b5cf6', // violet (default)
-  '#a855f7', // purple
+  '#8ab4f8', // Google-TV blue (default)
+  '#4285f4', // Google blue
+  '#8b5cf6', // violet
   '#ec4899', // pink
-  '#4f8cff', // blue
   '#f43f5e', // red
   '#f59e0b', // amber
   '#22c55e', // green
@@ -65,6 +49,11 @@ export function applyAccent(accent: string): void {
   const root = document.documentElement;
   root.style.setProperty('--accent', color);
   root.style.setProperty('--accent-glow', `rgba(${r}, ${g}, ${b}, 0.35)`);
+  // Legible text/icon color to sit ON an accent fill (buttons, badges, selected
+  // pills). Google-TV's default light-blue wants near-black; a deep accent wants
+  // white. Pick by perceived luminance so any picked colour stays readable.
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  root.style.setProperty('--on-accent', luminance > 0.6 ? '#06121f' : '#ffffff');
 }
 
 /** Parses `#rgb`/`#rrggbb` into [r,g,b], or null if it isn't a valid hex. */

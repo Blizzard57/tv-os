@@ -1,12 +1,12 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-// Static weight files, not the variable font: Linux Chromium's FreeType
-// path renders interpolated heavy weights (700–800 display titles) badly.
-import '@fontsource/inter/400.css';
-import '@fontsource/inter/500.css';
-import '@fontsource/inter/600.css';
-import '@fontsource/inter/700.css';
-import '@fontsource/inter/800.css';
+// Roboto — the typeface the Android/Google-TV system UI uses. Static weight
+// files (not a variable font): Linux Chromium's FreeType path renders
+// interpolated weights badly.
+import '@fontsource/roboto/300.css';
+import '@fontsource/roboto/400.css';
+import '@fontsource/roboto/500.css';
+import '@fontsource/roboto/700.css';
 import App from './App';
 import './styles.css';
 

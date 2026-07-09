@@ -9,7 +9,7 @@
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -146,6 +146,27 @@ fn http_get_within(url: &str, timeout: Duration) -> Result<String, String> {
         .map_err(|e| format!("request failed: {}", crate::util::scrub_secrets(&e.to_string())))?
         .text()
         .map_err(|e| e.to_string())
+}
+
+/// Reachability probe for a source URL: a short GET that treats *any* HTTP
+/// response below 500 as "reachable" (a 404 for a probe title still means the
+/// host is up and serving), and a network error / timeout / 5xx as unreachable.
+/// Returns the round-trip latency in milliseconds when reachable. SSRF-guarded
+/// like every other outbound fetch.
+pub fn probe(url: &str) -> Option<u64> {
+    if validate_fetch_url(url).is_err() {
+        return None;
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent(concat!("tvos/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    let start = Instant::now();
+    let resp = client.get(url).send().ok()?;
+    let ms = start.elapsed().as_millis() as u64;
+    (resp.status().as_u16() < 500).then_some(ms)
 }
 
 /// Upper bound on any user-supplied URL we accept (addon manifests, play URLs).

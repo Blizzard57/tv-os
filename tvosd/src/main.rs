@@ -12,6 +12,11 @@
 //!   GET  /api/addons    → installed Stremio-compatible addons
 //!   POST /api/addons    → {"url": "…/manifest.json"} install an addon
 //!   POST /api/addons/remove → {"url": …} uninstall
+//!   GET  /api/source-manifests → installed CloudStream-style source manifests
+//!   POST /api/source-manifests → {"text": url-or-json} add (URL or pasted JSON)
+//!   POST /api/source-manifests/remove → {"id": …} uninstall
+//!   POST /api/source-manifests/toggle → {"id","name","enabled"} enable a source
+//!   POST /api/source-manifests/test → {"id"?} probe + auto-disable unreachable
 
 mod addons;
 mod embed;
@@ -191,6 +196,13 @@ async fn main() {
         .route("/api/steam/status", get(get_steam_status))
         .route("/api/addons", get(get_addons).post(post_addon))
         .route("/api/addons/remove", post(post_addon_remove))
+        .route(
+            "/api/source-manifests",
+            get(get_source_manifests).post(post_source_manifest),
+        )
+        .route("/api/source-manifests/remove", post(post_source_manifest_remove))
+        .route("/api/source-manifests/toggle", post(post_source_manifest_toggle))
+        .route("/api/source-manifests/test", post(post_source_manifest_test))
         .route("/api/meta", get(get_meta))
         .route("/api/streams", get(get_streams))
         .route("/api/search", get(get_search))
@@ -479,6 +491,82 @@ async fn post_addon_remove(
         .remove(&req.url)
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+async fn get_source_manifests() -> Json<Vec<sources::cloudstream::Manifest>> {
+    Json(sources::cloudstream::STORE.list())
+}
+
+/// Add a source manifest from either a URL (fetched) or its JSON pasted
+/// directly — the daemon auto-detects which. A URL install fetches over the
+/// network, so it runs on a blocking thread.
+#[derive(Deserialize)]
+struct SourceManifestInput {
+    /// URL or raw JSON. `url` is accepted as an alias for older clients.
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+async fn post_source_manifest(
+    Json(req): Json<SourceManifestInput>,
+) -> Result<Json<sources::cloudstream::Manifest>, (StatusCode, String)> {
+    let input = req.text.or(req.url).unwrap_or_default();
+    tokio::task::spawn_blocking(move || sources::cloudstream::STORE.install(&input))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+#[derive(Deserialize)]
+struct SourceManifestId {
+    id: String,
+}
+
+async fn post_source_manifest_remove(
+    Json(req): Json<SourceManifestId>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    sources::cloudstream::STORE
+        .remove(&req.id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+#[derive(Deserialize)]
+struct SourceToggle {
+    id: String,
+    name: String,
+    enabled: bool,
+}
+
+async fn post_source_manifest_toggle(
+    Json(req): Json<SourceToggle>,
+) -> Result<Json<sources::cloudstream::Manifest>, (StatusCode, String)> {
+    sources::cloudstream::STORE
+        .set_enabled(&req.id, &req.name, req.enabled)
+        .map(Json)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+#[derive(Deserialize)]
+struct SourceTest {
+    /// Manifest to test; when absent, every installed manifest is tested.
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// Probes each source for reachability and auto-disables the unreachable ones —
+/// network work, so it runs on a blocking thread.
+async fn post_source_manifest_test(
+    Json(req): Json<SourceTest>,
+) -> Json<Vec<sources::cloudstream::Manifest>> {
+    let manifests =
+        tokio::task::spawn_blocking(move || sources::cloudstream::STORE.test(req.id.as_deref()))
+            .await
+            .unwrap_or_default();
+    Json(manifests)
 }
 
 #[derive(Deserialize)]

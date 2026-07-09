@@ -1,0 +1,62 @@
+import { useState } from 'react';
+import { ContentItem, Meta } from './api';
+import { gameLogo } from './cards';
+
+interface Props {
+  item: ContentItem | undefined;
+  preview: Meta | null;
+  /** True while focus is on a card (shows the "open" affordance). */
+  onRows: boolean;
+}
+
+/** The spotlight at the top of every tab: the focused title's backdrop washed
+ *  behind a left-anchored block of logo/title, meta line and synopsis — the
+ *  Google-TV "featured" panel. Games show Steam's stylized logo the way movies
+ *  show their title treatment. */
+export function Hero({ item, preview, onRows }: Props) {
+  const [logoFailed, setLogoFailed] = useState(false);
+  if (!item) return <div className="hero hero-empty" />;
+
+  const isGame = (preview?.kind ?? item.kind) === 'game';
+  const isSys = item.id.startsWith('sys:');
+  const bg = preview?.background || item.art;
+  // Prefer a real title treatment: TMDB logo for movies/shows, Steam logo.png
+  // for games.
+  const logo = !logoFailed ? preview?.logo || gameLogo(item) : null;
+  const sub = [
+    preview?.release_info,
+    preview?.runtime,
+    preview?.rating && (isGame ? `Metacritic ${preview.rating}` : `★ ${preview.rating}`),
+    preview?.genres?.slice(0, 3).join(', '),
+  ]
+    .filter(Boolean)
+    .join('  ·  ');
+
+  return (
+    <div className="hero">
+      {bg && <div key={bg} className="hero-bg" style={{ backgroundImage: `url(${bg})` }} />}
+      <div className="hero-scrim" />
+      <div className="hero-content">
+        {!isSys && <div className="hero-kind">{(preview?.kind ?? item.kind).toUpperCase()}</div>}
+        {logo && !isSys ? (
+          <img
+            key={logo}
+            className="hero-logo"
+            src={logo}
+            alt={preview?.title || item.title}
+            onError={() => setLogoFailed(true)}
+          />
+        ) : (
+          <h1 className="hero-title">{preview?.title || item.title}</h1>
+        )}
+        {sub && <div className="hero-sub">{sub}</div>}
+        {preview?.description && <p className="hero-desc">{preview.description}</p>}
+        {onRows && (
+          <div className="hero-hint">
+            Press <span className="key">A</span> / <span className="key">Enter</span> to open
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

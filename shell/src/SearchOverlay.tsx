@@ -526,7 +526,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
 const OSK_LETTERS = ['abcdefghi', 'jklmnopqr', 'stuvwxyz'];
 const OSK_DIGITS = '0123456789';
 const OSK_SYMBOLS = '.:/-_@+=?&%#';
-const OSK_ACTIONS = ['Shift', 'Space', '⌫ Delete', 'Clear', 'Done'] as const;
+const OSK_ACTIONS = ['Shift', 'Space', 'Paste', '⌫ Delete', 'Clear', 'Done'] as const;
 
 /** Full-screen on-screen keyboard for entering/editing one field's value with
  *  a controller or remote. A physical keyboard still types straight into the
@@ -566,6 +566,11 @@ export function OnScreenKeyboard({
         const kind = OSK_ACTIONS[col];
         if (kind === 'Shift') setShift((s) => !s);
         else if (kind === 'Space') setValue((v) => v + ' ');
+        else if (kind === 'Paste')
+          navigator.clipboard
+            ?.readText()
+            .then((clip) => clip && setValue((v) => v + clip))
+            .catch(() => {});
         else if (kind === '⌫ Delete') setValue((v) => v.slice(0, -1));
         else if (kind === 'Clear') setValue('');
         else if (kind === 'Done') onCommit(value);
@@ -641,14 +646,37 @@ export function OnScreenKeyboard({
         setValue((v) => v.slice(0, -1));
         return;
       }
+      // Paste (Ctrl/Cmd+V): pull from the clipboard and append. The native
+      // `paste` event below also covers middle-click / context-menu paste.
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) {
+        e.stopPropagation();
+        e.preventDefault();
+        navigator.clipboard
+          ?.readText()
+          .then((clip) => clip && setValue((v) => v + clip))
+          .catch(() => {});
+        return;
+      }
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
         e.stopPropagation();
         e.preventDefault();
         setValue((v) => v + e.key);
       }
     };
+    const onPaste = (e: ClipboardEvent) => {
+      const clip = e.clipboardData?.getData('text');
+      if (clip) {
+        e.stopPropagation();
+        e.preventDefault();
+        setValue((v) => v + clip);
+      }
+    };
     window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('paste', onPaste, true);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('paste', onPaste, true);
+    };
   }, [value, onCommit, onCancel]);
 
   const shown = masked ? '•'.repeat(value.length) : value;

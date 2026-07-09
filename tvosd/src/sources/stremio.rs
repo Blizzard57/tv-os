@@ -179,6 +179,9 @@ pub fn streams(kind: &str, id: &str) -> Vec<Stream> {
             .flat_map(|h| h.join().unwrap_or_default())
             .collect()
     });
+    // Merge in streams from installed CloudStream source manifests so they rank,
+    // cache, and auto-pick alongside Torrentio / WatchHub.
+    all.extend(crate::sources::cloudstream::streams(kind, id));
     rank(&mut all);
 
     let mut cache = STREAM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -407,7 +410,7 @@ fn describe(stream: &Stream) -> String {
 
 // ---- Parsing ----
 
-fn parse_streams(json: &str) -> Vec<Stream> {
+pub fn parse_streams(json: &str) -> Vec<Stream> {
     let Ok(value) = serde_json::from_str::<Value>(json) else {
         return Vec::new();
     };
