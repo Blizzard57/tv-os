@@ -1,12 +1,10 @@
 //! Local recommender — no cloud, no accounts. Every launch is appended to an
 //! event log (~/.config/tvos/events.jsonl); the home screen gets its
-//! "continue" rows out of it:
+//! "continue" row out of it:
 //!
-//!   Continue Watching    — most recent distinct movies/shows/games, newest
-//!                          first (the cross-domain row from PLAN.md)
-//!   Continue on YouTube  — the same, but for YouTube clips, kept in their own
-//!                          row so a binge of shorts doesn't bury the film or
-//!                          game you were half-way through
+//!   Continue watching    — most recent distinct items (movies, shows, games
+//!                          and YouTube clips together), newest first — the
+//!                          single Google-TV cross-domain row
 //!   Recommended for You  — frequency × recency decay (half-life 14 days),
 //!                          boosted when an item is usually used in the same
 //!                          part of day as right now, excluding the item
@@ -128,10 +126,10 @@ impl EventLog {
         }
     }
 
-    /// The "Continue" home rows — most recent distinct items, newest first,
-    /// split so YouTube gets its own row (see [`continue_rows`]). Actual
-    /// *recommendations* of new titles come from the TMDB recommender (see
-    /// sources::tmdb::for_you), seeded by [`recent_items`].
+    /// The single "Continue watching" home row — most recent distinct items,
+    /// newest first (see [`continue_rows`]). Actual *recommendations* of new
+    /// titles come from the TMDB recommender (see sources::tmdb::for_you and
+    /// because_you_watched), seeded by [`recent_items`].
     pub fn rows(&self) -> Vec<Row> {
         let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         continue_rows(&events)
@@ -254,49 +252,30 @@ fn trim(events: &mut Vec<Event>) {
     }
 }
 
-/// The Continue rows: most recent distinct items, newest first, with YouTube
-/// clips split into their own row so they don't crowd out the movie, show or
-/// game you were part-way through. Empty rows are simply omitted.
+/// The single "Continue watching" row, Google-TV style: the most recent
+/// distinct items — movies, shows, games and YouTube clips together — newest
+/// first. Returned as a `Vec` (empty when there's nothing) so the caller can
+/// `extend` it into the home rows unchanged.
 fn continue_rows(events: &[Event]) -> Vec<Row> {
     let mut seen = Vec::new();
-    let mut main: Vec<ContentItem> = Vec::new();
-    let mut youtube: Vec<ContentItem> = Vec::new();
+    let mut items: Vec<ContentItem> = Vec::new();
     for event in events.iter().rev() {
         if seen.contains(&event.item.id) {
             continue;
         }
         seen.push(event.item.id.clone());
-        let bucket = if is_youtube(&event.item) {
-            &mut youtube
-        } else {
-            &mut main
-        };
-        if bucket.len() < ROW_SIZE {
-            bucket.push(event.item.clone());
-        }
-        if main.len() >= ROW_SIZE && youtube.len() >= ROW_SIZE {
+        items.push(event.item.clone());
+        if items.len() >= ROW_SIZE {
             break;
         }
     }
-    let mut rows = Vec::new();
-    if !main.is_empty() {
-        rows.push(Row {
-            title: "Continue Watching".to_string(),
-            items: main,
-        });
+    if items.is_empty() {
+        return Vec::new();
     }
-    if !youtube.is_empty() {
-        rows.push(Row {
-            title: "Continue on YouTube".to_string(),
-            items: youtube,
-        });
-    }
-    rows
-}
-
-/// YouTube items own the `yt:` id prefix (see sources::youtube).
-fn is_youtube(item: &ContentItem) -> bool {
-    item.id.starts_with("yt:")
+    vec![Row {
+        title: "Continue watching".to_string(),
+        items,
+    }]
 }
 
 fn now() -> u64 {
@@ -339,11 +318,11 @@ mod tests {
     fn continue_is_recent_distinct_newest_first() {
         let events = vec![ev("a", 1), ev("b", 2), ev("a", 3), ev("c", 4)];
         let rows = continue_rows(&events);
-        assert_eq!(row_ids(&rows, "Continue Watching"), ["c", "a", "b"]);
+        assert_eq!(row_ids(&rows, "Continue watching"), ["c", "a", "b"]);
     }
 
     #[test]
-    fn continue_splits_youtube_into_its_own_row() {
+    fn continue_mixes_youtube_with_everything_newest_first() {
         let events = vec![
             ev("strm:movie:tt1", 1),
             ev("yt:aaa", 2),
@@ -351,20 +330,21 @@ mod tests {
             ev("yt:bbb", 4),
         ];
         let rows = continue_rows(&events);
-        // YouTube clips never appear in the main Continue row…
+        // One Google-TV "Continue watching" row: movies, games and YouTube
+        // clips together, newest first.
+        assert_eq!(rows.len(), 1);
         assert_eq!(
-            row_ids(&rows, "Continue Watching"),
-            ["steam:620", "strm:movie:tt1"]
+            row_ids(&rows, "Continue watching"),
+            ["yt:bbb", "steam:620", "yt:aaa", "strm:movie:tt1"]
         );
-        // …they get their own row, newest first.
-        assert_eq!(row_ids(&rows, "Continue on YouTube"), ["yt:bbb", "yt:aaa"]);
     }
 
     #[test]
-    fn continue_omits_empty_rows() {
+    fn continue_omits_empty_row() {
+        assert!(continue_rows(&[]).is_empty());
         let rows = continue_rows(&[ev("yt:only", 1)]);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].title, "Continue on YouTube");
+        assert_eq!(rows[0].title, "Continue watching");
     }
 
     #[test]

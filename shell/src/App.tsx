@@ -88,7 +88,6 @@ const ERROR_COPY: Record<LoadError, string> = {
 
 const EMPTY_TAB_COPY: Record<TabId, string> = {
   foryou: '',
-  live: 'Nothing live right now — follow a channel or connect YouTube in Settings.',
   movies: 'No movies yet — add a TMDB key in Settings to fill this tab.',
   shows: 'No shows yet — add a TMDB key in Settings to fill this tab.',
   library: 'Your library is empty — connect Steam, Epic or GOG, or start watching to fill it.',

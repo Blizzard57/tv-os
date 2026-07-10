@@ -7,13 +7,18 @@
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+  /* Roboto everywhere — the Android/Google-TV system typeface. Applied on the
+     universal selector (not just body) so no UA-styled element (buttons,
+     inputs, headings) can fall back to a platform sans. */
+  font-family: 'Roboto', 'Roboto Flex', system-ui, -apple-system, 'Segoe UI', sans-serif;
 }
 
 button,
 input,
 select,
 textarea {
-  font: inherit;
+  font-family: inherit;
+  font-size: inherit;
   color: inherit;
 }
 
@@ -34,17 +39,33 @@ textarea {
   --overlay-border: rgba(244, 245, 250, 0.1);
   --panel: rgba(13, 14, 19, 0.92);
   --scrim: rgba(8, 9, 13, 0.94);
-  --card-radius: 12px;
+  --card-radius: 10px;
   /* Google-TV card focus: a bright white ring + lift, not a coloured outline. */
-  --card-focus: 0 0 0 3px var(--bg), 0 0 0 6px #ffffff, 0 22px 50px rgba(0, 0, 0, 0.6);
-  --focus-ring: 0 0 0 3px var(--bg), 0 0 0 6px var(--accent), 0 18px 44px rgba(0, 0, 0, 0.55);
+  --card-focus: 0 0 0 3px var(--bg), 0 0 0 6px #ffffff, 0 26px 60px rgba(0, 0, 0, 0.65);
+  --focus-ring: 0 0 0 3px var(--bg), 0 0 0 6px var(--accent), 0 22px 50px rgba(0, 0, 0, 0.55);
   --title-shadow: 0 2px 24px rgba(0, 0, 0, 0.4);
   /* TV overscan safe area: many TVs crop ~5% of each edge. */
-  --overscan: 32px;
+  --overscan: 36px;
   --safe-top: env(safe-area-inset-top, var(--overscan));
   --safe-bottom: env(safe-area-inset-bottom, var(--overscan));
-  --edge: max(60px, env(safe-area-inset-left, 60px));
-  --topbar-h: 72px;
+  --edge: max(56px, env(safe-area-inset-left, 56px));
+  --topbar-h: 88px;
+
+  /* ---- 10-foot size scale ----
+     Google TV shows content as wide 16:9 cards, ~4 across with generous
+     gutters, seen from a couch. These scale with the viewport so the layout
+     reads the same on a 1080p panel and a dev laptop, and everything derives
+     from them so the whole shell resizes in one place. (Grid ~= the Android TV
+     spec: 48–58dp side margins, 20dp gutter, doubled for 1080p.) */
+  --card-w: clamp(300px, 21vw, 404px);
+  --card-gap: clamp(18px, 1.7vw, 32px);
+  --shelf-gap: clamp(14px, 2.4vh, 36px);
+  /* Vertical breathing room baked into each strip so the focus ring + scale
+     never clip against the row above/below. Must exceed the upward growth of a
+     scaled card plus the ring width. */
+  --strip-pad: 26px;
+  /* Google-TV card focus is a gentle lift, not a big zoom. */
+  --card-lift: 1.05;
 }
 
 [data-theme='light'] {
@@ -65,6 +86,9 @@ textarea {
   --scrim: rgba(240, 238, 247, 0.95);
   --focus-ring: 0 0 0 3px var(--bg), 0 0 0 6px var(--accent), 0 18px 44px rgba(0, 0, 0, 0.2);
   --title-shadow: none;
+  /* On the light theme a white focus ring vanishes into the background, so the
+     card focus uses a dark ring (the accent-blue reads as "selected" here). */
+  --card-focus: 0 0 0 3px var(--bg), 0 0 0 6px var(--accent), 0 22px 50px rgba(0, 0, 0, 0.28);
 }
 
 html,
@@ -127,10 +151,10 @@ body {
   z-index: 40;
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 18px;
   height: calc(var(--topbar-h) + var(--safe-top));
   padding: var(--safe-top) var(--edge) 0;
-  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.72) 0%, rgba(0, 0, 0, 0.28) 55%, transparent 100%);
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.78) 0%, rgba(0, 0, 0, 0.32) 55%, transparent 100%);
 }
 
 [data-theme='light'] .topbar {
@@ -141,13 +165,13 @@ body {
 .top-avatar {
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   flex: 0 0 auto;
   border-radius: 50%;
   background: linear-gradient(135deg, var(--accent), #c86bff);
   color: #fff;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
 }
@@ -155,8 +179,8 @@ body {
 .top-icon {
   display: grid;
   place-items: center;
-  width: 42px;
-  height: 42px;
+  width: 48px;
+  height: 48px;
   border: none;
   border-radius: 50%;
   background: transparent;
@@ -166,7 +190,7 @@ body {
 }
 
 .top-icon-glyph {
-  font-size: 21px;
+  font-size: 24px;
   line-height: 1;
 }
 
@@ -174,14 +198,14 @@ body {
 .top-pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  height: 42px;
-  padding: 0 20px 0 16px;
+  gap: 10px;
+  height: 48px;
+  padding: 0 24px 0 20px;
   border: none;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.1);
   color: var(--text);
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 500;
   cursor: pointer;
   transition: background 0.14s, color 0.14s, transform 0.14s;
@@ -192,24 +216,34 @@ body {
 }
 
 .top-search-glyph {
-  font-size: 20px;
+  font-size: 22px;
   line-height: 1;
+}
+
+.top-avatar,
+.top-pill,
+.top-icon,
+.top-right {
+  flex: 0 0 auto;
 }
 
 .top-tabs {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .top-tab {
   position: relative;
-  padding: 8px 18px;
+  padding: 10px 22px;
   border: none;
   border-radius: 999px;
   background: transparent;
   color: var(--text-dim);
-  font-size: 16px;
+  font-size: 19px;
   font-weight: 500;
   cursor: pointer;
   transition: color 0.14s, background 0.14s, transform 0.14s;
@@ -242,12 +276,12 @@ body {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 
 .top-clock {
   margin-right: 4px;
-  font-size: 15px;
+  font-size: 17px;
   font-weight: 500;
   color: var(--text);
   opacity: 0.92;
@@ -258,8 +292,8 @@ body {
 .hero {
   position: relative;
   flex-shrink: 0;
-  height: 54vh;
-  min-height: 340px;
+  height: 56vh;
+  min-height: 420px;
   overflow: hidden;
 }
 
@@ -303,44 +337,44 @@ body {
 .hero-content {
   position: absolute;
   left: var(--edge);
-  bottom: 22px;
-  max-width: 46%;
+  bottom: 40px;
+  max-width: min(720px, 48%);
   padding-top: calc(var(--topbar-h) + var(--safe-top));
 }
 
 .hero-kind {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 700;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.18em;
   color: var(--accent);
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
 .hero-logo {
-  max-width: min(460px, 100%);
-  max-height: 150px;
+  max-width: min(520px, 100%);
+  max-height: 176px;
   object-fit: contain;
   object-position: left bottom;
   filter: drop-shadow(0 4px 18px rgba(0, 0, 0, 0.5));
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 
 .hero-title {
-  font-size: clamp(34px, 4.4vw, 60px);
+  font-size: clamp(40px, 5vw, 68px);
   line-height: 1.02;
   text-shadow: var(--title-shadow);
 }
 
 .hero-sub {
-  margin-top: 12px;
-  font-size: 16px;
+  margin-top: 14px;
+  font-size: 18px;
   color: var(--text-dim);
   font-weight: 500;
 }
 
 .hero-desc {
-  margin-top: 12px;
-  font-size: 17px;
+  margin-top: 14px;
+  font-size: 19px;
   line-height: 1.5;
   color: var(--text);
   opacity: 0.92;
@@ -351,8 +385,8 @@ body {
 }
 
 .hero-hint {
-  margin-top: 16px;
-  font-size: 14px;
+  margin-top: 18px;
+  font-size: 15px;
   color: var(--text-dim);
 }
 
@@ -363,7 +397,7 @@ body {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 8px 0 calc(var(--safe-bottom) + 28px);
+  padding: 6px 0 calc(var(--safe-bottom) + 32px);
   scrollbar-width: none;
 }
 
@@ -372,14 +406,14 @@ body {
 }
 
 .shelf {
-  padding: 6px 0 6px;
-  scroll-margin-top: calc(var(--topbar-h) + var(--safe-top) + 24px);
-  scroll-margin-bottom: 40px;
+  padding: 0;
+  scroll-margin-top: calc(var(--topbar-h) + var(--safe-top) + 28px);
+  scroll-margin-bottom: 48px;
 }
 
 .shelf-title {
-  margin: 0 var(--edge) 4px;
-  font-size: 20px;
+  margin: 0 var(--edge) 2px;
+  font-size: 24px;
   font-weight: 500;
   color: var(--text-dim);
   transition: color 0.15s;
@@ -390,12 +424,14 @@ body {
 }
 
 /* The strip scrolls horizontally, which makes the browser clip the cross-axis
-   too — so the focus ring + 1.09 lift needs real vertical breathing room baked
-   into the padding, or it gets cropped top and bottom. */
+   too (a horizontal overflow container can't also be overflow-y: visible), so
+   the focus ring + lift needs real vertical breathing room baked into the
+   padding via --strip-pad, or the focused card gets cropped top and bottom. */
 .shelf-strip {
   display: flex;
-  gap: 16px;
-  padding: 24px var(--edge) 28px;
+  gap: var(--card-gap);
+  padding: var(--strip-pad) var(--edge);
+  margin-bottom: var(--shelf-gap);
   overflow-x: auto;
   overflow-y: hidden;
   scroll-behavior: smooth;
@@ -407,38 +443,32 @@ body {
   display: none;
 }
 
-/* ---- Cards: Google-TV mixes 2:3 posters and 16:9 landscape tiles ---- */
+/* ---- Google-TV "Standard" card: a 16:9 thumbnail with the title below ---- */
 
 .card {
   flex: 0 0 auto;
+  width: var(--card-w);
   cursor: pointer;
   transition: transform 0.16s ease;
+  transform-origin: center center;
+  /* scrollIntoView({block:'nearest'}) aligns the card's margin box to the
+     scroll container edge. Without these margins a card scrolled to the top (or
+     bottom) parks flush against the clip edge and its scaled/ringed top gets
+     cropped — the classic "top of the highlighted item is cut when scrolling
+     back up". The top margin also keeps the row title on screen. */
+  scroll-margin-top: calc(var(--strip-pad) + 48px);
+  scroll-margin-bottom: calc(var(--strip-pad) + 24px);
 }
 
-.card-poster {
-  width: 168px;
-}
-
-.card-landscape {
-  width: 320px;
-}
-
-.card-art-box {
+.card-thumb {
   position: relative;
   width: 100%;
+  aspect-ratio: 16 / 9;
   border-radius: var(--card-radius);
   overflow: hidden;
   background: var(--surface);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.4);
   transition: box-shadow 0.16s ease;
-}
-
-.card-poster .card-art-box {
-  aspect-ratio: 2 / 3;
-}
-
-.card-landscape .card-art-box {
-  aspect-ratio: 16 / 9;
 }
 
 .card-art {
@@ -453,51 +483,60 @@ body {
   height: 100%;
   display: grid;
   place-items: center;
-  padding: 14px;
+  padding: 12px 16px;
   text-align: center;
-  font-size: 15px;
+  font-size: 17px;
   font-weight: 500;
+  line-height: 1.25;
   color: var(--text);
   background: linear-gradient(150deg, var(--surface-2), var(--surface));
 }
 
+/* The label sits below the thumbnail (Standard card), dim until focused. */
+.card-label {
+  padding: 10px 2px 0;
+}
+
+.card-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 18px;
+  font-weight: 500;
+  line-height: 1.25;
+  color: var(--text-dim);
+  transition: color 0.14s;
+}
+
+.card-subtitle {
+  margin-top: 2px;
+  font-size: 14px;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
 .card-focused {
-  transform: scale(1.09);
+  transform: scale(var(--card-lift));
   z-index: 2;
 }
 
-.card-focused .card-art-box {
+.card-focused .card-thumb {
   box-shadow: var(--card-focus);
 }
 
-/* Landscape tiles carry a title + bottom gradient like Google-TV Continue cards. */
-.card-overlay {
-  position: absolute;
-  inset: auto 0 0 0;
-  padding: 22px 14px 10px;
-  background: linear-gradient(to top, rgba(0, 0, 0, 0.85), transparent);
-  pointer-events: none;
-}
-
-.card-overlay-title {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  font-size: 15px;
-  font-weight: 500;
-  line-height: 1.25;
-  color: #fff;
+.card-focused .card-title {
+  color: var(--text);
 }
 
 .card-badge {
   position: absolute;
-  top: 10px;
-  left: 10px;
-  padding: 4px 9px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 500;
+  top: 12px;
+  left: 12px;
+  padding: 5px 11px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 600;
   letter-spacing: 0.04em;
   background: rgba(0, 0, 0, 0.72);
   color: #fff;
@@ -1070,8 +1109,8 @@ textarea:focus-visible {
 
 .shot {
   flex: 0 0 auto;
-  height: 170px;
-  border-radius: 12px;
+  height: 190px;
+  border-radius: var(--card-radius);
   object-fit: cover;
   background: var(--surface);
   transition: transform 0.14s, box-shadow 0.14s;
@@ -1084,11 +1123,11 @@ textarea:focus-visible {
 
 .ach-tile {
   flex: 0 0 auto;
-  width: 320px;
+  width: 340px;
   display: flex;
   gap: 12px;
-  padding: 12px 14px;
-  border-radius: 12px;
+  padding: 14px 16px;
+  border-radius: var(--card-radius);
   background: var(--surface);
   transition: transform 0.14s, box-shadow 0.14s;
 }
@@ -1132,7 +1171,7 @@ textarea:focus-visible {
 
 .sim-card {
   flex: 0 0 auto;
-  width: 150px;
+  width: clamp(240px, 18vw, 320px);
   cursor: pointer;
   transition: transform 0.14s;
 }
@@ -1140,9 +1179,9 @@ textarea:focus-visible {
 .sim-card img,
 .sim-card .card-placeholder {
   width: 100%;
-  aspect-ratio: 2 / 3;
+  aspect-ratio: 16 / 9;
   object-fit: cover;
-  border-radius: 12px;
+  border-radius: var(--card-radius);
   background: var(--surface);
   display: block;
 }
@@ -1388,8 +1427,8 @@ textarea:focus-visible {
 .search-grid {
   margin-top: 26px;
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 18px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--card-gap);
 }
 
 .search-sections {
@@ -1435,25 +1474,17 @@ textarea:focus-visible {
   flex: 0 0 auto;
 }
 
-.search-card-wide {
-  width: 300px;
-}
-
 .search-art {
   position: relative;
   width: 100%;
-  aspect-ratio: 2 / 3;
-  border-radius: 12px;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--card-radius);
   overflow: hidden;
   background: var(--surface);
 }
 
 .search-section-strip .search-card {
-  width: 150px;
-}
-
-.search-art-wide {
-  aspect-ratio: 16 / 9;
+  width: clamp(260px, 20vw, 340px);
 }
 
 .search-art img {
@@ -1546,18 +1577,19 @@ textarea:focus-visible {
 
 /* ============================ Settings panel ============================ */
 
+/* Google-TV Settings is a solid, full-screen page with a left-aligned list of
+   grouped rows — not a stack of floating cards. */
 .settings-scrim {
-  background: var(--scrim);
-  backdrop-filter: blur(20px);
+  background: var(--bg);
   display: flex;
   justify-content: center;
 }
 
 .settings {
-  width: min(920px, 100%);
+  width: min(1080px, 100%);
   height: 100%;
   overflow-y: auto;
-  padding: calc(var(--safe-top) + 36px) var(--edge) calc(var(--safe-bottom) + 60px);
+  padding: calc(var(--safe-top) + 44px) var(--edge) calc(var(--safe-bottom) + 72px);
   scrollbar-width: none;
 }
 
@@ -1570,66 +1602,104 @@ textarea:focus-visible {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 8px;
+  margin-bottom: 12px;
 }
 
 .settings-head h1 {
   display: flex;
   align-items: baseline;
-  gap: 14px;
-  font-size: 40px;
+  gap: 16px;
+  font-size: 46px;
 }
 
 .settings-version {
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 500;
   color: var(--text-dim);
 }
 
+/* Each group is a flat section split by a hairline divider — the Google-TV
+   settings list look, not a boxed card. */
 .settings-section {
-  margin-top: 30px;
-  padding: 24px;
-  border-radius: 18px;
-  background: var(--surface);
-  border: 1px solid var(--overlay-border);
+  margin-top: 8px;
+  padding: 28px 0;
+  border-top: 1px solid var(--overlay-border);
 }
 
 .settings-section h2 {
-  font-size: 22px;
-  margin-bottom: 8px;
+  font-size: 24px;
+  font-weight: 500;
+  margin-bottom: 6px;
 }
 
 .settings-muted {
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1.55;
   color: var(--text-dim);
-  margin-bottom: 14px;
+  margin-bottom: 16px;
+  max-width: 760px;
 }
 
+/* A setting row: label on the left, its control on the right, full width, with
+   a filled surface — Google-TV's list rows. */
 .settings-field {
-  display: block;
-  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 28px;
+  margin-top: 12px;
+  padding: 14px 20px;
+  border-radius: 14px;
+  background: var(--surface);
 }
 
 .settings-field-label {
   display: block;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-dim);
-  margin-bottom: 8px;
+  font-size: 17px;
+  font-weight: 500;
+  color: var(--text);
+  flex: 0 1 auto;
 }
 
 .settings input[type='text'],
 .settings input[type='password'],
-.settings select,
+.settings select {
+  flex: 0 0 auto;
+  width: min(48%, 460px);
+  padding: 13px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--overlay-border);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 16px;
+}
+
 .settings-textarea {
   width: 100%;
-  padding: 12px 16px;
+  padding: 14px 16px;
   border-radius: 12px;
   border: 1px solid var(--overlay-border);
   background: var(--bg-2);
   color: var(--text);
   font-size: 16px;
+}
+
+/* A field holding a multiline textarea stacks (label above) instead of the
+   single-row label/control layout. */
+.settings-field:has(.settings-textarea) {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.settings-field:has(.settings-textarea) .settings-field-label {
+  align-self: flex-start;
+}
+
+/* The locked/edit control (masked secret + Edit button) is the right-hand
+   control of its row. */
+.settings-field .locked-row {
+  flex: 0 0 min(52%, 520px);
 }
 
 .settings-textarea {

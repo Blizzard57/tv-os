@@ -1,4 +1,5 @@
-//! TMDB discovery source: "Trending Movies" and "Trending Shows" rows.
+//! TMDB discovery source: Google-TV-style recommendation rows (Trending,
+//! Popular, New, Top Rated) — see `CATALOGS`.
 //!
 //! Enabled by a TMDB API key set in the Settings panel (or the TVOS_TMDB_KEY
 //! env var). TMDB only provides metadata/art, not streams — so to *play* an
@@ -65,64 +66,13 @@ pub struct Tmdb {
     cache: Mutex<HashMap<String, (Instant, Vec<ContentItem>)>>,
 }
 
-/// The home-screen catalog rows, as (title, media, TMDB path+query). `media` is
-/// "movie" or "tv" and decides how each item is parsed/played. Tuned for a rich,
-/// varied home page: trending, popular, anime/cartoons, K/C/J-drama, and a few
-/// big streaming services. Edit this list to change what shows up.
-const CATALOGS: &[(&str, &str, &str)] = &[
-    ("Trending Movies", "movie", "trending/movie/week"),
-    ("Trending Shows", "tv", "trending/tv/week"),
-    (
-        "Popular Movies",
-        "movie",
-        "discover/movie?sort_by=popularity.desc&vote_count.gte=300",
-    ),
-    (
-        "Anime",
-        "tv",
-        "discover/tv?with_genres=16&with_original_language=ja&sort_by=popularity.desc",
-    ),
-    (
-        "Anime Movies",
-        "movie",
-        "discover/movie?with_genres=16&with_original_language=ja&sort_by=popularity.desc",
-    ),
-    (
-        "Cartoons",
-        "tv",
-        "discover/tv?with_genres=16&with_original_language=en&sort_by=popularity.desc",
-    ),
-    (
-        "K-Dramas",
-        "tv",
-        "discover/tv?with_original_language=ko&without_genres=16&sort_by=popularity.desc",
-    ),
-    (
-        "C-Dramas",
-        "tv",
-        "discover/tv?with_original_language=zh&without_genres=16&sort_by=popularity.desc",
-    ),
-    (
-        "J-Dramas",
-        "tv",
-        "discover/tv?with_original_language=ja&without_genres=16&sort_by=popularity.desc",
-    ),
-    (
-        "Popular on Netflix",
-        "tv",
-        "discover/tv?with_watch_providers=8&watch_region=US&sort_by=popularity.desc",
-    ),
-    (
-        "Popular on Disney+",
-        "tv",
-        "discover/tv?with_watch_providers=337&watch_region=US&sort_by=popularity.desc",
-    ),
-    (
-        "Popular on Prime Video",
-        "tv",
-        "discover/tv?with_watch_providers=9&watch_region=US&sort_by=popularity.desc",
-    ),
-];
+/// The home is strictly a recommendation feed (Google-TV "For you"), so TMDB
+/// contributes NO generic browse rows — no Trending / Popular / Top Rated /
+/// genre catalogues. The personalized rows come from `for_you` ("Top picks for
+/// you") and `because_you_watched` ("Because you watched X") instead; the
+/// candidate pool for those is `candidate_corpus`, not this list. Kept as an
+/// (empty) hook so a future setting could opt back into browse rows.
+const CATALOGS: &[(&str, &str, &str)] = &[];
 
 impl Tmdb {
     /// Key from settings, falling back to the env var for headless setups.
@@ -352,7 +302,7 @@ fn for_you_embeddings(key: &str, recent: &[ContentItem]) -> Vec<Row> {
     }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     vec![Row {
-        title: "For You".to_string(),
+        title: "Top picks for you".to_string(),
         items: scored.into_iter().take(25).map(|(_, item)| item).collect(),
     }]
 }
@@ -595,9 +545,48 @@ fn for_you_fallback() -> Vec<Row> {
         return Vec::new();
     }
     vec![Row {
-        title: "For You".to_string(),
+        title: "Top picks for you".to_string(),
         items,
     }]
+}
+
+/// Google-TV "Because you watched X" rows: for your most recent distinct
+/// watched titles, a row of TMDB recommendations for each. Both our own
+/// `tmdb:` items and IMDb/Stremio (`strm:`) items resolve via [`seed`]; anything
+/// that doesn't map to a TMDB title is skipped. At most `max` rows, each needing
+/// a few recommendations to be worth showing.
+pub fn because_you_watched(recent: &[ContentItem], max: usize) -> Vec<Row> {
+    let Some(key) = api_key() else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in recent {
+        if rows.len() >= max {
+            break;
+        }
+        if item.title.trim().is_empty() || !seen.insert(item.title.clone()) {
+            continue;
+        }
+        let Some((media, id)) = seed(&key, item) else {
+            continue;
+        };
+        let Ok(tmdb_id) = id.parse::<i64>() else {
+            continue;
+        };
+        let items: Vec<ContentItem> = similar(&media, tmdb_id)
+            .into_iter()
+            .filter(|i| i.id != item.id)
+            .take(ROW_LIMIT)
+            .collect();
+        if items.len() >= 4 {
+            rows.push(Row {
+                title: format!("Because you watched {}", item.title),
+                items,
+            });
+        }
+    }
+    rows
 }
 
 /// Maps a watched item to a TMDB `(media, id)` seed, if it's a resolvable video.
@@ -639,15 +628,19 @@ fn find_tmdb(key: &str, imdb: &str, media: &str) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-/// Poster (preferred) or backdrop image URL, if the item has any artwork.
+/// Landscape backdrop (preferred) or poster image URL, if the item has any
+/// artwork. Google TV shows content as wide 16:9 cards, so the home/search/
+/// similar rows want the backdrop; the poster is only a fallback for the rare
+/// title that has no backdrop. (The details page fetches its own poster
+/// separately via `media.rs`, so it still gets a real 2:3 poster.)
 fn art_of(m: &Value) -> Option<String> {
-    m.get("poster_path")
+    m.get("backdrop_path")
         .and_then(|p| p.as_str())
-        .map(|p| format!("https://image.tmdb.org/t/p/w500{p}"))
+        .map(|p| format!("https://image.tmdb.org/t/p/w780{p}"))
         .or_else(|| {
-            m.get("backdrop_path")
+            m.get("poster_path")
                 .and_then(|p| p.as_str())
-                .map(|p| format!("https://image.tmdb.org/t/p/w780{p}"))
+                .map(|p| format!("https://image.tmdb.org/t/p/w500{p}"))
         })
 }
 
@@ -1065,22 +1058,23 @@ mod tests {
     #[test]
     fn parses_trending_movies_and_skips_artless() {
         let json = r#"{"results": [
-            {"id": 603, "title": "The Matrix", "poster_path": "/abc.jpg"},
-            {"id": 605, "title": "Backdrop Only", "poster_path": null, "backdrop_path": "/bd.jpg"},
+            {"id": 603, "title": "The Matrix", "poster_path": "/abc.jpg", "backdrop_path": "/wide.jpg"},
+            {"id": 605, "title": "Poster Only", "poster_path": "/ps.jpg", "backdrop_path": null},
             {"id": 604, "title": "No Art Movie", "poster_path": null}
         ]}"#;
         let items = parse_trending(json, "movie");
-        // The art-less movie is dropped; the backdrop-only one is kept.
+        // The art-less movie is dropped. Cards prefer the landscape backdrop
+        // (Google-TV style); the poster is only a fallback.
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].id, "tmdb:movie:603");
         assert_eq!(items[0].kind, Kind::Movie);
         assert_eq!(
             items[0].art.as_deref(),
-            Some("https://image.tmdb.org/t/p/w500/abc.jpg")
+            Some("https://image.tmdb.org/t/p/w780/wide.jpg")
         );
         assert_eq!(
             items[1].art.as_deref(),
-            Some("https://image.tmdb.org/t/p/w780/bd.jpg")
+            Some("https://image.tmdb.org/t/p/w500/ps.jpg")
         );
     }
 

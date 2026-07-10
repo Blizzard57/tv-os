@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ContentItem, InstallJob } from './api';
-import { ShelfLayout, artSources, landscapeArtSources, shelfLayout, stateBadge } from './cards';
+import { cardSubtitle, landscapeArtSources, stateBadge } from './cards';
 
 interface Props {
   title: string;
@@ -11,11 +11,11 @@ interface Props {
   onPick: (item: ContentItem) => void;
 }
 
-/** One home shelf: a title and a horizontally-scrolling strip of cards. Google
- *  TV mixes card shapes — 16:9 landscape for Continue/Apps/videos, 2:3 posters
- *  for Movies/Shows/Games — decided by `shelfLayout`. */
+/** One home shelf: a title and a horizontally-scrolling strip of Google-TV
+ *  "Standard" cards — a wide 16:9 thumbnail with the title and a short subtitle
+ *  below it. Every content row uses the same landscape card so the home reads as
+ *  one consistent grid (see cards.ts). */
 export function Shelf({ title, items, focused, jobs, onPick }: Props) {
-  const layout = shelfLayout(title, items);
   const stripRef = useRef<HTMLDivElement>(null);
   const active = focused !== null;
 
@@ -28,12 +28,11 @@ export function Shelf({ title, items, focused, jobs, onPick }: Props) {
   return (
     <section className={`shelf ${active ? 'shelf-active' : ''}`}>
       <h2 className="shelf-title">{title}</h2>
-      <div ref={stripRef} className={`shelf-strip shelf-${layout}`}>
+      <div ref={stripRef} className="shelf-strip">
         {items.map((item, i) => (
           <Card
             key={item.id}
             item={item}
-            layout={layout}
             focused={active && i === focused}
             job={jobs.find((j) => j.id === item.id && j.status === 'running')}
             onClick={() => onPick(item)}
@@ -46,29 +45,24 @@ export function Shelf({ title, items, focused, jobs, onPick }: Props) {
 
 function Card({
   item,
-  layout,
   focused,
   job,
   onClick,
 }: {
   item: ContentItem;
-  layout: ShelfLayout;
   focused: boolean;
   job?: InstallJob;
   onClick: () => void;
 }) {
   const [artStep, setArtStep] = useState(0);
-  const sources = layout === 'landscape' ? landscapeArtSources(item) : artSources(item);
+  const sources = landscapeArtSources(item);
   const src = sources[artStep];
   const badge = stateBadge(item);
-  const landscape = layout === 'landscape';
+  const subtitle = cardSubtitle(item);
 
   return (
-    <div
-      className={`card card-${layout} ${focused ? 'card-focused' : ''}`}
-      onClick={onClick}
-    >
-      <div className="card-art-box">
+    <div className={`card ${focused ? 'card-focused' : ''}`} onClick={onClick}>
+      <div className="card-thumb">
         {src ? (
           <img
             className="card-art"
@@ -85,18 +79,15 @@ function Card({
         ) : (
           badge && <div className={`card-badge ${badge.cls}`}>{badge.label}</div>
         )}
-        {/* Landscape cards carry a title/gradient the way Google-TV Continue
-            cards do; posters keep their baked-in title art clean. */}
-        {landscape && src && (
-          <div className="card-overlay">
-            <span className="card-overlay-title">{item.title}</span>
-          </div>
-        )}
         {job && (
           <div className="card-progress">
             <div className="card-progress-fill" style={{ width: `${Math.max(4, job.progress)}%` }} />
           </div>
         )}
+      </div>
+      <div className="card-label">
+        <div className="card-title">{item.title}</div>
+        {subtitle && <div className="card-subtitle">{subtitle}</div>}
       </div>
     </div>
   );

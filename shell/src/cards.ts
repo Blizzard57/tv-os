@@ -16,36 +16,21 @@ export function stateBadge(item: ContentItem): { label: string; cls: string } | 
   return null;
 }
 
-/** Artwork candidates, best first. Steam games get a second chance: not every
- *  title has the portrait capsule, but header.jpg always exists — a wide banner
- *  beats an artless placeholder. */
-export function artSources(item: ContentItem): string[] {
-  const sources = item.art ? [item.art] : [];
-  const appid = item.id.match(/^(?:steam|gshop):(\d+)$/)?.[1];
-  if (appid) {
-    sources.push(`https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/header.jpg`);
+// Google TV shows content as wide 16:9 "Standard" cards (a thumbnail with the
+// title below), not portrait posters — see the TV design guidelines. Every home
+// row uses the same landscape tile: movie/show backdrops, Steam header banners
+// and YouTube thumbnails are all 16:9, so the whole home reads as one consistent
+// grid. `landscapeArtSources` supplies the wide artwork.
+
+/** A short metadata line shown under a card label (kind, and for games their
+ *  state). Kept intentionally terse — the card is small. */
+export function cardSubtitle(item: ContentItem): string {
+  if (item.kind === 'game') {
+    if (item.action === 'play') return 'Installed';
+    if (item.action === 'install') return 'In library';
+    return 'Game';
   }
-  return sources;
-}
-
-/** A row is "wide" (16:9 landscape cards) when every item is a video — YouTube
- *  thumbnails are landscape. Everything else uses 2:3 posters. */
-export const isWideRow = (items: ContentItem[]): boolean =>
-  items.length > 0 && items.every((i) => i.kind === 'video');
-
-// ---- Google-TV mixed card shapes: 16:9 landscape vs 2:3 portrait ----
-
-export type ShelfLayout = 'landscape' | 'poster';
-
-const CONTINUE = /continue/i;
-
-/** Which card shape a shelf uses, the way Google TV does: 16:9 landscape for
- *  Continue watching and all-video (YouTube) rows; 2:3 portrait posters for
- *  Movies / Shows / Games browse rows. */
-export function shelfLayout(title: string, items: ContentItem[]): ShelfLayout {
-  if (isWideRow(items)) return 'landscape';
-  if (CONTINUE.test(title)) return 'landscape';
-  return 'poster';
+  return { movie: 'Movie', series: 'TV Show', video: 'Video' }[item.kind] ?? '';
 }
 
 const appidOf = (id: string) => id.match(/^(?:steam|gshop):(\d+)$/)?.[1];

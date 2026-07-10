@@ -16,30 +16,32 @@ use crate::model::{ContentItem, Kind, Row};
 use crate::sources::gamehub;
 use crate::{embed, recommend};
 
-const RECS_LIMIT: usize = 18;
+const RECS_LIMIT: usize = 24;
 /// How many recent plays/watches shape the taste profile.
 const PROFILE_ITEMS: usize = 12;
 
-/// Steam genre names → store genre-hub slugs (getappsingenre). Genres
-/// without a hub (Free To Play, Early Access, …) don't make a row.
-const GENRE_SLUGS: &[(&str, &str)] = &[
-    ("action", "action"),
-    ("adventure", "adventure"),
-    ("casual", "casual"),
-    ("indie", "indie"),
-    ("rpg", "rpg"),
-    ("racing", "racing"),
-    ("simulation", "simulation"),
-    ("sports", "sports"),
-    ("strategy", "strategy"),
+/// Steam genre names → store search tag ids (used by the paginated top-seller
+/// search). Genres without a useful tag (Free To Play, Early Access, …) don't
+/// make a row.
+const GENRE_TAGS: &[(&str, u32)] = &[
+    ("action", 19),
+    ("adventure", 21),
+    ("rpg", 122),
+    ("strategy", 9),
+    ("simulation", 599),
+    ("casual", 597),
+    ("indie", 492),
+    ("racing", 699),
+    ("sports", 701),
+    ("massively multiplayer", 128),
 ];
 
-static GENRES_CACHE: Mutex<Option<(Instant, Vec<(String, String)>)>> = Mutex::new(None);
+static GENRES_CACHE: Mutex<Option<(Instant, Vec<(String, u32)>)>> = Mutex::new(None);
 
 /// The genres the user actually plays — tallied from their recent games'
-/// store pages, best first, as (display name, store slug). Cached: the
+/// store pages, best first, as (display name, store search tag id). Cached: the
 /// tally needs a storefront lookup per recent game.
-pub fn top_genres(limit: usize) -> Vec<(String, String)> {
+pub fn top_genres(limit: usize) -> Vec<(String, u32)> {
     const TTL: Duration = Duration::from_secs(900);
     {
         let cache = GENRES_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -70,13 +72,13 @@ pub fn top_genres(limit: usize) -> Vec<(String, String)> {
     }
     let mut counts: Vec<(String, usize)> = tally.into_iter().collect();
     counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let genres: Vec<(String, String)> = counts
+    let genres: Vec<(String, u32)> = counts
         .into_iter()
         .filter_map(|(name, _)| {
-            GENRE_SLUGS
+            GENRE_TAGS
                 .iter()
                 .find(|(g, _)| *g == name.to_lowercase())
-                .map(|(_, slug)| (name, slug.to_string()))
+                .map(|(_, tag)| (name, *tag))
         })
         .collect();
     *GENRES_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), genres.clone()));
@@ -84,7 +86,7 @@ pub fn top_genres(limit: usize) -> Vec<(String, String)> {
 }
 
 pub fn recommended(library: &[Row]) -> Vec<ContentItem> {
-    let candidates = gamehub::charts_unowned(library);
+    let candidates = gamehub::recommend_pool(library);
     if candidates.is_empty() {
         return Vec::new();
     }

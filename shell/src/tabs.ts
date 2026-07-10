@@ -10,7 +10,7 @@
 
 import { ContentItem, Kind, Row } from './api';
 
-export type TabId = 'foryou' | 'live' | 'movies' | 'shows' | 'library';
+export type TabId = 'foryou' | 'movies' | 'shows' | 'library';
 
 export interface TabDef {
   id: TabId;
@@ -19,7 +19,6 @@ export interface TabDef {
 
 export const TABS: TabDef[] = [
   { id: 'foryou', label: 'For you' },
-  { id: 'live', label: 'Live' },
   { id: 'movies', label: 'Movies' },
   { id: 'shows', label: 'Shows' },
   { id: 'library', label: 'Library' },
@@ -30,16 +29,14 @@ export const TABS: TabDef[] = [
 // through and what you own.
 const LIBRARY_ROW = /^(continue|ready to|watchlist|my )/i;
 
-// Which item kinds belong under each simple content tab. "Live" collects video
-// (YouTube feeds) — the closest thing to an always-on channel on this box.
-// "Apps" and "Library" are special-cased in rowsForTab.
-const TAB_KINDS: Record<'live' | 'movies' | 'shows', Kind[]> = {
-  live: ['video'],
+// Which item kinds belong under each simple content tab. "Library" is
+// special-cased in rowsForTab.
+const TAB_KINDS: Record<'movies' | 'shows', Kind[]> = {
   movies: ['movie'],
   shows: ['series'],
 };
 
-/** The rows to show for a tab. "For you" is every row as-is. Movies/Shows/Live
+/** The rows to show for a tab. "For you" is every row as-is. Movies/Shows
  *  narrow each row to the tab's kinds and drop rows that empty out. "Library"
  *  gathers your Continue/owned rows plus every game row. Item order is always
  *  preserved. */

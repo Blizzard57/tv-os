@@ -312,6 +312,18 @@ fn ui_dir() -> PathBuf {
     .unwrap_or(user_default)
 }
 
+/// Personal library rows kept on the recommendation-only home — your watchlist
+/// and owned/started rows — as opposed to generic browse catalogues (Cinemeta
+/// "Popular"/"Trending", TMDB discovery, etc.), which are dropped. Mirrors the
+/// shell's LIBRARY_ROW grouping (see shell/src/tabs.ts).
+fn is_personal_row(title: &str) -> bool {
+    let t = title.to_ascii_lowercase();
+    t.contains("because you")
+        || ["continue", "watchlist", "ready to", "my ", "your "]
+            .iter()
+            .any(|p| t.starts_with(p))
+}
+
 /// Library building shells out to store CLIs and may hit catalog APIs, so it
 /// runs on a blocking thread instead of stalling the async executor.
 /// Personalized rows (Continue / Recommended) come first.
@@ -335,66 +347,83 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
                 }
             }
             recent.truncate(16);
+
+            // The home is strictly a recommendation feed (Google-TV "For you"):
+            // personalized rows only — no browse catalogues. "Top picks for you"
+            // leads; "Because you watched X" follows.
             let mut r = sources::tmdb::for_you(&recent);
             let library = app.refresh_library();
-            // "Games for you": the recommender picks (taste-ranked when the
-            // embedder is warm); GameHub prices them on their pages.
-            // Store discovery rows + to-buy recommendations, fetched in
-            // parallel while the library is still whole (owned filtering).
-            let (recs, deals, fresh, genre_rows) = std::thread::scope(|s| {
+
+            // Recommendation rows built in parallel while the library is whole:
+            // "Because you watched X" (video), taste-ranked game picks for the
+            // Games hub, and "Because you play X" genre rows.
+            let (bcw, recs, genre_rows) = std::thread::scope(|s| {
+                let bcw = s.spawn(|| sources::tmdb::because_you_watched(&recent, 3));
                 let recs = s.spawn(|| sources::gamerec::recommended(&library));
-                let deals = s.spawn(|| sources::gamehub::category_row("specials", &library, 16));
-                let fresh =
-                    s.spawn(|| sources::gamehub::category_row("new_releases", &library, 16));
                 let genres = s.spawn(|| {
-                    sources::gamerec::top_genres(2)
+                    sources::gamerec::top_genres(3)
                         .into_iter()
-                        .map(|(name, slug)| model::Row {
+                        .map(|(name, tag)| model::Row {
                             title: format!("Because you play {name}"),
-                            items: sources::gamehub::genre_row(&slug, &library, 14),
+                            items: sources::gamehub::genre_row(tag, &library, 20),
                         })
                         .filter(|row| !row.items.is_empty())
                         .collect::<Vec<_>>()
                 });
                 (
+                    bcw.join().unwrap_or_default(),
                     recs.join().unwrap_or_default(),
-                    deals.join().unwrap_or_default(),
-                    fresh.join().unwrap_or_default(),
                     genres.join().unwrap_or_default(),
                 )
             });
 
-            // One games hub: everything installed, owned and worth buying in
-            // a single "Games for Me" row — the badges tell the states apart.
-            let mut games: Vec<model::ContentItem> = Vec::new();
-            let mut rest: Vec<model::Row> = Vec::new();
+            r.extend(bcw);
+
+            // Your installed/owned games → the "Games" row. Non-game library
+            // rows are kept ONLY when personal (your watchlist / owned rows);
+            // generic browse catalogues (Cinemeta "Popular"/"Trending", etc.)
+            // are dropped — the home is recommendation-only.
+            let mut owned_games: Vec<model::ContentItem> = Vec::new();
+            let mut personal: Vec<model::Row> = Vec::new();
             for mut row in library {
                 let all_games =
                     !row.items.is_empty() && row.items.iter().all(|i| i.kind == model::Kind::Game);
                 if all_games {
-                    games.append(&mut row.items);
-                } else {
-                    rest.push(row);
+                    owned_games.append(&mut row.items);
+                } else if is_personal_row(&row.title) {
+                    personal.push(row);
                 }
             }
-            games.extend(recs);
-            if !games.is_empty() {
+
+            // De-duplicate game recommendations across every rec row so a title
+            // never repeats: the "Recommended games" row claims its picks first,
+            // then each "Because you play X" row keeps only what's still unseen.
+            let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let recs: Vec<model::ContentItem> =
+                recs.into_iter().filter(|i| used.insert(i.id.clone())).collect();
+            let genre_rows: Vec<model::Row> = genre_rows
+                .into_iter()
+                .filter_map(|mut row| {
+                    row.items.retain(|i| used.insert(i.id.clone()));
+                    (!row.items.is_empty()).then_some(row)
+                })
+                .collect();
+
+            if !owned_games.is_empty() {
                 r.push(model::Row {
-                    title: "Games for Me".to_string(),
-                    items: games,
+                    title: "Games".to_string(),
+                    items: owned_games,
                 });
             }
-            for (title, items) in [("Game deals", deals), ("New on Steam", fresh)] {
-                if !items.is_empty() {
-                    r.push(model::Row {
-                        title: title.to_string(),
-                        items,
-                    });
-                }
+            if !recs.is_empty() {
+                r.push(model::Row {
+                    title: "Recommended games".to_string(),
+                    items: recs,
+                });
             }
             r.extend(genre_rows);
-            r.extend(rest);
-            // Taste-biased, lightly random order per section — fresh finds
+            r.extend(personal);
+            // Taste-biased, lightly random item order per row — fresh finds
             // mixed with the familiar on every visit.
             sources::tmdb::personalize(&mut r, &recent);
             r

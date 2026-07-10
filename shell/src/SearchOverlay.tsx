@@ -57,14 +57,15 @@ function ResultCard({
 }) {
   const [artFailed, setArtFailed] = useState(false);
   const badge = badgeFor(item);
-  const wide = item.kind === 'video';
+  // Google TV shows results as wide 16:9 cards (art_of now feeds landscape
+  // backdrops), so every search card is landscape.
   return (
     <div
       ref={refCb}
-      className={`search-card ${wide ? 'search-card-wide' : ''} ${selected ? 'selected' : ''}`}
+      className={`search-card ${selected ? 'selected' : ''}`}
       onClick={() => onPick(item)}
     >
-      <div className={`search-art ${wide ? 'search-art-wide' : ''}`}>
+      <div className="search-art">
         {item.art && !artFailed ? (
           <img
             src={item.art}

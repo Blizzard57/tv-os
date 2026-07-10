@@ -30,6 +30,9 @@ const OFFERS_TTL: Duration = Duration::from_secs(600);
 
 static CHARTS_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<(i64, String, String)>)>>> =
     LazyLock::new(Mutex::default);
+/// Cache of Steam store-search top-seller appid lists, keyed by request URL.
+static TOPSELLER_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<i64>)>>> =
+    LazyLock::new(Mutex::default);
 static OFFERS_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<Stream>)>>> =
     LazyLock::new(Mutex::default);
 /// appid → (name, art) once verified; art is the portrait capsule when the
@@ -158,26 +161,101 @@ fn shop_item(id: i64, name: String) -> ContentItem {
     }
 }
 
-/// Candidate pool for the game recommender (gamerec.rs decides the order):
-/// the region's store charts minus everything already in the library, box
-/// art verified.
-pub fn charts_unowned(library: &[Row]) -> Vec<ContentItem> {
+/// Steam store-search top-seller appids (most popular first), optionally within
+/// a store tag (genre). The paginated search endpoint returns ~100 per call —
+/// the reason we use it over `getappsingenre`/`featuredcategories`, which cap at
+/// 10 and leave nothing after a big library's owned titles are filtered out.
+/// Cached by URL (15-min TTL).
+fn topseller_ids(region: &str, tag: Option<u32>) -> Vec<i64> {
+    let tag_q = tag.map(|t| format!("&tags={t}")).unwrap_or_default();
+    let url = format!(
+        "https://store.steampowered.com/search/results/?filter=topsellers{tag_q}\
+         &start=0&count=100&cc={region}&l=en&json=1&infinite=1"
+    );
+    if let Some((at, ids)) = TOPSELLER_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&url) {
+        if at.elapsed() < CHARTS_TTL {
+            return ids.clone();
+        }
+    }
+    let ids = search_appids(&url);
+    if !ids.is_empty() {
+        TOPSELLER_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(url, (Instant::now(), ids.clone()));
+    }
+    ids
+}
+
+/// Pulls the `data-ds-appid` ids out of a store-search results page (the search
+/// endpoint returns rendered HTML rows inside JSON). Bundles carry a
+/// comma-separated list — we take the first id. De-duped, order preserved.
+fn search_appids(url: &str) -> Vec<i64> {
+    let Ok(json) = http_get_quick(url) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&json) else {
+        return Vec::new();
+    };
+    let html = v.get("results_html").and_then(|h| h.as_str()).unwrap_or_default();
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for chunk in html.split("data-ds-appid=\"").skip(1) {
+        let Some(end) = chunk.find('"') else { continue };
+        let first = chunk[..end].split(',').next().unwrap_or_default();
+        if let Ok(id) = first.parse::<i64>() {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// appids → shop items: fetches each title's brief (name) in parallel, keeping
+/// only real games whose portrait box art exists and that aren't owned by
+/// title. Order is preserved (popularity).
+fn resolve_shop_items(ids: Vec<i64>, owned_titles: &HashSet<String>) -> Vec<ContentItem> {
+    std::thread::scope(|scope| {
+        let briefs: Vec<_> = ids
+            .into_iter()
+            .map(|id| scope.spawn(move || app_brief(id).map(|name| (id, name))))
+            .collect();
+        briefs
+            .into_iter()
+            .filter_map(|b| b.join().ok().flatten())
+            .filter(|(_, name)| !owned_titles.contains(&name.to_lowercase()))
+            .map(|(id, name)| shop_item(id, name))
+            .collect()
+    })
+}
+
+/// Candidate pool for the game recommender (gamerec.rs decides the order): the
+/// region's global top sellers minus everything already owned, box-art
+/// verified. Falls back to the featured charts if search is unavailable.
+pub fn recommend_pool(library: &[Row]) -> Vec<ContentItem> {
     let (owned_titles, owned_apps) = owned_sets(library);
-    let pool: Vec<(i64, String)> = charts(&region())
+    let region = region();
+    let mut ids: Vec<i64> = topseller_ids(&region, None)
         .into_iter()
-        .filter(|(id, name, _)| {
-            !owned_apps.contains(id) && !owned_titles.contains(&name.to_lowercase())
-        })
-        .map(|(id, name, _)| (id, name))
+        .filter(|id| !owned_apps.contains(id))
+        .take(60)
         .collect();
-    with_portraits(pool)
-        .into_iter()
-        .map(|(id, name)| shop_item(id, name))
-        .collect()
+    if ids.is_empty() {
+        // Fallback: the small featured charts (10-ish each) still beats nothing.
+        ids = charts(&region)
+            .into_iter()
+            .filter(|(id, _, _)| !owned_apps.contains(id))
+            .map(|(id, _, _)| id)
+            .collect();
+    }
+    resolve_shop_items(ids, &owned_titles)
 }
 
 /// One featured category ("specials" = deals, "new_releases") as unowned,
-/// art-verified shop items.
+/// art-verified shop items. Currently unused — the home is recommendation-only
+/// (no deals/new-release browse rows) — but kept for a future browse setting.
+#[allow(dead_code)]
 pub fn category_row(list: &str, library: &[Row], limit: usize) -> Vec<ContentItem> {
     let (owned_titles, owned_apps) = owned_sets(library);
     let pool: Vec<(i64, String)> = category(&region(), list)
@@ -194,50 +272,20 @@ pub fn category_row(list: &str, library: &[Row], limit: usize) -> Vec<ContentIte
         .collect()
 }
 
-/// Top sellers of one store genre hub (slug like "action", "rpg") as
-/// unowned, art-verified shop items. Names come from cached app briefs —
-/// the genre endpoint only returns ids.
-pub fn genre_row(slug: &str, library: &[Row], limit: usize) -> Vec<ContentItem> {
+/// Top sellers within one store genre `tag` (e.g. Action=19, RPG=122) as
+/// unowned, art-verified shop items, popularity order. Uses the paginated store
+/// search (100/call) so a big library still leaves plenty after owned-filtering.
+pub fn genre_row(tag: u32, library: &[Row], limit: usize) -> Vec<ContentItem> {
     let (owned_titles, owned_apps) = owned_sets(library);
-    let url = format!(
-        "https://store.steampowered.com/api/getappsingenre/?genre={}&cc={}&l=en",
-        percent_encode(slug),
-        region()
-    );
-    let Ok(json) = http_get_quick(&url) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&json) else {
-        return Vec::new();
-    };
-    let ids: Vec<i64> = v
-        .get("tabs")
-        .and_then(|t| t.get("topsellers"))
-        .and_then(|t| t.get("items"))
-        .and_then(|i| i.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|i| i.get("id").and_then(|x| x.as_i64()))
-                .filter(|id| !owned_apps.contains(id))
-                .take(limit * 2) // room for brief/art misses
-                .collect()
-        })
-        .unwrap_or_default();
-
-    std::thread::scope(|scope| {
-        let briefs: Vec<_> = ids
-            .into_iter()
-            .map(|id| scope.spawn(move || app_brief(id).map(|name| (id, name))))
-            .collect();
-        briefs
-            .into_iter()
-            .filter_map(|b| b.join().ok().flatten())
-            .filter(|(_, name)| !owned_titles.contains(&name.to_lowercase()))
-            .take(limit)
-            .map(|(id, name)| shop_item(id, name))
-            .collect()
-    })
+    let ids: Vec<i64> = topseller_ids(&region(), Some(tag))
+        .into_iter()
+        .filter(|id| !owned_apps.contains(id))
+        .take(limit * 3) // room for brief/portrait/owned-title misses
+        .collect();
+    resolve_shop_items(ids, &owned_titles)
+        .into_iter()
+        .take(limit)
+        .collect()
 }
 
 /// Name for an appid, only when it's a normal game with portrait box art.

@@ -189,7 +189,7 @@ impl ManifestStore {
             .get("name")
             .and_then(|n| n.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or("manifest needs a \"name\" field")?;
+            .unwrap_or("Sources");
         let id = match &source_url {
             Some(url) => url.clone(),
             None => format!("paste:{name}"),
@@ -510,22 +510,51 @@ impl<'a> TemplateCtx<'a> {
 /// CloudStream *plugin repository* (a list of compiled `.cs3` plugins) — we
 /// detect that and say so, instead of a confusing "no sources" message.
 fn interpret_manifest(value: &Value) -> Result<Value, String> {
-    // A real source manifest is an object with a "sources" array.
-    if value.get("sources").and_then(|s| s.as_array()).is_some() {
-        return Ok(value.clone());
+    // A source manifest is an object with an array of sources. Accept the
+    // native "sources" key plus a couple of common synonyms, normalising to
+    // "sources".
+    for key in ["sources", "providers", "list"] {
+        if let Some(arr) = value.get(key).and_then(|s| s.as_array()) {
+            let mut obj = value.clone();
+            if key != "sources" {
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("sources".to_string(), Value::Array(arr.clone()));
+                }
+            }
+            return Ok(obj);
+        }
     }
-    if is_cs3_plugin_list(value) {
+
+    // A CloudStream *plugin repository* — either repo.json (has "pluginLists")
+    // or a plugins.json array of compiled .cs3 plugins. These are Android/Kotlin
+    // extensions that this app has no runtime for; there's nothing to parse.
+    if value.get("pluginLists").is_some() || is_cs3_plugin_list(value) {
         return Err(
-            "This is a CloudStream plugin repository — a list of compiled .cs3 plugins \
-             (Android/Kotlin extensions) that this app cannot run. Add a source manifest \
-             instead: a JSON object with a \"sources\" array, where each source gives a \
-             \"movie\"/\"series\" URL template that returns stream links."
+            "This lists CloudStream .cs3 plugins — compiled Android/Kotlin code (each \
+             plugin is Dalvik bytecode that scrapes a site), which this app has no \
+             runtime to execute; there are no stream URLs inside to import. Use a \
+             Stremio addon (Settings → Addons) for the same coverage over HTTP, or a \
+             source manifest here: a JSON object with a \"sources\" array whose entries \
+             give a \"movie\"/\"series\" URL template that returns stream links."
                 .to_string(),
         );
     }
+
+    // A bare array of source objects (no wrapper) — accept it as the sources.
+    if let Some(arr) = value.as_array() {
+        if arr.iter().any(looks_like_source) {
+            return Ok(serde_json::json!({ "name": "Sources", "sources": arr }));
+        }
+    }
+    // A single source object (no wrapper) — wrap it.
+    if looks_like_source(value) {
+        return Ok(serde_json::json!({ "name": "Sources", "sources": [value] }));
+    }
+
     Err(
         "not a source manifest — expected a JSON object with a \"sources\" array \
-         (each source: a \"movie\"/\"series\" URL template). See the format in Settings."
+         (each source: a \"movie\"/\"series\" URL template), a bare array of such \
+         sources, or a single source object. See the format in Settings."
             .to_string(),
     )
 }
@@ -546,8 +575,35 @@ fn is_cs3_plugin_list(value: &Value) -> bool {
     })
 }
 
+/// Alternate spellings accepted for the movie / series URL templates, so a
+/// manifest written for a slightly different convention still works.
+const MOVIE_KEYS: &[&str] = &["movie", "movieUrl", "movie_url", "movieUrlTemplate"];
+const SERIES_KEYS: &[&str] = &["series", "tv", "seriesUrl", "series_url", "tv_url", "show"];
+/// A single template that serves both (a generic `url`/`template`).
+const GENERIC_KEYS: &[&str] = &["url", "template", "urlTemplate"];
+
+/// First non-empty string among `keys` on `s`.
+fn first_template(s: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| s.get(*k).and_then(|v| v.as_str()))
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+}
+
+/// Does this JSON value look like a stream source (declares some URL template)?
+/// Used to accept a bare array / single object of sources without a wrapper.
+fn looks_like_source(v: &Value) -> bool {
+    !v.is_string()
+        && (first_template(v, MOVIE_KEYS).is_some()
+            || first_template(v, SERIES_KEYS).is_some()
+            || first_template(v, GENERIC_KEYS).is_some())
+}
+
 /// Parses the `sources` array of a manifest into usable providers. A source is
-/// kept only if it declares at least one template (movie or series).
+/// kept only if it declares at least one template (movie or series). Accepts
+/// several key spellings (`movie`/`movieUrl`/…, `series`/`tv`/…) and a generic
+/// `url`/`template` that serves movies, and series too when it references a
+/// `{season}`/`{episode}` placeholder.
 fn parse_sources(manifest: &Value) -> Vec<SourceDef> {
     let Some(sources) = manifest.get("sources").and_then(|s| s.as_array()) else {
         return Vec::new();
@@ -555,14 +611,16 @@ fn parse_sources(manifest: &Value) -> Vec<SourceDef> {
     sources
         .iter()
         .filter_map(|s| {
-            let template = |key: &str| {
-                s.get(key)
-                    .and_then(|v| v.as_str())
-                    .filter(|t| !t.is_empty())
-                    .map(String::from)
-            };
-            let movie = template("movie");
-            let series = template("series");
+            let generic = first_template(s, GENERIC_KEYS);
+            let movie = first_template(s, MOVIE_KEYS).or_else(|| generic.clone());
+            let series = first_template(s, SERIES_KEYS).or_else(|| {
+                // A generic template is a series template only if it can vary by
+                // episode — otherwise it's a movies-only source.
+                generic
+                    .as_ref()
+                    .filter(|t| t.contains("{season}") || t.contains("{episode}"))
+                    .cloned()
+            });
             if movie.is_none() && series.is_none() {
                 return None; // nothing playable
             }
@@ -806,5 +864,56 @@ mod tests {
         let plain = serde_json::json!([{"foo": "bar"}]);
         assert!(!is_cs3_plugin_list(&plain));
         assert!(interpret_manifest(&plain).is_err());
+    }
+
+    #[test]
+    fn rejects_cloudstream_repo_json_with_pluginlists() {
+        // The canonical CloudStream repo.json — compiled .cs3 plugins, unrunnable.
+        let repo = serde_json::json!({
+            "name": "MyRepo", "description": "d", "manifestVersion": 1,
+            "pluginLists": ["https://host/builds/plugins.json"]
+        });
+        let err = interpret_manifest(&repo).unwrap_err();
+        assert!(err.contains(".cs3"), "pluginLists repo should get the plugin-repo error: {err}");
+    }
+
+    #[test]
+    fn accepts_lenient_source_manifest_shapes() {
+        // Bare array of source objects (no wrapper).
+        let bare = serde_json::json!([{ "name": "A", "movie": "https://h/m/{imdb}" }]);
+        assert_eq!(parse_sources(&interpret_manifest(&bare).unwrap()).len(), 1);
+
+        // Single source object (no wrapper).
+        let single =
+            serde_json::json!({ "name": "Solo", "series": "https://h/s/{imdb}/{season}/{episode}" });
+        let defs = parse_sources(&interpret_manifest(&single).unwrap());
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "Solo");
+        assert!(defs[0].series.is_some() && defs[0].movie.is_none());
+
+        // Alternate container key ("providers") + alternate template keys.
+        let alt = serde_json::json!({
+            "name": "Alt",
+            "providers": [{
+                "name": "P",
+                "movieUrl": "https://h/m/{imdb}",
+                "tv": "https://h/t/{imdb}/{season}/{episode}"
+            }]
+        });
+        let defs = parse_sources(&interpret_manifest(&alt).unwrap());
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].movie.is_some() && defs[0].series.is_some());
+
+        // A generic `url` serves movies; it's a series template only when it can
+        // vary by episode.
+        let generic = serde_json::json!({ "sources": [{ "name": "G", "url": "https://h/{type}/{id}.json" }] });
+        let defs = parse_sources(&interpret_manifest(&generic).unwrap());
+        assert!(defs[0].movie.is_some() && defs[0].series.is_none());
+
+        let generic_ep = serde_json::json!({ "sources": [
+            { "name": "G", "url": "https://h/{type}/{imdb}/{season}/{episode}" }
+        ] });
+        let defs = parse_sources(&interpret_manifest(&generic_ep).unwrap());
+        assert!(defs[0].series.is_some());
     }
 }
