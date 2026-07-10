@@ -747,23 +747,28 @@ textarea:focus-visible {
 
 .details-bg {
   position: fixed;
-  inset: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  /* A tall cinematic banner that fades into the page — not a full-height cover
+     that gets awkwardly cropped when the page scrolls. */
+  height: 78vh;
   background-size: cover;
-  background-position: center 20%;
+  background-position: center top;
 }
 
 .details-scrim {
   position: fixed;
   inset: 0;
   background:
-    linear-gradient(to top, var(--bg) 8%, rgba(13, 14, 19, 0.35) 60%, rgba(13, 14, 19, 0.6) 100%),
-    linear-gradient(to right, var(--bg) 0%, rgba(13, 14, 19, 0.5) 55%, transparent 92%);
+    linear-gradient(to top, var(--bg) 22%, rgba(13, 14, 19, 0.35) 62%, rgba(13, 14, 19, 0.55) 100%),
+    linear-gradient(to right, var(--bg) 0%, rgba(13, 14, 19, 0.55) 40%, rgba(13, 14, 19, 0.25) 75%, transparent 100%);
 }
 
 [data-theme='light'] .details-scrim {
   background:
-    linear-gradient(to top, var(--bg) 8%, rgba(245, 244, 250, 0.35) 60%, rgba(245, 244, 250, 0.6) 100%),
-    linear-gradient(to right, var(--bg) 0%, rgba(245, 244, 250, 0.5) 55%, transparent 92%);
+    linear-gradient(to top, var(--bg) 22%, rgba(245, 244, 250, 0.4) 62%, rgba(245, 244, 250, 0.55) 100%),
+    linear-gradient(to right, var(--bg) 0%, rgba(245, 244, 250, 0.6) 40%, rgba(245, 244, 250, 0.3) 75%, transparent 100%);
 }
 
 .details-back,
@@ -777,19 +782,31 @@ textarea:focus-visible {
 .details-body {
   position: relative;
   z-index: 2;
-  padding: calc(var(--safe-top) + 96px) var(--edge) calc(var(--safe-bottom) + 60px);
-  max-width: 1280px;
+  padding: calc(var(--safe-top) + 96px) var(--edge) calc(var(--safe-bottom) + 84px);
+  /* Use the whole width so the page never feels lopsided/empty on the right. */
+  max-width: 1720px;
+  margin: 0 auto;
 }
 
 .details-head {
-  display: flex;
-  gap: 34px;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr) minmax(300px, 360px);
+  gap: 40px;
+  align-items: start;
+}
+
+/* On narrower panels drop the facts column below rather than squashing it. */
+@media (max-width: 1180px) {
+  .details-head {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+  .details-facts {
+    grid-column: 1 / -1;
+  }
 }
 
 .details-poster {
-  flex: 0 0 auto;
-  width: 240px;
+  width: 100%;
   aspect-ratio: 2 / 3;
   object-fit: cover;
   border-radius: 16px;
@@ -797,9 +814,7 @@ textarea:focus-visible {
 }
 
 .details-info {
-  flex: 1;
   min-width: 0;
-  max-width: 720px;
 }
 
 .details-kind {
@@ -871,6 +886,61 @@ textarea:focus-visible {
   color: var(--text);
   opacity: 0.94;
   max-width: 780px;
+}
+
+/* ---- Facts panel (right column of the hero) ---- */
+
+.details-facts {
+  align-self: stretch;
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  border: 1px solid var(--overlay-border);
+  border-radius: 16px;
+  padding: 20px 22px;
+  backdrop-filter: blur(8px);
+}
+
+.details-facts-head {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 14px;
+}
+
+.details-facts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.fact-row {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 12px;
+  padding: 9px 0;
+  font-size: 14px;
+  border-top: 1px solid var(--overlay-border);
+}
+
+.fact-row:first-child {
+  border-top: none;
+}
+
+.fact-row dt {
+  color: var(--text-dim);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.fact-row dd {
+  margin: 0;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.details-facts-tags {
+  margin-top: 16px;
 }
 
 /* Action / list rows on the details page share the pill look. */
@@ -959,7 +1029,28 @@ textarea:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  max-width: 900px;
+  max-width: 1040px;
+  /* Keep long lists compact: cap the height and scroll inside instead of
+     stretching the page down forever. Selection scrollIntoView keeps the
+     focused row visible. */
+  max-height: 46vh;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--overlay-border) transparent;
+  /* Room so the focused row's lift + ring isn't clipped by the scroll box. */
+  padding: 6px 4px;
+  margin-left: -4px;
+}
+
+.ep-list::-webkit-scrollbar,
+.stream-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.ep-list::-webkit-scrollbar-thumb,
+.stream-list::-webkit-scrollbar-thumb {
+  background: var(--overlay-border);
+  border-radius: 8px;
 }
 
 .ep-item {
@@ -1075,6 +1166,136 @@ textarea:focus-visible {
   color: var(--text-dim);
 }
 
+/* ---- Compact "best pick" source picker ---- */
+
+.source-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 1040px;
+}
+
+.best-source {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 18px 24px;
+  border-radius: 16px;
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+  cursor: pointer;
+  transition: background 0.12s, box-shadow 0.12s, transform 0.12s;
+}
+
+.best-source.selected {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), 0 16px 40px var(--accent-glow);
+  transform: translateY(-1px);
+}
+
+.best-play {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 20px;
+  padding-left: 3px;
+}
+
+.best-source.selected .best-play {
+  background: var(--on-accent);
+  color: var(--accent);
+}
+
+.best-text {
+  min-width: 0;
+}
+
+.best-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.best-label {
+  font-size: 19px;
+  font-weight: 700;
+}
+
+.source-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--overlay-border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.best-source.selected .source-chip {
+  background: color-mix(in srgb, var(--on-accent) 20%, transparent);
+  border-color: transparent;
+  color: var(--on-accent);
+}
+
+.best-detail {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 760px;
+}
+
+.best-source.selected .best-detail {
+  color: color-mix(in srgb, var(--on-accent) 82%, transparent);
+}
+
+.source-toggle {
+  align-self: flex-start;
+  padding: 11px 22px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--overlay-border);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.12s, box-shadow 0.12s, color 0.12s;
+}
+
+.source-toggle.selected {
+  background: var(--surface-2);
+  border-color: var(--accent);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* "Best" ribbon on the top-ranked row in the expanded list. */
+.stream-best {
+  border-color: var(--overlay-border);
+}
+
+.best-tag {
+  margin-left: 10px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  vertical-align: middle;
+}
+
 /* ---- Horizontal strips: screenshots, achievements, similar ---- */
 
 .shots {
@@ -1097,9 +1318,13 @@ textarea:focus-visible {
 
 .shots-strip {
   display: flex;
-  gap: 14px;
+  gap: 16px;
   overflow-x: auto;
-  padding: 12px 0;
+  /* Generous padding + matching negative margin so a focused card's scale and
+     focus ring are never clipped by the (auto) overflow box — the source of
+     the cropping when an item was selected. */
+  padding: 20px 24px;
+  margin: -8px -24px 0;
   scrollbar-width: none;
 }
 
@@ -1109,7 +1334,7 @@ textarea:focus-visible {
 
 .shot {
   flex: 0 0 auto;
-  height: 190px;
+  height: 200px;
   border-radius: var(--card-radius);
   object-fit: cover;
   background: var(--surface);

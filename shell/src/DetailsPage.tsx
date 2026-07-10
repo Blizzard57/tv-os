@@ -52,6 +52,9 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const [season, setSeason] = useState(1);
   const [episode, setEpisode] = useState<Episode | null>(null);
   const [streams, setStreams] = useState<Stream[] | null>(null);
+  // Sources are compact by default (auto-chosen best pick + a toggle); this
+  // expands the full ranked list.
+  const [showAllSources, setShowAllSources] = useState(false);
   const [sel, setSel] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState<{ label: string; kind: LoadingKind } | null>(null);
@@ -78,6 +81,11 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   // A "Resume" entry leads the episodes/streams list when there's a saved spot.
   const resumeShown = !!resume && isStreamItem(item.id) && (stage === 'streams' || stage === 'episodes');
   const resumeOffset = resumeShown ? 1 : 0;
+  // Only real stream sources (Torrentio &c.) get the "best pick + reveal the
+  // rest" treatment. Shop offers are always shown in full (cheapest first).
+  const canCompactSources = isStreamItem(item.id) && !isShopItem(item.id);
+  const sourcesExpanded = !canCompactSources || showAllSources;
+  const bestStream = streams && streams.length > 0 ? streams[0] : null;
 
   // Load metadata, then decide the opening stage.
   // Is there a saved spot/source to continue from?
@@ -148,6 +156,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     setStreams(null);
     setSel(0);
     setStrip(null);
+    setShowAllSources(false);
     fetchStreams(id)
       .then((s) => {
         if (token !== streamToken.current) return; // a newer load won
@@ -292,8 +301,19 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
         return;
       }
 
+      // In the streams stage the navigable rows depend on whether the compact
+      // "best pick + reveal" view or the full ranked list is showing.
+      const streamRows = !streams
+        ? 0
+        : sourcesExpanded
+          ? streams.length
+          : Math.min(streams.length, 2); // best pick + "show all" toggle
       const base: unknown[] =
-        stage === 'episodes' ? episodesInSeason : stage === 'streams' ? (streams ?? []) : [0];
+        stage === 'episodes'
+          ? episodesInSeason
+          : stage === 'streams'
+            ? new Array(streamRows)
+            : [0];
       // A "Resume" entry takes index 0 when we have somewhere to continue from.
       const offset = resumeShown ? 1 : 0;
       const navLen = base.length + offset;
@@ -329,12 +349,25 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
             const ep = episodesInSeason[sel - offset];
             if (ep) openEpisode(ep);
           } else if (stage === 'streams') {
-            const s = streams?.[sel - offset];
-            if (s) playChosen(s);
+            const idx = sel - offset;
+            if (sourcesExpanded) {
+              const s = streams?.[idx];
+              if (s) playChosen(s);
+            } else if (idx === 0) {
+              if (streams?.[0]) playChosen(streams[0]);
+            } else if (idx === 1) {
+              // Reveal the full ranked list, landing on the best pick.
+              setShowAllSources(true);
+              setSel(offset);
+            }
           }
           break;
         case 'back':
-          if (stage === 'streams' && series) {
+          if (stage === 'streams' && showAllSources && canCompactSources) {
+            // Collapse back to the compact best-pick view.
+            setShowAllSources(false);
+            setSel(offset);
+          } else if (stage === 'streams' && series) {
             setStage('episodes');
             setSel(0);
           } else onClose();
@@ -343,7 +376,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           break;
       }
     },
-    [stage, episodesInSeason, streams, seasons, season, sel, series, runAction, openEpisode, playChosen, onClose, onOpen, loading, strip, similar, extras, meta, resume, resumeShown],
+    [stage, episodesInSeason, streams, seasons, season, sel, series, runAction, openEpisode, playChosen, onClose, onOpen, loading, strip, similar, extras, meta, resume, resumeShown, sourcesExpanded, showAllSources, canCompactSources],
   );
 
   // Navigation must always keep the selection on screen: the selected list
@@ -351,7 +384,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   useEffect(() => {
     if (strip) return;
     selRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [sel, stage, strip, streams, episode, episodesInSeason]);
+  }, [sel, stage, strip, streams, episode, episodesInSeason, showAllSources]);
 
   useEffect(() => {
     if (!strip) return;
@@ -399,11 +432,20 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 meta?.release_info,
                 meta?.runtime,
                 meta?.rating && (isGame ? `Metacritic ${meta.rating}` : `★ ${meta.rating}`),
-                meta?.genres?.slice(0, 3).join(', '),
+                series && seasons.length > 0 && `${seasons.length} season${seasons.length > 1 ? 's' : ''}`,
               ]
                 .filter(Boolean)
                 .join('  ·  ')}
             </div>
+            {!!meta?.genres?.length && (
+              <div className="details-tags">
+                {meta.genres.map((g) => (
+                  <span key={g} className="details-tag">
+                    {g}
+                  </span>
+                ))}
+              </div>
+            )}
             {(extras.playtime_minutes != null || extras.hltb || extras.achievements) && (
               <div className="game-stats">
                 {extras.playtime_minutes != null && (
@@ -437,29 +479,6 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 )}
               </div>
             )}
-            {(meta?.developer || meta?.publisher) && (
-              <div className="details-credits">
-                {meta?.developer && (
-                  <span>
-                    <span className="details-credit-label">Developer</span> {meta.developer}
-                  </span>
-                )}
-                {meta?.publisher && meta.publisher !== meta.developer && (
-                  <span>
-                    <span className="details-credit-label">Publisher</span> {meta.publisher}
-                  </span>
-                )}
-              </div>
-            )}
-            {!!meta?.tags?.length && (
-              <div className="details-tags">
-                {meta.tags.map((t) => (
-                  <span key={t} className="details-tag">
-                    {t}
-                  </span>
-                ))}
-              </div>
-            )}
             {metaError ? (
               <p className="details-desc">
                 Couldn't load the details for this title — the daemon may be busy or offline.
@@ -472,6 +491,49 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
               </>
             )}
           </div>
+
+          {(() => {
+            const facts: { label: string; value: string }[] = [
+              meta?.rating && {
+                label: isGame ? 'Metacritic' : 'Rating',
+                value: isGame ? String(meta.rating) : `★ ${meta.rating}`,
+              },
+              meta?.release_info && { label: 'Released', value: meta.release_info },
+              meta?.runtime && { label: 'Runtime', value: meta.runtime },
+              series &&
+                seasons.length > 0 && {
+                  label: 'Seasons',
+                  value: `${seasons.length} · ${meta?.episodes.length ?? 0} episodes`,
+                },
+              !!meta?.genres?.length && { label: 'Genres', value: meta!.genres.join(', ') },
+              meta?.developer && { label: 'Developer', value: meta.developer },
+              meta?.publisher &&
+                meta.publisher !== meta.developer && { label: 'Publisher', value: meta.publisher },
+            ].filter(Boolean) as { label: string; value: string }[];
+            if (facts.length === 0 && !meta?.tags?.length) return null;
+            return (
+              <aside className="details-facts">
+                <div className="details-facts-head">Details</div>
+                <dl className="details-facts-list">
+                  {facts.map((f) => (
+                    <div key={f.label} className="fact-row">
+                      <dt>{f.label}</dt>
+                      <dd>{f.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+                {!!meta?.tags?.length && (
+                  <div className="details-tags details-facts-tags">
+                    {meta.tags.map((t) => (
+                      <span key={t} className="details-tag">
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </aside>
+            );
+          })()}
         </div>
 
         {stage === 'actions' && (
@@ -540,11 +602,11 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 ? 'Where to buy — cheapest first'
                 : episode
                   ? `${episode.season}×${String(episode.episode).padStart(2, '0')} — ${episode.title}`
-                  : 'Sources'}
+                  : 'Play'}
             </div>
             {streams === null && (
               <div className="details-hint">
-                {isShopItem(item.id) ? 'Comparing store prices…' : 'Finding sources…'}
+                {isShopItem(item.id) ? 'Comparing store prices…' : 'Finding the best source…'}
               </div>
             )}
             {streams?.length === 0 && (
@@ -554,25 +616,81 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                   : 'No sources found. Add or configure a stream addon (e.g. Torrentio, WatchHub) in Settings.'}
               </div>
             )}
-            <div className="stream-list">
-              {streams?.map((s, i) => (
-                <div
-                  key={`${s.url}-${i}`}
-                  ref={i === sel - resumeOffset && !strip ? selRef : undefined}
-                  className={`stream-item ${i === sel - resumeOffset && !strip ? 'selected' : ''}`}
-                  onClick={() => {
-                    setSel(i + resumeOffset);
-                    playChosen(s);
-                  }}
-                >
-                  <span className={`stream-badge badge-${s.kind}`}>{KIND_BADGE[s.kind]}</span>
-                  <div className="stream-text">
-                    <div className="stream-name">{s.name.split('\n').join(' · ')}</div>
-                    {s.title && <div className="stream-detail">{s.title.split('\n').join('  ')}</div>}
+
+            {/* Compact view: the auto-chosen best pick + a reveal toggle. */}
+            {!sourcesExpanded && bestStream && (
+              <div className="source-picker">
+                {(() => {
+                  const d = describeSource(bestStream);
+                  return (
+                    <div
+                      ref={sel - resumeOffset === 0 && !strip ? selRef : undefined}
+                      className={`best-source ${sel - resumeOffset === 0 && !strip ? 'selected' : ''}`}
+                      onClick={() => {
+                        setSel(resumeOffset);
+                        playChosen(bestStream);
+                      }}
+                    >
+                      <span className="best-play">▶</span>
+                      <div className="best-text">
+                        <div className="best-line">
+                          <span className="best-label">Play now</span>
+                          {d.chips.map((c) => (
+                            <span key={c} className="source-chip">
+                              {c}
+                            </span>
+                          ))}
+                          <span className={`stream-badge badge-${bestStream.kind}`}>
+                            {KIND_BADGE[bestStream.kind]}
+                          </span>
+                        </div>
+                        {d.detail && <div className="best-detail">{d.detail}</div>}
+                      </div>
+                    </div>
+                  );
+                })()}
+                {streams && streams.length > 1 && (
+                  <div
+                    ref={sel - resumeOffset === 1 && !strip ? selRef : undefined}
+                    className={`source-toggle ${sel - resumeOffset === 1 && !strip ? 'selected' : ''}`}
+                    onClick={() => {
+                      setShowAllSources(true);
+                      setSel(resumeOffset);
+                    }}
+                  >
+                    Show all {streams.length} sources ▾
                   </div>
-                </div>
-              ))}
-            </div>
+                )}
+              </div>
+            )}
+
+            {/* Expanded view: the full ranked list, scrollable. */}
+            {sourcesExpanded && !!streams?.length && (
+              <div className="stream-list">
+                {streams.map((s, i) => (
+                  <div
+                    key={`${s.url}-${i}`}
+                    ref={i === sel - resumeOffset && !strip ? selRef : undefined}
+                    className={`stream-item ${i === sel - resumeOffset && !strip ? 'selected' : ''} ${
+                      i === 0 && canCompactSources ? 'stream-best' : ''
+                    }`}
+                    onClick={() => {
+                      setSel(i + resumeOffset);
+                      playChosen(s);
+                    }}
+                  >
+                    <span className={`stream-badge badge-${s.kind}`}>{KIND_BADGE[s.kind]}</span>
+                    <div className="stream-text">
+                      <div className="stream-name">
+                        {s.name.split('\n').join(' · ')}
+                        {i === 0 && canCompactSources && <span className="best-tag">BEST</span>}
+                      </div>
+                      {s.title && <div className="stream-detail">{s.title.split('\n').join('  ')}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -748,6 +866,25 @@ function LoadingOverlay({
 
 function emptyMeta(item: ContentItem): Meta {
   return { id: item.id, kind: item.kind, title: item.title, genres: [], episodes: [] };
+}
+
+/** Pulls a couch-readable summary out of a stream's name/title: quality/size/
+ *  seeder chips for the "best pick" card, plus a cleaned filename detail line.
+ *  Addon labels (Torrentio &c.) pack this into name + emoji-laden title. */
+function describeSource(s: Stream): { chips: string[]; detail: string } {
+  const blob = `${s.name} ${s.title}`;
+  const chips: string[] = [];
+  const quality = blob.match(/\b(2160p|4k|1440p|1080p|720p|480p)\b/i)?.[1];
+  if (quality) chips.push(quality.toUpperCase());
+  const hdr = blob.match(/\b(HDR10\+?|HDR|Dolby\s?Vision|DV)\b/i)?.[1];
+  if (hdr) chips.push(/dv|dolby/i.test(hdr) ? 'Dolby Vision' : hdr.toUpperCase());
+  const size = blob.match(/([\d.]+\s?(?:GB|MB))/i)?.[1];
+  if (size) chips.push(size.replace(/\s+/g, ' '));
+  const seeders = s.title.match(/(?:👤|seeders?[:\s])\s*([\d]+)/i)?.[1];
+  if (seeders) chips.push(`${seeders} seeders`);
+  // Detail line: the filename (first line of title) minus the stats line.
+  const detail = (s.title.split('\n')[0] || s.name.split('\n').slice(1).join(' ')).trim();
+  return { chips, detail };
 }
 
 function formatHours(hours: number): string {
