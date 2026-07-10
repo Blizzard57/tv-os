@@ -43,7 +43,13 @@ fn scrub_token(token: &str) -> String {
     // `key=value` / `token: value` forms embedded in error text.
     let lower = token.to_ascii_lowercase();
     const SECRET_HINTS: [&str; 7] = [
-        "token", "api_key", "apikey", "secret", "password", "access_token", "client_secret",
+        "token",
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "access_token",
+        "client_secret",
     ];
     if SECRET_HINTS.iter().any(|h| lower.contains(h)) {
         if let Some((name, _)) = token.split_once(['=', ':']) {
@@ -76,6 +82,9 @@ mod tests {
             scrub_secrets("access_token=deadbeef expired"),
             "access_token=<redacted> expired"
         );
-        assert_eq!(scrub_secrets("plain error, no secrets"), "plain error, no secrets");
+        assert_eq!(
+            scrub_secrets("plain error, no secrets"),
+            "plain error, no secrets"
+        );
     }
 }

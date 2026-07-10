@@ -122,7 +122,11 @@ fn owned_sets(library: &[Row]) -> (HashSet<String>, HashSet<i64>) {
 /// Does the portrait box-art capsule exist for this app? Checked once and
 /// remembered — a store item without it would render as a cropped banner.
 fn has_portrait(appid: i64) -> bool {
-    if let Some(&ok) = PORTRAIT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&appid) {
+    if let Some(&ok) = PORTRAIT_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&appid)
+    {
         return ok;
     }
     let ok = reqwest::blocking::Client::builder()
@@ -132,7 +136,10 @@ fn has_portrait(appid: i64) -> bool {
         .ok()
         .and_then(|c| c.head(crate::sources::steam::art_url(appid)).send().ok())
         .is_some_and(|r| r.status().is_success());
-    PORTRAIT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(appid, ok);
+    PORTRAIT_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(appid, ok);
     ok
 }
 
@@ -172,7 +179,11 @@ fn topseller_ids(region: &str, tag: Option<u32>) -> Vec<i64> {
         "https://store.steampowered.com/search/results/?filter=topsellers{tag_q}\
          &start=0&count=100&cc={region}&l=en&json=1&infinite=1"
     );
-    if let Some((at, ids)) = TOPSELLER_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&url) {
+    if let Some((at, ids)) = TOPSELLER_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&url)
+    {
         if at.elapsed() < CHARTS_TTL {
             return ids.clone();
         }
@@ -197,7 +208,10 @@ fn search_appids(url: &str) -> Vec<i64> {
     let Ok(v) = serde_json::from_str::<Value>(&json) else {
         return Vec::new();
     };
-    let html = v.get("results_html").and_then(|h| h.as_str()).unwrap_or_default();
+    let html = v
+        .get("results_html")
+        .and_then(|h| h.as_str())
+        .unwrap_or_default();
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
     for chunk in html.split("data-ds-appid=\"").skip(1) {
@@ -322,7 +336,11 @@ fn app_brief(appid: i64) -> Option<String> {
 /// (region, category).
 fn category(region: &str, list: &str) -> Vec<(i64, String, String)> {
     let cache_key = format!("{region}:{list}");
-    if let Some((at, items)) = CHARTS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&cache_key) {
+    if let Some((at, items)) = CHARTS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
         if at.elapsed() < CHARTS_TTL {
             return items.clone();
         }
@@ -332,11 +350,15 @@ fn category(region: &str, list: &str) -> Vec<(i64, String, String)> {
     let mut seen = HashSet::new();
     if let Ok(json) = http_get_quick(&url) {
         if let Ok(v) = serde_json::from_str::<Value>(&json) {
-            let entries = v.get(list).and_then(|l| l.get("items")).and_then(|i| i.as_array());
+            let entries = v
+                .get(list)
+                .and_then(|l| l.get("items"))
+                .and_then(|i| i.as_array());
             for e in entries.into_iter().flatten() {
-                let (Some(id), Some(name)) =
-                    (e.get("id").and_then(|i| i.as_i64()), e.get("name").and_then(|n| n.as_str()))
-                else {
+                let (Some(id), Some(name)) = (
+                    e.get("id").and_then(|i| i.as_i64()),
+                    e.get("name").and_then(|n| n.as_str()),
+                ) else {
                     continue;
                 };
                 let art = e
@@ -373,7 +395,11 @@ fn charts(region: &str) -> Vec<(i64, String, String)> {
 pub fn offers(appid: &str) -> Vec<Stream> {
     let region = region();
     let cache_key = format!("{appid}:{region}");
-    if let Some((at, offers)) = OFFERS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&cache_key) {
+    if let Some((at, offers)) = OFFERS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
         if at.elapsed() < OFFERS_TTL {
             return offers.clone();
         }
@@ -399,11 +425,25 @@ pub fn offers(appid: &str) -> Vec<Stream> {
                 if data.get("is_free").and_then(|f| f.as_bool()) == Some(true) {
                     priced.push((0.0, external("Steam · Free", "", &page)));
                 } else if let Some(p) = data.get("price_overview") {
-                    let amount = p.get("final").and_then(|f| f.as_i64()).unwrap_or(0) as f64 / 100.0;
-                    let label = p.get("final_formatted").and_then(|f| f.as_str()).unwrap_or("");
-                    let discount = p.get("discount_percent").and_then(|d| d.as_i64()).unwrap_or(0);
-                    let detail = if discount > 0 { format!("-{discount}% right now") } else { String::new() };
-                    priced.push((amount, external(&format!("Steam · {label}"), &detail, &page)));
+                    let amount =
+                        p.get("final").and_then(|f| f.as_i64()).unwrap_or(0) as f64 / 100.0;
+                    let label = p
+                        .get("final_formatted")
+                        .and_then(|f| f.as_str())
+                        .unwrap_or("");
+                    let discount = p
+                        .get("discount_percent")
+                        .and_then(|d| d.as_i64())
+                        .unwrap_or(0);
+                    let detail = if discount > 0 {
+                        format!("-{discount}% right now")
+                    } else {
+                        String::new()
+                    };
+                    priced.push((
+                        amount,
+                        external(&format!("Steam · {label}"), &detail, &page),
+                    ));
                 }
             }
         }
@@ -431,10 +471,7 @@ pub fn offers(appid: &str) -> Vec<Stream> {
             // GMG, Battle.net, EA, Ubisoft, …). Prices are USD; outside the US
             // they're still shown (a real number beats a "check price" link).
             let cheap = scope.spawn(|| cheapshark(&title, &region));
-            (
-                gog.join().ok().flatten(),
-                cheap.join().unwrap_or_default(),
-            )
+            (gog.join().ok().flatten(), cheap.join().unwrap_or_default())
         });
         priced.extend(gog);
         priced.extend(cheap);
@@ -530,10 +567,17 @@ fn cheapshark(title: &str, region: &str) -> Vec<(f64, Stream)> {
     };
     let stores: HashMap<&str, &str> = CHEAPSHARK_STORES.iter().copied().collect();
     let mut best: HashMap<String, (f64, String)> = HashMap::new(); // store → (price, dealID)
-    for deal in v.get("deals").and_then(|d| d.as_array()).into_iter().flatten() {
+    for deal in v
+        .get("deals")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+    {
         let (Some(store_id), Some(price), Some(deal_id)) = (
             deal.get("storeID").and_then(|s| s.as_str()),
-            deal.get("price").and_then(|p| p.as_str()).and_then(|p| p.parse::<f64>().ok()),
+            deal.get("price")
+                .and_then(|p| p.as_str())
+                .and_then(|p| p.parse::<f64>().ok()),
             deal.get("dealID").and_then(|d| d.as_str()),
         ) else {
             continue;
@@ -541,7 +585,9 @@ fn cheapshark(title: &str, region: &str) -> Vec<(f64, Stream)> {
         let Some(&store) = stores.get(store_id) else {
             continue; // Steam/GOG come from their own regional lookups
         };
-        let entry = best.entry(store.to_string()).or_insert((f64::MAX, String::new()));
+        let entry = best
+            .entry(store.to_string())
+            .or_insert((f64::MAX, String::new()));
         if price < entry.0 {
             *entry = (price, deal_id.to_string());
         }
@@ -587,9 +633,17 @@ pub(crate) fn similar_title(a: &str, b: &str) -> bool {
     } else {
         return false;
     };
-    ["edition", "goty", "cut", "remaster", "definitive", "complete", "enhanced"]
-        .iter()
-        .any(|s| remainder.contains(s))
+    [
+        "edition",
+        "goty",
+        "cut",
+        "remaster",
+        "definitive",
+        "complete",
+        "enhanced",
+    ]
+    .iter()
+    .any(|s| remainder.contains(s))
 }
 
 #[cfg(test)]
@@ -599,9 +653,15 @@ mod tests {
     #[test]
     fn titles_match_loosely_but_not_wrongly() {
         assert!(similar_title("Celeste", "CELESTE"));
-        assert!(similar_title("The Witcher 3: Wild Hunt", "the witcher 3 wild hunt"));
+        assert!(similar_title(
+            "The Witcher 3: Wild Hunt",
+            "the witcher 3 wild hunt"
+        ));
         assert!(!similar_title("Celeste", "Celeste Classic 2: Lani's Trek"));
-        assert!(similar_title("Cyberpunk 2077", "Cyberpunk 2077: Ultimate Edition"));
+        assert!(similar_title(
+            "Cyberpunk 2077",
+            "Cyberpunk 2077: Ultimate Edition"
+        ));
     }
 
     #[test]

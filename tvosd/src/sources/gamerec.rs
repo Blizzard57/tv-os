@@ -81,7 +81,8 @@ pub fn top_genres(limit: usize) -> Vec<(String, u32)> {
                 .map(|(_, tag)| (name, *tag))
         })
         .collect();
-    *GENRES_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), genres.clone()));
+    *GENRES_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((Instant::now(), genres.clone()));
     genres.into_iter().take(limit).collect()
 }
 
@@ -100,7 +101,7 @@ fn taste_ranked(candidates: &[ContentItem]) -> Option<Vec<ContentItem>> {
     if !embed::ready() {
         return None;
     }
-    let recent = recommend::LOG.recent_items(PROFILE_ITEMS);
+    let recent = recommend::LOG.recommendation_seeds(PROFILE_ITEMS);
     if recent.is_empty() {
         return None;
     }

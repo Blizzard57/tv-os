@@ -77,8 +77,10 @@ pub fn play_video(
     // In the TV/gamescope session, run mpv through gamescope so it lands in the
     // compositor's fullscreen output like everything else; degrades to a direct
     // mpv launch off-session or when gamescope isn't installed.
-    let mut cmd = gamescope_command("mpv");
+    let mpv = resolve_mpv();
+    let mut cmd = gamescope_command(&mpv);
     cmd.env("MPV_HOME", &home)
+        .env("PATH", child_path())
         .args(["--no-terminal", target])
         .stdin(Stdio::null())
         .stdout(crate::logging::child_output())
@@ -177,6 +179,7 @@ pub fn play_torrent(
     let _ = std::fs::remove_file(home.join(".started")); // fresh start signal
     let _ = std::fs::remove_file(home.join("mpv.log"));
     cmd.env("MPV_HOME", &home)
+        .env("PATH", child_path())
         .stdin(Stdio::null())
         .stdout(crate::logging::child_output())
         .stderr(crate::logging::child_output());
@@ -210,7 +213,11 @@ fn confirm_started(
 ) -> Result<(), String> {
     let started = home.join(".started");
     let log = home.join("mpv.log");
-    let timeout = Duration::from_secs(if torrent { 25 } else { 15 });
+    // Torrent startup can legitimately take a while: webtorrent has to join
+    // swarms, choose a file, start a local HTTP server, and only then launch
+    // mpv. Returning after 25s caused the UI to show an error while the player
+    // appeared moments later. Direct HTTP failures are still kept quick.
+    let timeout = Duration::from_secs(if torrent { 90 } else { 15 });
     let deadline = Instant::now() + timeout;
 
     let outcome = loop {
@@ -243,7 +250,7 @@ fn confirm_started(
 
         if Instant::now() >= deadline {
             break Err(if torrent {
-                "No working source — this torrent has too few seeders to stream. Pick another quality, or add a debrid service (e.g. RealDebrid) in the addon for instant, reliable streams."
+                "Torrent stream did not start in time — it may have too few seeders. Pick another quality, or add a debrid service (e.g. RealDebrid) in the addon for instant, reliable streams."
             } else {
                 "Stream didn't start in time — the source may be slow or unavailable. Try another source."
             });
@@ -393,8 +400,8 @@ fn write_mpv_conf(home: &Path, profile: &Profile, start: Option<f64>) {
     conf.push_str("osc=no\n"); // uosc is the UI
     conf.push_str("osd-bar=no\n");
     conf.push_str("input-gamepad=yes\n"); // controller.lua maps the buttons
-    // Resume where we left off (works for torrents too, since their mpv only
-    // reads this config — we can't pass it args).
+                                          // Resume where we left off (works for torrents too, since their mpv only
+                                          // reads this config — we can't pass it args).
     if let Some(secs) = start {
         conf.push_str(&format!("start={secs}\n"));
     }
@@ -474,20 +481,11 @@ fn home_dir() -> PathBuf {
     }
 }
 
-/// Base of an XDG dir (e.g. XDG_DATA_HOME), honoring the spec's rule that a
-/// relative value is ignored in favor of the `~/default` fallback.
-fn xdg_dir(var: &str, default: &str) -> PathBuf {
-    match std::env::var(var) {
-        Ok(v) if v.starts_with('/') => PathBuf::from(v),
-        _ => home_dir().join(default),
-    }
-}
-
 fn mpv_home() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_MPV_HOME") {
         return PathBuf::from(dir);
     }
-    xdg_dir("XDG_DATA_HOME", ".local/share").join("tvos/mpv")
+    crate::settings::profile_dir().join("mpv")
 }
 
 /// Where webtorrent downloads torrent data (disk-backed, easy to clear).
@@ -495,7 +493,7 @@ fn torrent_cache() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_TORRENT_DIR") {
         return PathBuf::from(dir);
     }
-    xdg_dir("XDG_CACHE_HOME", ".cache").join("tvos/torrents")
+    crate::settings::profile_dir().join("torrents")
 }
 
 /// An OS-assigned free TCP port (bound to :0, then released) for webtorrent's
@@ -519,6 +517,7 @@ fn resolve_webtorrent() -> Option<String> {
         format!("{home}/.npm-global/bin/webtorrent"),
         format!("{home}/.local/bin/webtorrent"),
         format!("{home}/node_modules/.bin/webtorrent"),
+        "/opt/homebrew/bin/webtorrent".to_string(),
         "/usr/local/bin/webtorrent".to_string(),
         "/usr/bin/webtorrent".to_string(),
     ];
@@ -532,6 +531,30 @@ fn resolve_webtorrent() -> Option<String> {
     candidates
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
+}
+
+fn resolve_mpv() -> String {
+    if command_exists("mpv") {
+        return "mpv".to_string();
+    }
+    [
+        "/opt/homebrew/bin/mpv",
+        "/usr/local/bin/mpv",
+        "/usr/bin/mpv",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .unwrap_or("mpv")
+    .to_string()
+}
+
+fn child_path() -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if cfg!(target_os = "macos") {
+        format!("/opt/homebrew/bin:/usr/local/bin:{current}")
+    } else {
+        current
+    }
 }
 
 fn stop(player: &mut Option<Child>) {

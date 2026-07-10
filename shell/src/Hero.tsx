@@ -14,7 +14,7 @@ interface Props {
  *  Google-TV "featured" panel. Games show Steam's stylized logo the way movies
  *  show their title treatment. */
 export function Hero({ item, preview, onRows }: Props) {
-  const [logoFailed, setLogoFailed] = useState(false);
+  const [failedLogos, setFailedLogos] = useState<Set<string>>(() => new Set());
   if (!item) return <div className="hero hero-empty" />;
 
   const isGame = (preview?.kind ?? item.kind) === 'game';
@@ -22,7 +22,8 @@ export function Hero({ item, preview, onRows }: Props) {
   const bg = preview?.background || item.art;
   // Prefer a real title treatment: TMDB logo for movies/shows, Steam logo.png
   // for games.
-  const logo = !logoFailed ? preview?.logo || gameLogo(item) : null;
+  const logoCandidate = preview?.logo || gameLogo(item);
+  const logo = logoCandidate && !failedLogos.has(logoCandidate) ? logoCandidate : null;
   const sub = [
     preview?.release_info,
     preview?.runtime,
@@ -44,7 +45,7 @@ export function Hero({ item, preview, onRows }: Props) {
             className="hero-logo"
             src={logo}
             alt={preview?.title || item.title}
-            onError={() => setLogoFailed(true)}
+            onError={() => setFailedLogos((failed) => new Set(failed).add(logo))}
           />
         ) : (
           <h1 className="hero-title">{preview?.title || item.title}</h1>

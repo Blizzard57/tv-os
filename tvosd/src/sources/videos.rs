@@ -32,7 +32,14 @@ impl Source for Videos {
         let target = validated_video_path(target)?;
         let mode = settings::STORE.get().enhance;
         let profile = upscale::resolve(mode, &target);
-        launcher::play_video(&target, &profile, mode, &target, Some(item_id), Some(item_id))
+        launcher::play_video(
+            &target,
+            &profile,
+            mode,
+            &target,
+            Some(item_id),
+            Some(item_id),
+        )
     }
 }
 

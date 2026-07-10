@@ -35,7 +35,8 @@ impl Source for Gog {
     fn available(&self) -> bool {
         // Signed into GOG in Heroic = the auth file and the library cache exist.
         heroic_dir().is_some_and(|d| {
-            d.join("gog_store/auth.json").exists() && d.join("store_cache/gog_library.json").exists()
+            d.join("gog_store/auth.json").exists()
+                && d.join("store_cache/gog_library.json").exists()
         })
     }
 
@@ -141,7 +142,10 @@ fn parse_game(g: &Value) -> Option<GogGame> {
         app_name,
         title,
         art,
-        installed: g.get("is_installed").and_then(|i| i.as_bool()).unwrap_or(false),
+        installed: g
+            .get("is_installed")
+            .and_then(|i| i.as_bool())
+            .unwrap_or(false),
     })
 }
 

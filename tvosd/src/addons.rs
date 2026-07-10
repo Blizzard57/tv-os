@@ -6,6 +6,7 @@
 //! playable URLs). Installed addons are persisted with their manifest in
 //! ~/.config/tvos/addons.json, so the home screen works offline at boot.
 
+use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
@@ -129,6 +130,39 @@ pub fn http_get_quick(url: &str) -> Result<String, String> {
     http_get_within(url, Duration::from_secs(4))
 }
 
+pub fn http_get_bytes(url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    validate_fetch_url(url)?;
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent(concat!("tvos/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| {
+            format!(
+                "request failed: {}",
+                crate::util::scrub_secrets(&e.to_string())
+            )
+        })?;
+    if let Some(len) = response.content_length() {
+        if len > max_bytes {
+            return Err(format!("download is too large ({len} bytes)"));
+        }
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > max_bytes {
+        return Err("download exceeded size cap".to_string());
+    }
+    Ok(bytes)
+}
+
 fn http_get_within(url: &str, timeout: Duration) -> Result<String, String> {
     validate_fetch_url(url)?;
     reqwest::blocking::Client::builder()
@@ -143,7 +177,12 @@ fn http_get_within(url: &str, timeout: Duration) -> Result<String, String> {
         .get(url)
         .send()
         .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("request failed: {}", crate::util::scrub_secrets(&e.to_string())))?
+        .map_err(|e| {
+            format!(
+                "request failed: {}",
+                crate::util::scrub_secrets(&e.to_string())
+            )
+        })?
         .text()
         .map_err(|e| e.to_string())
 }
@@ -191,10 +230,7 @@ fn validate_fetch_url(url: &str) -> Result<(), String> {
         return Err(format!("unsupported URL scheme: {scheme}"));
     }
     // authority = everything up to the first '/', '?' or '#'.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     // Drop any userinfo, then split host[:port].
     let hostport = authority.rsplit('@').next().unwrap_or(authority);
     let host = if let Some(stripped) = hostport.strip_prefix('[') {
@@ -357,14 +393,17 @@ fn requires_extra(catalog: &Value) -> bool {
 
 /// Whether the catalog accepts the `search` extra (either manifest form).
 fn supports_search(catalog: &Value) -> bool {
-    let names_search = |v: &Value| v.as_str() == Some("search")
-        || v.get("name").and_then(|n| n.as_str()) == Some("search");
-    ["extra", "extraSupported", "extraRequired"].iter().any(|key| {
-        catalog
-            .get(key)
-            .and_then(|e| e.as_array())
-            .is_some_and(|extras| extras.iter().any(names_search))
-    })
+    let names_search = |v: &Value| {
+        v.as_str() == Some("search") || v.get("name").and_then(|n| n.as_str()) == Some("search")
+    };
+    ["extra", "extraSupported", "extraRequired"]
+        .iter()
+        .any(|key| {
+            catalog
+                .get(key)
+                .and_then(|e| e.as_array())
+                .is_some_and(|extras| extras.iter().any(names_search))
+        })
 }
 
 #[cfg(test)]

@@ -78,7 +78,10 @@ impl Source for Epic {
         // signing in is picked up without restarting the daemon. "Connected"
         // means legendary is present *and* you're logged in. Cached with a
         // short TTL so a library refresh doesn't spawn a subprocess each call.
-        let mut cache = self.available_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .available_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some((at, ok)) = cache.as_ref() {
             if at.elapsed() < AVAILABLE_CACHE_TTL {
                 return *ok;

@@ -113,7 +113,11 @@ pub fn deep(query: &str, library: Vec<Row>) -> Vec<Row> {
     if query.is_empty() {
         return Vec::new();
     }
-    if let Some((at, rows)) = DEEP_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&query) {
+    if let Some((at, rows)) = DEEP_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&query)
+    {
         if at.elapsed() < DEEP_TTL {
             return rows.clone();
         }
@@ -167,13 +171,7 @@ pub fn deep(query: &str, library: Vec<Row>) -> Vec<Row> {
         .into_iter()
         .chain(addon_items)
         .enumerate()
-        .map(|(idx, item)| {
-            (
-                fuzzy::score(&query, &item.title).unwrap_or(0),
-                idx,
-                item,
-            )
-        })
+        .map(|(idx, item)| (fuzzy::score(&query, &item.title).unwrap_or(0), idx, item))
         .collect();
     titles.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
@@ -237,7 +235,11 @@ fn discover_sections(query: &str, plan: Option<&Plan>) -> Vec<Row> {
                 None => plan.label.clone(),
             };
             let kw_ids: Vec<i64> = keywords.iter().map(|(id, _)| *id).collect();
-            let (tv_floor, movie_floor) = if kw_ids.is_empty() { (150, 300) } else { (20, 50) };
+            let (tv_floor, movie_floor) = if kw_ids.is_empty() {
+                (150, 300)
+            } else {
+                (20, 50)
+            };
             // If leftover words resolved to no keyword, they were probably a
             // title fragment — Top matches covers that; discover without them.
             let mut items = Vec::new();
@@ -264,7 +266,10 @@ fn discover_sections(query: &str, plan: Option<&Plan>) -> Vec<Row> {
             if items.is_empty() {
                 return Vec::new();
             }
-            vec![Row { title: label, items }]
+            vec![Row {
+                title: label,
+                items,
+            }]
         }
         None => {
             let keywords = keyword_matches(query);
@@ -321,11 +326,43 @@ const VARIETY: &[i64] = &[16, 10767, 10764, 10763];
 /// Region/language idioms:
 /// (phrases, label, language, with genres, without genres, tv, movies).
 const IDIOMS: &[(&[&str], &str, &str, &[i64], &[i64], bool, bool)] = &[
-    (&["kdrama", "k drama", "korean drama", "korean"], "K-Drama", "ko", &[], VARIETY, true, false),
-    (&["cdrama", "c drama", "chinese drama", "chinese"], "C-Drama", "zh", &[], VARIETY, true, false),
-    (&["jdrama", "j drama", "japanese drama"], "J-Drama", "ja", &[], VARIETY, true, false),
+    (
+        &["kdrama", "k drama", "korean drama", "korean"],
+        "K-Drama",
+        "ko",
+        &[],
+        VARIETY,
+        true,
+        false,
+    ),
+    (
+        &["cdrama", "c drama", "chinese drama", "chinese"],
+        "C-Drama",
+        "zh",
+        &[],
+        VARIETY,
+        true,
+        false,
+    ),
+    (
+        &["jdrama", "j drama", "japanese drama"],
+        "J-Drama",
+        "ja",
+        &[],
+        VARIETY,
+        true,
+        false,
+    ),
     (&["anime"], "Anime", "ja", &[16], &[], true, true),
-    (&["bollywood", "hindi"], "Bollywood", "hi", &[], &[], false, true),
+    (
+        &["bollywood", "hindi"],
+        "Bollywood",
+        "hi",
+        &[],
+        &[],
+        false,
+        true,
+    ),
 ];
 
 /// Genre vocabulary: (phrase, movie genre ids, tv genre ids). Ids are TMDB's

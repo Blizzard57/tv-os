@@ -1,5 +1,10 @@
-//! User settings, persisted as JSON in ~/.config/tvos/settings.json
-//! (override the directory with TVOS_CONFIG_DIR).
+//! User settings, persisted as JSON in the TV OS config directory.
+//!
+//! Defaults:
+//!   - `TVOS_CONFIG_DIR` when set.
+//!   - repo-local `.tvos/profile/config` when `TVOS_PORTABLE=1`.
+//!   - macOS: `~/Library/Application Support/TV OS`.
+//!   - other Unix: `~/.config/tvos`.
 
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
@@ -236,7 +241,65 @@ pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/tvos")
+    if portable_enabled() {
+        if let Some(repo) = repo_dir() {
+            return repo.join(".tvos/profile/config");
+        }
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/TV OS")
+    } else {
+        home.join(".config/tvos")
+    }
+}
+
+pub fn profile_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TVOS_PROFILE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if portable_enabled() {
+        if let Some(repo) = repo_dir() {
+            return repo.join(".tvos/profile");
+        }
+    }
+    config_dir()
+}
+
+fn portable_enabled() -> bool {
+    if matches!(
+        std::env::var("TVOS_PORTABLE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) {
+        return true;
+    }
+    if cfg!(test) {
+        return false;
+    }
+    repo_dir().is_some_and(|repo| repo.join(".tvos/portable").is_file())
+}
+
+fn repo_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("TVOS_REPO_DIR") {
+        let path = PathBuf::from(dir);
+        if is_repo_root(&path) {
+            return Some(path);
+        }
+    }
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if is_repo_root(&dir) {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn is_repo_root(path: &std::path::Path) -> bool {
+    path.join("tvosd/Cargo.toml").is_file() && path.join("shell/package.json").is_file()
 }
 
 #[cfg(test)]
@@ -260,7 +323,7 @@ mod tests {
             ..Default::default()
         };
         let mut incoming = Settings {
-            steam_api_key: String::new(), // untouched by the panel
+            steam_api_key: String::new(),      // untouched by the panel
             trakt_token: "NEWTOK".to_string(), // explicitly changed
             ..Default::default()
         };

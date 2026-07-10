@@ -32,6 +32,7 @@ const ROW_SIZE: usize = 12;
 /// without bound. The newest `MAX_EVENTS` are far more than the recommender's
 /// recency-weighted scoring can use, so older ones are dropped.
 const MAX_EVENTS: usize = 5_000;
+const MAX_PREFS: usize = 5_000;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Event {
@@ -44,11 +45,49 @@ pub static LOG: LazyLock<EventLog> = LazyLock::new(EventLog::load);
 pub struct EventLog {
     path: PathBuf,
     events: Mutex<Vec<Event>>,
+    prefs_path: PathBuf,
+    prefs: Mutex<Vec<Preference>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Reaction {
+    Like,
+    Dislike,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Preference {
+    pub ts: u64,
+    pub item: ContentItem,
+    #[serde(default)]
+    pub watchlist: bool,
+    #[serde(default)]
+    pub watched: bool,
+    #[serde(default)]
+    pub reaction: Option<Reaction>,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct PreferenceStatus {
+    pub watchlist: bool,
+    pub watched: bool,
+    pub liked: bool,
+    pub disliked: bool,
+}
+
+#[derive(Clone, Copy)]
+pub enum PreferenceAction {
+    Watchlist,
+    Watched,
+    Like,
+    Dislike,
 }
 
 impl EventLog {
     fn load() -> Self {
         let path = config_dir().join("events.jsonl");
+        let prefs_path = config_dir().join("preferences.json");
         let mut events: Vec<Event> = std::fs::read_to_string(&path)
             .map(|text| {
                 text.lines()
@@ -57,9 +96,16 @@ impl EventLog {
             })
             .unwrap_or_default();
         trim(&mut events);
+        let mut prefs: Vec<Preference> = std::fs::read_to_string(&prefs_path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        trim_prefs(&mut prefs);
         Self {
             path,
             events: Mutex::new(events),
+            prefs_path,
+            prefs: Mutex::new(prefs),
         }
     }
 
@@ -132,7 +178,16 @@ impl EventLog {
     /// because_you_watched), seeded by [`recent_items`].
     pub fn rows(&self) -> Vec<Row> {
         let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        continue_rows(&events)
+        let disliked = self.disliked_ids();
+        if disliked.is_empty() {
+            return continue_rows(&events);
+        }
+        let filtered: Vec<Event> = events
+            .iter()
+            .filter(|e| !disliked.contains(&e.item.id))
+            .cloned()
+            .collect();
+        continue_rows(&filtered)
     }
 
     /// The newest distinct items (newest first), used to seed recommendations.
@@ -150,6 +205,145 @@ impl EventLog {
             }
         }
         items
+    }
+
+    /// Recommendation seeds: explicit preferences first (liked/watched/
+    /// watchlisted), then play history. This feeds the embedding recommender
+    /// and "Because you watched" rows without polluting Continue.
+    pub fn recommendation_seeds(&self, n: usize) -> Vec<ContentItem> {
+        let prefs = self.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut preferred: Vec<&Preference> = prefs
+            .iter()
+            .filter(|p| p.reaction != Some(Reaction::Dislike))
+            .filter(|p| p.reaction == Some(Reaction::Like) || p.watched || p.watchlist)
+            .collect();
+        preferred.sort_by(|a, b| b.ts.cmp(&a.ts));
+        let mut seen = Vec::new();
+        let mut items = Vec::new();
+        for p in preferred {
+            if seen.contains(&p.item.id) {
+                continue;
+            }
+            seen.push(p.item.id.clone());
+            items.push(p.item.clone());
+            if items.len() == n {
+                return items;
+            }
+        }
+        drop(prefs);
+        for item in self.recent_items(n) {
+            if !seen.contains(&item.id) {
+                seen.push(item.id.clone());
+                items.push(item);
+            }
+            if items.len() == n {
+                break;
+            }
+        }
+        items
+    }
+
+    pub fn preference(&self, id: &str) -> PreferenceStatus {
+        self.prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|p| p.item.id == id)
+            .map(pref_status)
+            .unwrap_or_default()
+    }
+
+    pub fn set_preference(&self, item: ContentItem, action: PreferenceAction) -> PreferenceStatus {
+        let mut prefs = self.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let pref = match prefs.iter_mut().find(|p| p.item.id == item.id) {
+            Some(pref) => {
+                pref.item = item;
+                pref.ts = now();
+                pref
+            }
+            None => {
+                prefs.push(Preference {
+                    ts: now(),
+                    item,
+                    watchlist: false,
+                    watched: false,
+                    reaction: None,
+                });
+                prefs.last_mut().expect("just pushed a preference")
+            }
+        };
+        match action {
+            PreferenceAction::Watchlist => pref.watchlist = !pref.watchlist,
+            PreferenceAction::Watched => pref.watched = !pref.watched,
+            PreferenceAction::Like => {
+                pref.reaction = if pref.reaction == Some(Reaction::Like) {
+                    None
+                } else {
+                    Some(Reaction::Like)
+                };
+            }
+            PreferenceAction::Dislike => {
+                pref.reaction = if pref.reaction == Some(Reaction::Dislike) {
+                    None
+                } else {
+                    Some(Reaction::Dislike)
+                };
+            }
+        }
+        let status = pref_status(pref);
+        trim_prefs(&mut prefs);
+        self.write_prefs(&prefs);
+        status
+    }
+
+    pub fn preference_rows(&self) -> Vec<Row> {
+        let prefs = self.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut watchlist: Vec<&Preference> = prefs
+            .iter()
+            .filter(|p| p.watchlist && p.reaction != Some(Reaction::Dislike))
+            .collect();
+        watchlist.sort_by(|a, b| b.ts.cmp(&a.ts));
+        let items: Vec<ContentItem> = watchlist
+            .into_iter()
+            .take(ROW_SIZE)
+            .map(|p| p.item.clone())
+            .collect();
+        if items.is_empty() {
+            Vec::new()
+        } else {
+            vec![Row {
+                title: "Watchlist".to_string(),
+                items,
+            }]
+        }
+    }
+
+    pub fn disliked_ids(&self) -> std::collections::HashSet<String> {
+        self.prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|p| p.reaction == Some(Reaction::Dislike))
+            .map(|p| p.item.id.clone())
+            .collect()
+    }
+
+    fn write_prefs(&self, prefs: &[Preference]) {
+        if let Some(dir) = self.prefs_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(buf) = serde_json::to_string_pretty(prefs) else {
+            return;
+        };
+        let tmp = self.prefs_path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, buf) {
+            crate::log_error!("preferences: temp write failed: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.prefs_path) {
+            crate::log_error!("preferences: atomic replace failed: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// The documented "Recommended for You" scorer (the non-embedding fallback):
@@ -174,8 +368,12 @@ impl EventLog {
             tod_hits: u32,
         }
         let current_hour = hour_of_day(now);
+        let disliked = self.disliked_ids();
         let mut aggs: Vec<Agg> = Vec::new();
         for event in events.iter() {
+            if disliked.contains(&event.item.id) {
+                continue;
+            }
             let age_days = (now.saturating_sub(event.ts)) as f64 / 86_400.0;
             let decay = (-std::f64::consts::LN_2 * age_days / HALF_LIFE_DAYS).exp();
             let near_tod = hours_apart(hour_of_day(event.ts), current_hour) <= TOD_WINDOW_HOURS;
@@ -190,6 +388,36 @@ impl EventLog {
                     decayed: decay,
                     count: 1,
                     tod_hits: near_tod as u32,
+                }),
+            }
+        }
+        drop(events);
+
+        let prefs = self.prefs.lock().unwrap_or_else(|e| e.into_inner());
+        for pref in prefs.iter().filter(|p| !disliked.contains(&p.item.id)) {
+            let mut boost = 0.0;
+            if pref.reaction == Some(Reaction::Like) {
+                boost += 3.0;
+            }
+            if pref.watched {
+                boost += 2.0;
+            }
+            if pref.watchlist {
+                boost += 1.0;
+            }
+            if boost == 0.0 {
+                continue;
+            }
+            match aggs.iter_mut().find(|a| a.item.id == pref.item.id) {
+                Some(a) => {
+                    a.decayed += boost;
+                    a.count += boost.ceil() as u32;
+                }
+                None => aggs.push(Agg {
+                    item: pref.item.clone(),
+                    decayed: boost,
+                    count: boost.ceil() as u32,
+                    tod_hits: 0,
                 }),
             }
         }
@@ -209,6 +437,15 @@ impl EventLog {
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         scored.into_iter().take(n).map(|(_, item)| item).collect()
+    }
+}
+
+fn pref_status(pref: &Preference) -> PreferenceStatus {
+    PreferenceStatus {
+        watchlist: pref.watchlist,
+        watched: pref.watched,
+        liked: pref.reaction == Some(Reaction::Like),
+        disliked: pref.reaction == Some(Reaction::Dislike),
     }
 }
 
@@ -249,6 +486,13 @@ fn hours_apart(a: u32, b: u32) -> u32 {
 fn trim(events: &mut Vec<Event>) {
     if events.len() > MAX_EVENTS {
         events.drain(0..events.len() - MAX_EVENTS);
+    }
+}
+
+fn trim_prefs(prefs: &mut Vec<Preference>) {
+    if prefs.len() > MAX_PREFS {
+        prefs.sort_by(|a, b| b.ts.cmp(&a.ts));
+        prefs.truncate(MAX_PREFS);
     }
 }
 

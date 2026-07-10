@@ -58,14 +58,22 @@ impl ResumeStore {
 
     /// The stream last used for this exact item, if any.
     pub fn stream(&self, item_id: &str) -> Option<Stream> {
-        self.streams.lock().unwrap_or_else(|e| e.into_inner()).get(item_id).cloned()
+        self.streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(item_id)
+            .cloned()
     }
 
     /// The source last used for this item's *show* — used to keep the next
     /// episode on the same addon/quality.
     pub fn series_stream(&self, item_id: &str) -> Option<Stream> {
         let key = series_key(item_id)?;
-        self.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
+        self.streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
     }
 }
 

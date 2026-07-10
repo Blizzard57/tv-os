@@ -45,9 +45,9 @@ fn score_in_order(q: &str, t: &str) -> Option<i32> {
                 score += 6; // consecutive run
             } else {
                 score -= ((i - l - 1) as i32).min(5); // gap penalty
-                // Skipping into the middle of a later word is barely a match
-                // ("anime" ⊂ "Adve*n*ture T*ime*") — punish it beyond the
-                // plain gap. Landing on a word start (initials) stays cheap.
+                                                      // Skipping into the middle of a later word is barely a match
+                                                      // ("anime" ⊂ "Adve*n*ture T*ime*") — punish it beyond the
+                                                      // plain gap. Landing on a word start (initials) stays cheap.
                 if !word_start && chars[l..i].iter().any(|c| !c.is_alphanumeric()) {
                     score -= 6;
                 }
@@ -94,8 +94,14 @@ mod tests {
         let scatter = score("anime", "Adventure Time").unwrap_or(-100);
         let abbrev = score("brdl", "Borderlands 2").unwrap();
         assert!(scatter < abbrev, "{scatter} vs {abbrev}");
-        assert!(scatter < 10, "scatter should fall below the library floor: {scatter}");
-        assert!(abbrev >= 10, "abbreviations must survive the floor: {abbrev}");
+        assert!(
+            scatter < 10,
+            "scatter should fall below the library floor: {scatter}"
+        );
+        assert!(
+            abbrev >= 10,
+            "abbreviations must survive the floor: {abbrev}"
+        );
     }
 
     #[test]

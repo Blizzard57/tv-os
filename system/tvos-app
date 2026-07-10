@@ -10,6 +10,43 @@
 #                     (controller / FSR / HDR), if gamescope is installed
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "$(uname -s)" = "Darwin" ]; then
+  export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+fi
+
+find_repo_dir() {
+  if [ -n "${TVOS_REPO_DIR:-}" ] && [ -f "$TVOS_REPO_DIR/tvosd/Cargo.toml" ]; then
+    printf '%s\n' "$TVOS_REPO_DIR"
+    return 0
+  fi
+  local d
+  for d in "$SCRIPT_DIR/.." "$PWD"; do
+    if [ -f "$d/tvosd/Cargo.toml" ] && [ -f "$d/shell/package.json" ]; then
+      (cd "$d" && pwd)
+      return 0
+    fi
+  done
+  return 1
+}
+
+REPO_CANDIDATE="$(find_repo_dir 2>/dev/null || true)"
+if [ "${TVOS_PORTABLE:-0}" = "1" ] || [ "${TVOS_REPO_PROFILE:-0}" = "1" ] || [ -f "$REPO_CANDIDATE/.tvos/portable" ]; then
+  if [ -n "$REPO_CANDIDATE" ]; then
+    REPO_DIR="$REPO_CANDIDATE"
+    export TVOS_REPO_DIR="$REPO_DIR"
+    export TVOS_PROFILE_DIR="${TVOS_PROFILE_DIR:-$REPO_DIR/.tvos/profile}"
+    export TVOS_CONFIG_DIR="${TVOS_CONFIG_DIR:-$TVOS_PROFILE_DIR/config}"
+    export TVOS_BROWSER_PROFILE="${TVOS_BROWSER_PROFILE:-$TVOS_PROFILE_DIR/browser/Default}"
+    export TVOS_MPV_HOME="${TVOS_MPV_HOME:-$TVOS_PROFILE_DIR/mpv}"
+    export TVOS_TORRENT_DIR="${TVOS_TORRENT_DIR:-$TVOS_PROFILE_DIR/torrents}"
+    export TVOS_LOG_DIR="${TVOS_LOG_DIR:-$TVOS_PROFILE_DIR/logs}"
+    mkdir -p "$TVOS_CONFIG_DIR" "$TVOS_BROWSER_PROFILE" "$TVOS_MPV_HOME" "$TVOS_TORRENT_DIR" "$TVOS_LOG_DIR"
+  else
+    echo "TV OS: TVOS_PORTABLE=1 but no repo root was found. Set TVOS_REPO_DIR=/path/to/tv-os." >&2
+  fi
+fi
+
 # ---- Display resolution (fullscreen / --tv mode) --------------------------
 # gamescope defaults to 1280x720 when unsized; drive it at the display's native
 # resolution instead (or an override from Settings → Display).
@@ -24,6 +61,7 @@ config_res() {
   return 1
 }
 native_res() {
+  [ "$(uname -s)" = "Darwin" ] && return 1
   local m first
   for m in /sys/class/drm/*/modes; do
     [ -r "$m" ] || continue
@@ -40,14 +78,21 @@ config_hdr() {
 }
 
 URL="http://127.0.0.1:8484"
-TVOSD="${TVOSD:-$HOME/.local/bin/tvosd}"
+TVOSD="${TVOSD:-${TVOS_REPO_DIR:-}/tvosd/target/debug/tvosd}"
+[ -x "$TVOSD" ] || TVOSD="${HOME:-}/.local/bin/tvosd"
 [ -x "$TVOSD" ] || TVOSD="$(command -v tvosd || echo "$TVOSD")"
 if [ ! -x "$TVOSD" ]; then
   echo "TV OS: tvosd binary not found or not executable ($TVOSD)." >&2
   echo "Run ./install.sh, or set TVOSD=/path/to/tvosd." >&2
   exit 1
 fi
-PROFILE_DIR="$HOME/.local/share/tvos/browser"
+if [ -n "${TVOS_BROWSER_PROFILE:-}" ]; then
+  PROFILE_DIR="${TVOS_BROWSER_PROFILE%/Default}"
+elif [ "$(uname -s)" = "Darwin" ]; then
+  PROFILE_DIR="$HOME/Library/Application Support/TV OS/browser"
+else
+  PROFILE_DIR="$HOME/.local/share/tvos/browser"
+fi
 LOG="${XDG_RUNTIME_DIR:-/tmp}/tvosd.log"
 
 tv_mode=0
@@ -55,7 +100,7 @@ tv_mode=0
 
 # Point the daemon at whichever UI directory exists (user app or system pkg).
 if [ -z "${TVOS_UI_DIR:-}" ]; then
-  for d in "$HOME/.local/share/tvos/ui" /usr/share/tvos/ui /usr/local/share/tvos/ui; do
+  for d in "${TVOS_REPO_DIR:-}/shell/dist" "$HOME/.local/share/tvos/ui" /usr/share/tvos/ui /usr/local/share/tvos/ui; do
     [ -d "$d" ] && { export TVOS_UI_DIR="$d"; break; }
   done
 fi
@@ -82,6 +127,14 @@ done
 # 2. Find a Chromium-family browser (best for the Gamepad API + app windows).
 pick_browser() {
   local b f
+  if [ "$(uname -s)" = "Darwin" ]; then
+    for f in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+             "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"; do
+      [ -x "$f" ] && { BROWSER=("$f"); return 0; }
+    done
+  fi
   for b in chromium chromium-browser google-chrome google-chrome-stable \
            brave brave-browser vivaldi-stable microsoft-edge-stable; do
     command -v "$b" >/dev/null 2>&1 && { BROWSER=("$b"); return 0; }

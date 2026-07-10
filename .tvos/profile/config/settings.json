@@ -1,0 +1,18 @@
+{
+  "enhance": "quality",
+  "steam_api_key": "65244866D3422CC1EA12C4EBEC625AC0",
+  "steam_id": "76561198205145357",
+  "tmdb_key": "ad3baf8678fd7b75ff6b9b28eeb2d730",
+  "accent": "#4285f4",
+  "display_resolution": "",
+  "display_hdr": true,
+  "youtube_channels": "",
+  "youtube_account": true,
+  "game_region": "IN",
+  "trakt_client_id": "1032631737c5b1a0327cd4ef1d02c44eefda80087402da711a856e37a867e7e0",
+  "trakt_client_secret": "f86c15d070a4a1b477aba0e6043c781df96eeb78f3ee853e5736dacc1801c833",
+  "trakt_token": "6799d5a83e61b8108230fde7b85353256dde0e0d93e2905f24836aa35e3d5ee9",
+  "anilist_token": "aoM7aQIfJWXn0LBoKxwCg4snjXrsKLpgvvSgxTlY",
+  "mal_client_id": "",
+  "mal_token": ""
+}

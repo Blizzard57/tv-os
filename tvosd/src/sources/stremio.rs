@@ -120,14 +120,14 @@ pub fn meta(kind: &str, id: &str) -> Option<Meta> {
                         percent_encode(kind),
                         percent_encode(id)
                     );
-                    addons::http_get(&url).ok().and_then(|json| parse_meta(&json))
+                    addons::http_get(&url)
+                        .ok()
+                        .and_then(|json| parse_meta(&json))
                 })
             })
             .collect();
         // First addon (in list order) that returned metadata wins.
-        handles
-            .into_iter()
-            .find_map(|h| h.join().ok().flatten())
+        handles.into_iter().find_map(|h| h.join().ok().flatten())
     });
 
     let mut cache = META_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -206,7 +206,11 @@ pub fn search(query: &str) -> Vec<ContentItem> {
     if query.is_empty() {
         return Vec::new();
     }
-    if let Some((at, items)) = SEARCH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&query.to_lowercase()) {
+    if let Some((at, items)) = SEARCH_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&query.to_lowercase())
+    {
         if at.elapsed() < SEARCH_TTL {
             return items.clone();
         }
@@ -302,7 +306,7 @@ pub fn play_stream(
 /// waits for playback to actually start, so a dead/seederless source fails fast-
 /// ish and we move on — "sometimes the stream doesn't start" becomes "we tried
 /// the next one".
-const AUTO_PICK_ATTEMPTS: usize = 3;
+const AUTO_PICK_ATTEMPTS: usize = 5;
 
 /// Auto-pick: play the best source for `(kind, id)`, falling back to the next
 /// one if it doesn't start. Used by Source::launch (the quick path). Prefers the
@@ -323,19 +327,13 @@ pub fn play_meta(kind: &str, id: &str, item_id: Option<&str>) -> Result<(), Stri
     // For the next episode of a show, float sources matching the one the show
     // last played (same addon + quality) to the very front.
     let preferred = item_id.and_then(|id| crate::resume::STORE.series_stream(id));
-    let matches_preferred = |s: &Stream| {
-        preferred
-            .as_ref()
-            .is_some_and(|p| same_source(p, s))
-    };
+    let matches_preferred = |s: &Stream| preferred.as_ref().is_some_and(|p| same_source(p, s));
 
     // Order: remembered source → directly-playable → torrents → externals.
     let mut order: Vec<&Stream> = found.iter().filter(|s| matches_preferred(s)).collect();
-    order.extend(
-        found
-            .iter()
-            .filter(|s| !matches_preferred(s) && matches!(s.kind, StreamKind::Direct | StreamKind::Youtube)),
-    );
+    order.extend(found.iter().filter(|s| {
+        !matches_preferred(s) && matches!(s.kind, StreamKind::Direct | StreamKind::Youtube)
+    }));
     order.extend(
         found
             .iter()
@@ -485,12 +483,12 @@ fn build_magnet(info_hash: &str, name: &str, sources: Option<&Value>) -> String 
     magnet
 }
 
-/// Orders the list best-first: the **highest resolution that will actually
-/// stream**. Directly-playable (debrid/HTTP) sources win outright; among
-/// torrents we group by a seeder "tier" (enough seeders to stream → preferred,
-/// a few → weaker, none → dead/last) and, within a tier, prefer higher
-/// resolution. So a well-seeded 4K ranks first (best for a capable system),
-/// while a seederless 4K that would never start drops below a solid 1080p.
+/// Orders the list best-first by source strength. Direct/debrid/cached links
+/// win outright; among torrents we group by a seeder "tier" (enough seeders to
+/// stream → preferred, a few → weaker, none → dead/last) and, within a tier,
+/// prefer higher resolution. WatchHub/external services remain visible above
+/// raw torrents because they are official fallbacks, while the auto-picker
+/// still tries directly playable sources first.
 fn rank(streams: &mut [Stream]) {
     streams.sort_by(|a, b| {
         stream_score(b)
@@ -511,7 +509,11 @@ fn stream_score(s: &Stream) -> f64 {
         // (per the docs) nudge https above plain http on an otherwise tie.
         StreamKind::Direct => {
             let https_bonus = if s.url.starts_with("https") { 1.0 } else { 0.0 };
-            1_000_000_000.0 + height + https_bonus
+            let lower_url = s.url.to_lowercase();
+            1_000_000_000.0
+                + source_strength_bonus(&text.to_lowercase(), &lower_url)
+                + height * 1_000.0
+                + https_bonus
         }
         StreamKind::Youtube => 500_000_000.0,
         // Official "watch on …" services (WatchHub): visible above the
@@ -535,6 +537,30 @@ fn stream_score(s: &Stream) -> f64 {
                 .unwrap_or(0.0);
             tier * 100_000_000.0 + height * 1_000.0 + (seeders.min(9_999) as f64) - smaller
         }
+    }
+}
+
+fn source_strength_bonus(lower_text: &str, lower_url: &str) -> f64 {
+    let haystack = format!("{lower_text} {lower_url}");
+    if [
+        "realdebrid",
+        "real-debrid",
+        "alldebrid",
+        "premiumize",
+        "debrid-link",
+        "cached",
+    ]
+    .iter()
+    .any(|needle| haystack.contains(needle))
+    {
+        80_000.0
+    } else if ["m3u8", ".mp4", ".mkv", "cdn", "cloudstream"]
+        .iter()
+        .any(|needle| haystack.contains(needle))
+    {
+        20_000.0
+    } else {
+        0.0
     }
 }
 
@@ -790,7 +816,11 @@ mod tests {
         };
         let mut streams = vec![
             // a barely-seeded 4K — would never start, so it must drop down
-            mk(StreamKind::Torrent, "4k weak", "Movie.2160p.REMUX 👤 1 💾 60 GB"),
+            mk(
+                StreamKind::Torrent,
+                "4k weak",
+                "Movie.2160p.REMUX 👤 1 💾 60 GB",
+            ),
             // a well-seeded 1080p
             mk(StreamKind::Torrent, "1080p", "Movie.1080p 👤 200 💾 2.4 GB"),
             // a debrid/direct link — always wins
@@ -804,7 +834,10 @@ mod tests {
         ];
         rank(&mut streams);
         let order: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(order, vec!["direct", "netflix", "4k", "1080p", "720p", "4k weak"]);
+        assert_eq!(
+            order,
+            vec!["direct", "netflix", "4k", "1080p", "720p", "4k weak"]
+        );
         assert_eq!(streams[0].kind, StreamKind::Direct);
     }
 
@@ -841,7 +874,10 @@ mod tests {
             title: String::new(),
             file_idx: None,
         };
-        assert!(same_source(&mk("Torrentio\n1080p"), &mk("Torrentio\n1080p")));
+        assert!(same_source(
+            &mk("Torrentio\n1080p"),
+            &mk("Torrentio\n1080p")
+        ));
         assert!(!same_source(&mk("Torrentio\n1080p"), &mk("Torrentio\n4k")));
     }
 

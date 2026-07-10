@@ -4,17 +4,22 @@ import {
   Episode,
   GameExtras,
   Meta,
+  PreferenceAction,
+  PreferenceStatus,
   ResumeInfo,
   Stream,
   fetchGameExtras,
   fetchMeta,
+  fetchPreference,
   fetchResume,
   fetchSimilar,
   fetchStreams,
   launch,
   playStream,
+  setPreference,
   startInstall,
 } from './api';
+import { gameLogo } from './cards';
 import { NavAction } from './input';
 
 interface Props {
@@ -29,6 +34,7 @@ interface Props {
 }
 
 type Stage = 'actions' | 'episodes' | 'streams';
+type PrefButton = { action: PreferenceAction; icon: string; label: string; active: boolean };
 
 /// The horizontal strips below the main list, in navigation order.
 type StripZone = 'shots' | 'ach' | 'similar';
@@ -75,6 +81,14 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   // The selected entry of the active list, so navigation scrolls the page.
   const selRef = useRef<HTMLDivElement | null>(null);
   const [resume, setResume] = useState<ResumeInfo | null>(null);
+  const [logoFailed, setLogoFailed] = useState(false);
+  const [pref, setPref] = useState<PreferenceStatus>({
+    watchlist: false,
+    watched: false,
+    liked: false,
+    disliked: false,
+  });
+  const [prefFocus, setPrefFocus] = useState<number | null>(null);
 
   const series = (meta?.kind ?? item.kind) === 'series';
   const isGame = (meta?.kind ?? item.kind) === 'game';
@@ -149,6 +163,16 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
         setMeta({ ...emptyMeta(item) });
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item.id]);
+
+  useEffect(() => setLogoFailed(false), [item.id]);
+
+  useEffect(() => {
+    setPref({ watchlist: false, watched: false, liked: false, disliked: false });
+    setPrefFocus(null);
+    fetchPreference(item.id)
+      .then(setPref)
+      .catch(() => {});
   }, [item.id]);
 
   const loadStreams = useCallback((id: string) => {
@@ -243,6 +267,40 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     }
   }, [item, onPlayed, flash]);
 
+  const runPreference = useCallback(
+    (action: PreferenceAction) => {
+      const preferenceItem: ContentItem = {
+        ...item,
+        title: meta?.title || item.title,
+        art: meta?.poster || meta?.background || item.art,
+      };
+      setPreference(action, preferenceItem)
+        .then((next) => {
+          setPref(next);
+          const label =
+            action === 'watchlist'
+              ? next.watchlist
+                ? 'Added to watchlist'
+                : 'Removed from watchlist'
+              : action === 'watched'
+                ? next.watched
+                  ? 'Marked as watched'
+                  : 'Marked as unwatched'
+                : action === 'like'
+                  ? next.liked
+                    ? 'Liked'
+                    : 'Like removed'
+                  : next.disliked
+                    ? 'Disliked'
+                    : 'Dislike removed';
+          flash(label);
+          onPlayed();
+        })
+        .catch((e) => flash(`Could not save preference: ${e.message}`));
+    },
+    [item, meta, flash, onPlayed],
+  );
+
   const openEpisode = useCallback(
     (ep: Episode) => {
       setEpisode(ep);
@@ -266,6 +324,33 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
         ...(achAll.length > 0 ? (['ach'] as const) : []),
         ...(similar.length > 0 ? (['similar'] as const) : []),
       ];
+      const prefCount = 4;
+
+      if (prefFocus !== null) {
+        switch (action) {
+          case 'left':
+            setPrefFocus((i) => (i == null ? 0 : Math.max(0, i - 1)));
+            break;
+          case 'right':
+            setPrefFocus((i) => (i == null ? 0 : Math.min(prefCount - 1, i + 1)));
+            break;
+          case 'down':
+            setPrefFocus(null);
+            setSel(0);
+            break;
+          case 'confirm': {
+            const prefActions: PreferenceAction[] = ['watchlist', 'watched', 'like', 'dislike'];
+            runPreference(prefActions[prefFocus]);
+            break;
+          }
+          case 'back':
+            setPrefFocus(null);
+            break;
+          default:
+            break;
+        }
+        return;
+      }
 
       // Focus is in a horizontal strip: ◀▶ browse, ↑↓ move between strips.
       if (strip) {
@@ -327,7 +412,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           }
           break;
         case 'up':
-          setSel((i) => Math.max(0, i - 1));
+          if (sel === 0) setPrefFocus(0);
+          else setSel((i) => Math.max(0, i - 1));
           break;
         case 'left':
         case 'right':
@@ -376,7 +462,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           break;
       }
     },
-    [stage, episodesInSeason, streams, seasons, season, sel, series, runAction, openEpisode, playChosen, onClose, onOpen, loading, strip, similar, extras, meta, resume, resumeShown, sourcesExpanded, showAllSources, canCompactSources],
+    [stage, episodesInSeason, streams, seasons, season, sel, series, runAction, runPreference, openEpisode, playChosen, onClose, onOpen, loading, strip, similar, extras, meta, resume, resumeShown, sourcesExpanded, showAllSources, canCompactSources, prefFocus],
   );
 
   // Navigation must always keep the selection on screen: the selected list
@@ -407,6 +493,46 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
   const title = meta?.title || item.title;
   const background = meta?.background || item.art;
+  const boxArt = meta?.poster || item.art;
+  const titleLogo = !logoFailed ? meta?.logo || gameLogo(item) : null;
+  const kindLabel = (meta?.kind ?? item.kind).toUpperCase();
+  const detailChips = [
+    meta?.rating && {
+      kind: isGame ? 'score' : 'rating',
+      text: isGame ? `Metacritic ${meta.rating}` : meta.rating,
+    },
+    meta?.release_info && { kind: 'text', text: meta.release_info },
+    meta?.runtime && { kind: 'text', text: meta.runtime },
+    series &&
+      seasons.length > 0 && {
+        kind: 'text',
+        text: `${seasons.length} season${seasons.length > 1 ? 's' : ''}`,
+      },
+    ...(meta?.genres ?? []).slice(0, 2).map((g) => ({ kind: 'text', text: g })),
+  ].filter(Boolean) as { kind: string; text: string }[];
+  const facts = [
+    meta?.rating && {
+      label: isGame ? 'Metacritic' : 'Rating',
+      value: isGame ? String(meta.rating) : meta.rating,
+    },
+    meta?.release_info && { label: 'Released', value: meta.release_info },
+    meta?.runtime && { label: 'Runtime', value: meta.runtime },
+    series &&
+      seasons.length > 0 && {
+        label: 'Seasons',
+        value: `${seasons.length} · ${meta?.episodes.length ?? 0} episodes`,
+      },
+    !!meta?.genres?.length && { label: 'Genres', value: meta.genres.join(', ') },
+    meta?.developer && { label: 'Developer', value: meta.developer },
+    meta?.publisher &&
+      meta.publisher !== meta.developer && { label: 'Publisher', value: meta.publisher },
+  ].filter(Boolean) as { label: string; value: string }[];
+  const prefButtons: PrefButton[] = [
+    { action: 'watchlist', icon: '+', label: 'Watchlist', active: pref.watchlist },
+    { action: 'watched', icon: '○', label: 'Watched it?', active: pref.watched },
+    { action: 'like', icon: '↑', label: 'Like', active: pref.liked },
+    { action: 'dislike', icon: '↓', label: 'Dislike', active: pref.disliked },
+  ];
 
   return (
     <div className="details">
@@ -421,27 +547,24 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
       <div className="details-body">
         <div className="details-head">
-          {(meta?.poster || item.art) && (
-            <img className="details-poster" src={meta?.poster || item.art} alt={title} />
-          )}
           <div className="details-info">
-            <div className="details-kind">{(meta?.kind ?? item.kind).toUpperCase()}</div>
-            <h1 className="details-title">{title}</h1>
-            <div className="details-sub">
-              {[
-                meta?.release_info,
-                meta?.runtime,
-                meta?.rating && (isGame ? `Metacritic ${meta.rating}` : `★ ${meta.rating}`),
-                series && seasons.length > 0 && `${seasons.length} season${seasons.length > 1 ? 's' : ''}`,
-              ]
-                .filter(Boolean)
-                .join('  ·  ')}
-            </div>
-            {!!meta?.genres?.length && (
-              <div className="details-tags">
-                {meta.genres.map((g) => (
-                  <span key={g} className="details-tag">
-                    {g}
+            <div className="details-kind">{kindLabel}</div>
+            {titleLogo ? (
+              <img
+                key={titleLogo}
+                className="details-title-logo"
+                src={titleLogo}
+                alt={title}
+                onError={() => setLogoFailed(true)}
+              />
+            ) : (
+              <h1 className="details-title">{title}</h1>
+            )}
+            {!!detailChips.length && (
+              <div className="details-sub">
+                {detailChips.map((chip, i) => (
+                  <span key={`${chip.text}-${i}`} className={`details-chip chip-${chip.kind}`}>
+                    {chip.text}
                   </span>
                 ))}
               </div>
@@ -490,57 +613,39 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 {!meta && <p className="details-desc">Loading…</p>}
               </>
             )}
-          </div>
 
-          {(() => {
-            const facts: { label: string; value: string }[] = [
-              meta?.rating && {
-                label: isGame ? 'Metacritic' : 'Rating',
-                value: isGame ? String(meta.rating) : `★ ${meta.rating}`,
-              },
-              meta?.release_info && { label: 'Released', value: meta.release_info },
-              meta?.runtime && { label: 'Runtime', value: meta.runtime },
-              series &&
-                seasons.length > 0 && {
-                  label: 'Seasons',
-                  value: `${seasons.length} · ${meta?.episodes.length ?? 0} episodes`,
-                },
-              !!meta?.genres?.length && { label: 'Genres', value: meta!.genres.join(', ') },
-              meta?.developer && { label: 'Developer', value: meta.developer },
-              meta?.publisher &&
-                meta.publisher !== meta.developer && { label: 'Publisher', value: meta.publisher },
-            ].filter(Boolean) as { label: string; value: string }[];
-            if (facts.length === 0 && !meta?.tags?.length) return null;
-            return (
-              <aside className="details-facts">
-                <div className="details-facts-head">Details</div>
-                <dl className="details-facts-list">
-                  {facts.map((f) => (
-                    <div key={f.label} className="fact-row">
-                      <dt>{f.label}</dt>
-                      <dd>{f.value}</dd>
-                    </div>
-                  ))}
-                </dl>
-                {!!meta?.tags?.length && (
-                  <div className="details-tags details-facts-tags">
-                    {meta.tags.map((t) => (
-                      <span key={t} className="details-tag">
-                        {t}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </aside>
-            );
-          })()}
+            <div className="details-quick-actions">
+              {prefButtons.map((button, i) => (
+                <button
+                  key={button.action}
+                  type="button"
+                  className={`details-round-action ${button.active ? 'active' : ''} ${
+                    prefFocus === i ? 'selected' : ''
+                  }`}
+                  onClick={() => {
+                    setPrefFocus(i);
+                    runPreference(button.action);
+                  }}
+                >
+                  <span className="round-action-icon">{button.icon}</span>
+                  <span>{button.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
+
+        {boxArt && (
+          <aside className="details-box-panel" aria-hidden="true">
+            <img className="details-box-art" src={boxArt} alt="" />
+          </aside>
+        )}
 
         {stage === 'actions' && (
           <div className="details-actions">
             <div
-              ref={!strip ? selRef : undefined}
-              className={`row-item action-button ${!strip ? 'selected' : ''}`}
+              ref={!strip && prefFocus === null ? selRef : undefined}
+              className={`row-item action-button ${!strip && prefFocus === null ? 'selected' : ''}`}
               onClick={runAction}
             >
               {item.action === 'install' ? 'Install' : 'Play'}
@@ -550,11 +655,15 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
         {resumeShown && resume && (
           <div
-            ref={sel === 0 && !strip ? selRef : undefined}
-            className={`resume-btn ${sel === 0 && !strip ? 'selected' : ''}`}
+            ref={sel === 0 && !strip && prefFocus === null ? selRef : undefined}
+            className={`resume-btn ${sel === 0 && !strip && prefFocus === null ? 'selected' : ''}`}
             onClick={() => playChosen(resume.stream)}
           >
-            ▶ Resume · {formatTime(resume.position)} · same source
+            <span className="resume-play">▶</span>
+            <span>
+              <span className="resume-label">Resume</span>
+              <span className="resume-detail">{formatTime(resume.position)} · same source</span>
+            </span>
           </div>
         )}
 
@@ -574,8 +683,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
               {episodesInSeason.map((ep, i) => (
                 <div
                   key={ep.id}
-                  ref={i === sel - resumeOffset && !strip ? selRef : undefined}
-                  className={`ep-item ${i === sel - resumeOffset && !strip ? 'selected' : ''}`}
+                  ref={i === sel - resumeOffset && !strip && prefFocus === null ? selRef : undefined}
+                  className={`ep-item ${i === sel - resumeOffset && !strip && prefFocus === null ? 'selected' : ''}`}
                   onClick={() => {
                     setSel(i + resumeOffset);
                     openEpisode(ep);
@@ -624,8 +733,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                   const d = describeSource(bestStream);
                   return (
                     <div
-                      ref={sel - resumeOffset === 0 && !strip ? selRef : undefined}
-                      className={`best-source ${sel - resumeOffset === 0 && !strip ? 'selected' : ''}`}
+                      ref={sel - resumeOffset === 0 && !strip && prefFocus === null ? selRef : undefined}
+                      className={`best-source ${sel - resumeOffset === 0 && !strip && prefFocus === null ? 'selected' : ''}`}
                       onClick={() => {
                         setSel(resumeOffset);
                         playChosen(bestStream);
@@ -651,8 +760,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 })()}
                 {streams && streams.length > 1 && (
                   <div
-                    ref={sel - resumeOffset === 1 && !strip ? selRef : undefined}
-                    className={`source-toggle ${sel - resumeOffset === 1 && !strip ? 'selected' : ''}`}
+                    ref={sel - resumeOffset === 1 && !strip && prefFocus === null ? selRef : undefined}
+                    className={`source-toggle ${sel - resumeOffset === 1 && !strip && prefFocus === null ? 'selected' : ''}`}
                     onClick={() => {
                       setShowAllSources(true);
                       setSel(resumeOffset);
@@ -670,8 +779,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 {streams.map((s, i) => (
                   <div
                     key={`${s.url}-${i}`}
-                    ref={i === sel - resumeOffset && !strip ? selRef : undefined}
-                    className={`stream-item ${i === sel - resumeOffset && !strip ? 'selected' : ''} ${
+                    ref={i === sel - resumeOffset && !strip && prefFocus === null ? selRef : undefined}
+                    className={`stream-item ${i === sel - resumeOffset && !strip && prefFocus === null ? 'selected' : ''} ${
                       i === 0 && canCompactSources ? 'stream-best' : ''
                     }`}
                     onClick={() => {
@@ -690,6 +799,36 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                   </div>
                 ))}
               </div>
+            )}
+          </div>
+        )}
+
+        {(facts.length > 0 || !!meta?.tags?.length) && (
+          <div className="details-facts">
+            {facts.length > 0 && (
+              <section className="details-fact-panel">
+                <div className="details-facts-head">More information</div>
+                <dl className="details-facts-list">
+                  {facts.map((f) => (
+                    <div key={f.label} className="fact-row">
+                      <dt>{f.label}</dt>
+                      <dd>{f.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
+            )}
+            {!!meta?.tags?.length && (
+              <section className="details-fact-panel">
+                <div className="details-facts-head">Tags</div>
+                <div className="details-tags details-facts-tags">
+                  {meta.tags.map((t) => (
+                    <span key={t} className="details-tag">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              </section>
             )}
           </div>
         )}

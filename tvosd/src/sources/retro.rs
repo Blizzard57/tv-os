@@ -389,10 +389,8 @@ impl RetroArch {
                 PathBuf::from("/app/lib/libretro"), // some flatpak runtimes
             ],
             RetroArch::Flatpak => vec![
-                Path::new(&home)
-                    .join(".var/app/org.libretro.RetroArch/config/retroarch/cores"),
-                Path::new(&home)
-                    .join(".var/app/org.libretro.RetroArch/.config/retroarch/cores"),
+                Path::new(&home).join(".var/app/org.libretro.RetroArch/config/retroarch/cores"),
+                Path::new(&home).join(".var/app/org.libretro.RetroArch/.config/retroarch/cores"),
             ],
         }
     }

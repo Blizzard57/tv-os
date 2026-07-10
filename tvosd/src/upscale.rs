@@ -43,10 +43,30 @@ pub struct Preset {
 
 /// The named upscaler presets, in menu order: (label, hint, anime?, mode).
 const PRESET_DEFS: [(&str, &str, bool, EnhanceMode); 4] = [
-    ("Anime — Quality", "Anime4K Mode A (HQ)", true, EnhanceMode::Quality),
-    ("Anime — Fast", "Anime4K (light)", true, EnhanceMode::Performance),
-    ("Live Action — Quality", "FSRCNNX x2 16", false, EnhanceMode::Quality),
-    ("Live Action — Fast", "FSRCNNX x2 8", false, EnhanceMode::Performance),
+    (
+        "Anime — Quality",
+        "Anime4K Mode A (HQ)",
+        true,
+        EnhanceMode::Quality,
+    ),
+    (
+        "Anime — Fast",
+        "Anime4K (light)",
+        true,
+        EnhanceMode::Performance,
+    ),
+    (
+        "Live Action — Quality",
+        "FSRCNNX x2 16",
+        false,
+        EnhanceMode::Quality,
+    ),
+    (
+        "Live Action — Fast",
+        "FSRCNNX x2 8",
+        false,
+        EnhanceMode::Performance,
+    ),
 ];
 
 /// Every upscaler the in-player menu can switch to live: "Off" first, then each
@@ -309,9 +329,7 @@ fn detect_gpu() -> Gpu {
     let nvidia = Command::new("nvidia-smi")
         .arg("-L")
         .output()
-        .is_ok_and(|o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GPU ")
-        });
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GPU "));
     if nvidia {
         return Gpu::Nvidia;
     }

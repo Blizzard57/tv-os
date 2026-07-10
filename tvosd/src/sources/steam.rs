@@ -308,7 +308,11 @@ fn names(array: Option<&Value>) -> Vec<String> {
         .and_then(|a| a.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|g| g.get("description").and_then(|d| d.as_str()).map(String::from))
+                .filter_map(|g| {
+                    g.get("description")
+                        .and_then(|d| d.as_str())
+                        .map(String::from)
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -446,7 +450,8 @@ pub fn playtime_minutes(appid: &str) -> Option<i64> {
         })
         .collect();
     let minutes = map.get(appid).copied();
-    *PLAYTIME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), map));
+    *PLAYTIME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((std::time::Instant::now(), map));
     minutes
 }
 
@@ -532,7 +537,11 @@ pub fn achievements(appid: &str) -> Option<(Vec<Achievement>, Vec<Achievement>)>
             Some(&t) => unlocked.push(Achievement {
                 name: display,
                 description,
-                icon: def.get("icon").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
+                icon: def
+                    .get("icon")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 unlocked_at: Some(t),
             }),
             None => locked.push(Achievement {
@@ -748,7 +757,10 @@ mod tests {
         let acf = "\t\"appid\"\t\t\"8930\"\n\t\"name\"\t\t\"Sid Meier's \\\"Civilization\\\" V\"\n";
         assert_eq!(
             parse_acf(acf),
-            Some(("8930".to_string(), "Sid Meier's \"Civilization\" V".to_string()))
+            Some((
+                "8930".to_string(),
+                "Sid Meier's \"Civilization\" V".to_string()
+            ))
         );
     }
 
@@ -797,8 +809,14 @@ mod tests {
         assert_eq!(m.publisher.as_deref(), Some("Valve"));
         assert_eq!(m.release_info.as_deref(), Some("18 Apr, 2011"));
         assert_eq!(m.rating.as_deref(), Some("95"));
-        assert_eq!(m.tags, vec!["Single-player", "Co-op", "Full controller support"]);
-        assert_eq!(m.screenshots, vec!["https://x/ss0.jpg", "https://x/ss1.jpg"]);
+        assert_eq!(
+            m.tags,
+            vec!["Single-player", "Co-op", "Full controller support"]
+        );
+        assert_eq!(
+            m.screenshots,
+            vec!["https://x/ss0.jpg", "https://x/ss1.jpg"]
+        );
         assert!(parse_store_meta("620", r#"{"620": {"success": false}}"#).is_none());
     }
 

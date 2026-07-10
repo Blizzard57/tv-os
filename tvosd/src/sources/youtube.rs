@@ -116,12 +116,13 @@ const ACCOUNT_FEEDS: &[(&str, &str)] = &[
 /// --password-store=basic, so yt-dlp can decrypt its cookies without a
 /// keyring — signing in to YouTube inside the app is all it takes.
 fn browser_profile() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let profile = format!("{home}/.local/share/tvos/browser/Default");
-    std::path::Path::new(&profile)
+    let profile = std::env::var("TVOS_BROWSER_PROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| crate::settings::profile_dir().join("browser/Default"));
+    profile
         .join("Cookies")
         .exists()
-        .then_some(profile)
+        .then(|| profile.to_string_lossy().into_owned())
 }
 
 /// Whether the signed-in feeds are reachable, with a human reason if not.

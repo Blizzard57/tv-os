@@ -87,6 +87,21 @@ type SettingsResponse = Settings & Record<string, unknown>;
 const isSecret = (key: string): key is SecretField =>
   (SECRET_FIELDS as readonly string[]).includes(key);
 
+type SettingsCategory = 'accounts' | 'games' | 'sources' | 'display' | 'appearance';
+
+const SETTINGS_CATEGORIES: {
+  id: SettingsCategory;
+  label: string;
+  detail: string;
+  icon: string;
+}[] = [
+  { id: 'accounts', label: 'Accounts & services', detail: 'Steam, TMDB, YouTube, tracking', icon: 'person' },
+  { id: 'games', label: 'Games & libraries', detail: 'Stores and price region', icon: 'apps' },
+  { id: 'sources', label: 'Streaming sources', detail: 'Torrentio, WatchHub, CloudStream', icon: 'wifi' },
+  { id: 'display', label: 'Display & sound', detail: 'Resolution and HDR', icon: 'tv' },
+  { id: 'appearance', label: 'System', detail: 'Theme, accent, enhancement', icon: 'gear' },
+];
+
 export function SettingsPanel({
   onClose,
   reload,
@@ -100,6 +115,7 @@ export function SettingsPanel({
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [version, setVersion] = useState<string | null>(null);
+  const [activeCategory, setActiveCategory] = useState<SettingsCategory>('sources');
   // Which secret fields already have a stored value on the daemon (their value
   // arrives blanked). Drives the "configured/•••" display.
   const [configured, setConfigured] = useState<Record<string, boolean>>({});
@@ -261,47 +277,116 @@ export function SettingsPanel({
     [],
   );
 
+  const activeInfo =
+    SETTINGS_CATEGORIES.find((cat) => cat.id === activeCategory) ?? SETTINGS_CATEGORIES[0];
+  const playableCloud = manifests.reduce(
+    (sum, manifest) => sum + manifest.sources.filter((source) => source.playable).length,
+    0,
+  );
+  const packageCloud = manifests.reduce(
+    (sum, manifest) =>
+      sum + manifest.sources.filter((source) => !source.playable && source.kind === 'cs3').length,
+    0,
+  );
+  const streamAddons = addons.filter((addon) => addon.streams).length;
+
   return (
     <div className="settings-scrim" onClick={onClose}>
       <div className="settings" ref={panelRef} onClick={(e) => e.stopPropagation()}>
-        <div className="settings-head">
-          <h1>
-            Settings
-            {version && <span className="settings-version">tvosd v{version}</span>}
-          </h1>
-          <button className="btn" onClick={onClose}>
-            Close (B / Esc)
-          </button>
-        </div>
-
         {loadError ? (
-          <p className="settings-muted">
-            Could not load settings — the tvosd daemon isn't answering. Check that it's running,
-            then reopen this panel.
-          </p>
+          <div className="settings-empty-state">
+            <h1>Settings</h1>
+            <p>Could not load settings. tvosd is not answering.</p>
+            <button className="btn btn-primary" onClick={onClose}>
+              Close
+            </button>
+          </div>
         ) : !loaded ? (
-          <p className="settings-muted">Loading…</p>
+          <div className="settings-empty-state">
+            <h1>Settings</h1>
+            <p>Loading…</p>
+          </div>
         ) : (
-          <>
-            <SteamSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-            <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />
-            <TmdbSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-            <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-            <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-            <AddonSection addons={addons} refresh={refreshAddons} reload={reload} openOsk={openOsk} />
-            <SourceManifestSection manifests={manifests} refresh={refreshManifests} reload={reload} openOsk={openOsk} />
-            <DisplaySection form={form} update={update} submit={submit} />
-            <AppearanceSection
-              form={form}
-              update={update}
-              reload={reload}
-              submit={submit}
-              configured={configured}
-              openOsk={openOsk}
-              theme={theme}
-              onToggleTheme={onToggleTheme}
-            />
-          </>
+          <div className="settings-tv-page">
+            <aside className="settings-nav-pane">
+              <div className="settings-brand">
+                <div>
+                  <span className="settings-kicker">Google TV</span>
+                  <h1>Settings</h1>
+                </div>
+                <button className="settings-gear-button" onClick={onClose} aria-label="Close settings">
+                  ×
+                </button>
+              </div>
+              <nav className="settings-nav-list" aria-label="Settings categories">
+                {SETTINGS_CATEGORIES.map((cat) => (
+                  <button
+                    key={cat.id}
+                    className={`settings-nav-item ${activeCategory === cat.id ? 'settings-nav-active' : ''}`}
+                    onClick={() => setActiveCategory(cat.id)}
+                  >
+                    <span className={`settings-nav-icon settings-nav-icon-${cat.icon}`} aria-hidden />
+                    <span>
+                      <span className="settings-nav-label">{cat.label}</span>
+                      <span className="settings-nav-detail">{cat.detail}</span>
+                    </span>
+                  </button>
+                ))}
+              </nav>
+              <div className="settings-version-bar">
+                <span>TV OS</span>
+                {version && <span>tvosd v{version}</span>}
+              </div>
+            </aside>
+
+            <main className="settings-detail-pane">
+              <div className="settings-detail-head">
+                <span className="settings-kicker">All settings</span>
+                <h2>{activeInfo.label}</h2>
+              </div>
+              <div className="settings-detail-scroll">
+                {activeCategory === 'accounts' && (
+                  <>
+                    <SteamSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+                    <TmdbSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+                    <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+                    <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+                  </>
+                )}
+                {activeCategory === 'games' && (
+                  <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />
+                )}
+                {activeCategory === 'sources' && (
+                  <>
+                    <SourceHealthPanel
+                      addons={addons}
+                      manifests={manifests}
+                      playableCloud={playableCloud}
+                      packageCloud={packageCloud}
+                      streamAddons={streamAddons}
+                    />
+                    <AddonSection addons={addons} refresh={refreshAddons} reload={reload} openOsk={openOsk} />
+                    <SourceManifestSection manifests={manifests} refresh={refreshManifests} reload={reload} openOsk={openOsk} />
+                  </>
+                )}
+                {activeCategory === 'display' && (
+                  <DisplaySection form={form} update={update} submit={submit} />
+                )}
+                {activeCategory === 'appearance' && (
+                  <AppearanceSection
+                    form={form}
+                    update={update}
+                    reload={reload}
+                    submit={submit}
+                    configured={configured}
+                    openOsk={openOsk}
+                    theme={theme}
+                    onToggleTheme={onToggleTheme}
+                  />
+                )}
+              </div>
+            </main>
+          </div>
         )}
       </div>
 
@@ -763,6 +848,74 @@ function LibRow({
   );
 }
 
+function SourceHealthPanel({
+  addons,
+  manifests,
+  playableCloud,
+  packageCloud,
+  streamAddons,
+}: {
+  addons: Addon[];
+  manifests: SourceManifest[];
+  playableCloud: number;
+  packageCloud: number;
+  streamAddons: number;
+}) {
+  const totalCloud = manifests.reduce((sum, manifest) => sum + manifest.sources.length, 0);
+  const tested = manifests.reduce(
+    (sum, manifest) => sum + manifest.sources.filter((source) => source.reachable != null).length,
+    0,
+  );
+  const reachable = manifests.reduce(
+    (sum, manifest) => sum + manifest.sources.filter((source) => source.reachable).length,
+    0,
+  );
+  const hasTorrentio = addons.some((addon) => addon.name.toLowerCase().includes('torrentio'));
+  const hasWatchHub = addons.some((addon) => addon.name.toLowerCase().includes('watchhub'));
+
+  return (
+    <section className="settings-source-overview">
+      <div className="source-overview-head">
+        <span className="settings-kicker">Source engine</span>
+        <h3>Ranked best-first on every details page</h3>
+      </div>
+      <div className="source-overview-grid">
+        <SourceMetric label="Stream addons" value={String(streamAddons)} detail="Stremio protocol" active={streamAddons > 0} />
+        <SourceMetric label="Torrentio" value={hasTorrentio ? 'On' : 'Off'} detail="Seed strength ranked" active={hasTorrentio} />
+        <SourceMetric label="WatchHub" value={hasWatchHub ? 'On' : 'Off'} detail="External services" active={hasWatchHub} />
+        <SourceMetric label="CloudStream" value={String(playableCloud)} detail="Playable templates" active={playableCloud > 0} />
+        <SourceMetric label=".cs3 packages" value={String(packageCloud)} detail="Reachable metadata" active={packageCloud > 0} />
+        <SourceMetric label="Tested" value={`${reachable}/${tested || totalCloud || 0}`} detail="CloudStream entries" active={tested > 0} />
+      </div>
+      <p className="settings-muted source-overview-note">
+        Direct and debrid streams rank first, then YouTube, WatchHub, and torrents by seeders,
+        resolution, and size. CloudStream URL-template sources join that same list. Imported
+        .cs3 packages are probed as packages; they need the CloudStream Android runtime to scrape.
+      </p>
+    </section>
+  );
+}
+
+function SourceMetric({
+  label,
+  value,
+  detail,
+  active,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  active: boolean;
+}) {
+  return (
+    <div className={`source-metric ${active ? 'source-metric-on' : ''}`}>
+      <span className="source-metric-label">{label}</span>
+      <strong>{value}</strong>
+      <span>{detail}</span>
+    </div>
+  );
+}
+
 function AddonSection({
   addons,
   refresh,
@@ -881,7 +1034,12 @@ function SourceManifestSection({
       const m = await addSourceManifest(input);
       setText('');
       const n = m.sources.length;
-      setStatus(`Added “${m.name}” — ${n} source${n === 1 ? '' : 's'}. Test them below.`);
+      const playable = m.sources.filter((s) => s.playable).length;
+      setStatus(
+        playable > 0
+          ? `Added “${m.name}” — ${playable} playable source${playable === 1 ? '' : 's'}.`
+          : `Added “${m.name}” — ${n} CloudStream plugin descriptor${n === 1 ? '' : 's'}.`
+      );
       await refresh();
       reload();
     } catch (e) {
@@ -927,7 +1085,15 @@ function SourceManifestSection({
       const flat = updated.flatMap((x) => x.sources);
       const up = flat.filter((s) => s.reachable).length;
       const down = flat.filter((s) => s.reachable === false).length;
-      setStatus(`Reachable: ${up} · unreachable (auto-disabled): ${down}`);
+      const playable = flat.filter((s) => s.playable).length;
+      const packages = flat.filter((s) => !s.playable && s.kind === 'cs3').length;
+      setStatus(
+        playable > 0
+          ? `Reachable: ${up} · unreachable (auto-disabled): ${down}`
+          : packages > 0
+            ? `Packages reachable: ${up} · unreachable: ${down}`
+            : 'No testable CloudStream entries yet.'
+      );
       await refresh();
       reload();
     } catch (e) {
@@ -941,12 +1107,9 @@ function SourceManifestSection({
     <section className="settings-section">
       <h2>CloudStream sources</h2>
       <p className="settings-muted">
-        Add a CloudStream-style source manifest — paste its URL <em>or</em> the
-        raw JSON. It declares extra stream providers that are queried for the
-        title you open and merged into one ranked list alongside Torrentio and
-        WatchHub. Each source maps a movie/series to a URL template (placeholders:{' '}
-        {'{imdb}'}, {'{type}'}, {'{id}'}, {'{season}'}, {'{episode}'}) returning
-        either a Stremio {'{'}streams{'}'} body or a CloudStream link list.
+        URL-template sources are playable and merge into the same ranked picker as
+        Torrentio and WatchHub. CloudStream .cs3 repositories are imported and
+        package-tested here; their scraper bytecode still needs a CloudStream runtime.
       </p>
       <Field label="Manifest URL or JSON">
         <textarea
@@ -1005,17 +1168,23 @@ function SourceManifestSection({
                   <span className="manifest-source-name">{s.name}</span>
                 </label>
                 <span className="manifest-source-meta settings-muted">
-                  {s.series ? 'movies + series' : 'movies only'}
+                  {s.playable
+                    ? s.series
+                      ? 'movies + series'
+                      : 'movies only'
+                    : '.cs3 package'}
                   {s.reachable === true && (
                     <span className="reach reach-ok">
-                      {' · '}✓ reachable
+                      {' · '}{s.playable ? 'reachable' : 'package reachable'}
                       {s.latency_ms != null ? ` (${s.latency_ms} ms)` : ''}
                     </span>
                   )}
                   {s.reachable === false && (
-                    <span className="reach reach-bad">{' · '}✗ unreachable</span>
+                    <span className="reach reach-bad">
+                      {' · '}{s.playable ? 'unreachable' : 'package unreachable'}
+                    </span>
                   )}
-                  {s.reachable == null && <span>{' · '}not tested</span>}
+                  {s.reachable == null && <span>{' · '}{s.testable ? 'not tested' : 'metadata only'}</span>}
                 </span>
               </li>
             ))}

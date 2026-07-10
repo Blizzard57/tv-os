@@ -320,6 +320,9 @@ export const openUrl = (url: string) => post('/api/open', { url });
 export interface ManifestSource {
   name: string;
   enabled: boolean;
+  playable: boolean;
+  testable: boolean;
+  kind: 'template' | 'cs3';
   series: boolean;
   reachable?: boolean;
   latency_ms?: number;
@@ -400,6 +403,37 @@ export async function searchDeep(query: string): Promise<Row[]> {
 export async function fetchSimilar(id: string): Promise<ContentItem[]> {
   const res = await apiFetch(`/api/similar?id=${encodeURIComponent(id)}`);
   if (!res.ok) return [];
+  return res.json();
+}
+
+export interface PreferenceStatus {
+  watchlist: boolean;
+  watched: boolean;
+  liked: boolean;
+  disliked: boolean;
+}
+
+export type PreferenceAction = 'watchlist' | 'watched' | 'like' | 'dislike';
+
+export async function fetchPreference(id: string): Promise<PreferenceStatus> {
+  const res = await apiFetch(`/api/preference?id=${encodeURIComponent(id)}`);
+  if (!res.ok) return { watchlist: false, watched: false, liked: false, disliked: false };
+  return res.json();
+}
+
+export async function setPreference(
+  action: PreferenceAction,
+  item: ContentItem,
+): Promise<PreferenceStatus> {
+  const res = await apiFetch('/api/preference', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action,
+      item: { id: item.id, title: item.title, kind: item.kind, art: item.art, action: item.action },
+    }),
+  });
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
   return res.json();
 }
 

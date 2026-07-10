@@ -30,9 +30,9 @@ mod recommend;
 mod resume;
 mod search;
 mod settings;
-mod tracking;
 mod shaders;
 mod sources;
+mod tracking;
 mod upscale;
 mod util;
 
@@ -127,10 +127,8 @@ impl App {
     /// Fresh source rows; also refreshes the search cache.
     fn refresh_library(&self) -> Vec<model::Row> {
         let rows = self.sources.library();
-        *self
-            .library_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), rows.clone()));
+        *self.library_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), rows.clone()));
         rows
     }
 
@@ -200,10 +198,20 @@ async fn main() {
             "/api/source-manifests",
             get(get_source_manifests).post(post_source_manifest),
         )
-        .route("/api/source-manifests/remove", post(post_source_manifest_remove))
-        .route("/api/source-manifests/toggle", post(post_source_manifest_toggle))
-        .route("/api/source-manifests/test", post(post_source_manifest_test))
+        .route(
+            "/api/source-manifests/remove",
+            post(post_source_manifest_remove),
+        )
+        .route(
+            "/api/source-manifests/toggle",
+            post(post_source_manifest_toggle),
+        )
+        .route(
+            "/api/source-manifests/test",
+            post(post_source_manifest_test),
+        )
         .route("/api/meta", get(get_meta))
+        .route("/api/preference", get(get_preference).post(post_preference))
         .route("/api/streams", get(get_streams))
         .route("/api/search", get(get_search))
         .route("/api/search/deep", get(get_search_deep))
@@ -259,7 +267,10 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
-    log_info!("tvosd listening on http://{addr} (ui: {})", ui_dir.display());
+    log_info!(
+        "tvosd listening on http://{addr} (ui: {})",
+        ui_dir.display()
+    );
     axum::serve(listener, router).await.expect("server error");
 }
 
@@ -300,6 +311,12 @@ fn ui_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_UI_DIR") {
         return PathBuf::from(dir);
     }
+    if let Ok(cwd) = std::env::current_dir() {
+        let dev = cwd.join("shell/dist");
+        if dev.is_dir() {
+            return dev;
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     let user_default = PathBuf::from(format!("{home}/.local/share/tvos/ui"));
     [
@@ -330,7 +347,9 @@ fn is_personal_row(title: &str) -> bool {
 async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
     // "Continue" comes from the in-memory event log (instant).
     let mut rows = recommend::LOG.rows();
-    let local_recent = recommend::LOG.recent_items(8);
+    rows.extend(recommend::LOG.preference_rows());
+    let local_recent = recommend::LOG.recommendation_seeds(8);
+    let disliked = recommend::LOG.disliked_ids();
     // Recommendations ("Because you watched …") and the source catalogs both hit
     // the network, so build them on a blocking thread. Recs come right after
     // Continue, then everything else.
@@ -399,8 +418,10 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             // never repeats: the "Recommended games" row claims its picks first,
             // then each "Because you play X" row keeps only what's still unseen.
             let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let recs: Vec<model::ContentItem> =
-                recs.into_iter().filter(|i| used.insert(i.id.clone())).collect();
+            let recs: Vec<model::ContentItem> = recs
+                .into_iter()
+                .filter(|i| used.insert(i.id.clone()))
+                .collect();
             let genre_rows: Vec<model::Row> = genre_rows
                 .into_iter()
                 .filter_map(|mut row| {
@@ -426,6 +447,12 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             // Taste-biased, lightly random item order per row — fresh finds
             // mixed with the familiar on every visit.
             sources::tmdb::personalize(&mut r, &recent);
+            if !disliked.is_empty() {
+                for row in &mut r {
+                    row.items.retain(|i| !disliked.contains(&i.id));
+                }
+                r.retain(|row| !row.items.is_empty());
+            }
             r
         })
         .await,
@@ -439,6 +466,44 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
     }
     rows.retain(|row| !row.items.is_empty());
     Json(rows)
+}
+
+#[derive(Deserialize)]
+struct PreferenceRequest {
+    action: String,
+    item: ItemMeta,
+}
+
+async fn get_preference(Query(q): Query<IdQuery>) -> Json<recommend::PreferenceStatus> {
+    Json(recommend::LOG.preference(&q.id))
+}
+
+async fn post_preference(
+    Json(req): Json<PreferenceRequest>,
+) -> Result<Json<recommend::PreferenceStatus>, (StatusCode, String)> {
+    let action = match req.action.as_str() {
+        "watchlist" => recommend::PreferenceAction::Watchlist,
+        "watched" => recommend::PreferenceAction::Watched,
+        "like" => recommend::PreferenceAction::Like,
+        "dislike" => recommend::PreferenceAction::Dislike,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "unknown preference action".to_string(),
+            ))
+        }
+    };
+    let status = recommend::LOG.set_preference(
+        model::ContentItem {
+            id: req.item.id,
+            kind: req.item.kind,
+            title: req.item.title,
+            art: req.item.art,
+            action: req.item.action.unwrap_or(model::Action::Play),
+        },
+        action,
+    );
+    Ok(Json(status))
 }
 
 async fn get_version() -> Json<serde_json::Value> {
@@ -707,13 +772,13 @@ fn meta_for(id: &str, title: Option<&str>) -> media::Meta {
             ..Default::default()
         }),
         // Unowned games (GameHub): the Steam storefront has rich metadata.
-        "gshop" => sources::steam::store_meta(id.trim_start_matches("gshop:")).unwrap_or(
-            media::Meta {
+        "gshop" => {
+            sources::steam::store_meta(id.trim_start_matches("gshop:")).unwrap_or(media::Meta {
                 id: id.to_string(),
                 kind: "game".to_string(),
                 ..Default::default()
-            },
-        ),
+            })
+        }
         // Owned games from stores without a storefront API of their own
         // (Epic, GOG, retro/homebrew). Borrow rich metadata — description,
         // screenshots, genres and the stylized logo — from Steam by matching
@@ -785,12 +850,11 @@ async fn get_search_deep(
 /// Everything degrades to null/absent when a source isn't available.
 async fn get_game(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
     let value = tokio::task::spawn_blocking(move || {
-        let appid = q
-            .id
-            .strip_prefix("steam:")
-            .or_else(|| q.id.strip_prefix("gshop:"))
-            .unwrap_or_default()
-            .to_string();
+        let appid =
+            q.id.strip_prefix("steam:")
+                .or_else(|| q.id.strip_prefix("gshop:"))
+                .unwrap_or_default()
+                .to_string();
         if appid.is_empty() {
             return serde_json::json!({});
         }
@@ -800,9 +864,16 @@ async fn get_game(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
             .map(|m| m.title)
             .unwrap_or_default();
         let (playtime, achievements, hltb) = std::thread::scope(|s| {
-            let playtime =
-                s.spawn(|| owned.then(|| sources::steam::playtime_minutes(&appid)).flatten());
-            let ach = s.spawn(|| owned.then(|| sources::steam::achievements(&appid)).flatten());
+            let playtime = s.spawn(|| {
+                owned
+                    .then(|| sources::steam::playtime_minutes(&appid))
+                    .flatten()
+            });
+            let ach = s.spawn(|| {
+                owned
+                    .then(|| sources::steam::achievements(&appid))
+                    .flatten()
+            });
             let hltb = s.spawn(|| {
                 (!title.is_empty())
                     .then(|| sources::hltb::lookup(&title))
@@ -971,18 +1042,38 @@ struct ItemMeta {
     title: String,
     kind: model::Kind,
     art: Option<String>,
+    #[serde(default)]
+    action: Option<model::Action>,
 }
 
 /// Plays a stream the user picked on the details page.
 async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCode, String)> {
     if req.stream.url.len() > MAX_URL_LEN {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "stream URL is too long".to_string()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stream URL is too long".to_string(),
+        ));
     }
     let stream = req.stream;
     let item_id = req.item.as_ref().map(|i| i.id.clone());
     let track_id = req.track_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        sources::stremio::play_stream(&stream, item_id.as_deref(), track_id.as_deref())
+        let first = sources::stremio::play_stream(&stream, item_id.as_deref(), track_id.as_deref());
+        if first.is_ok() || stream.kind == media::StreamKind::External {
+            return first;
+        }
+        let Some(item_id) = item_id.as_deref() else {
+            return first;
+        };
+        let Ok((kind, sid)) = sources::resolve_video(item_id) else {
+            return first;
+        };
+        log_warn!(
+            "selected/resume source failed, refreshing sources for {}: {}",
+            item_id,
+            util::scrub_secrets(first.as_ref().err().unwrap())
+        );
+        sources::stremio::play_meta(&kind, &sid, Some(item_id)).or(first)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1019,7 +1110,10 @@ async fn post_open(Json(req): Json<AddonRequest>) -> Result<StatusCode, (StatusC
 /// client-supplied URL to an external program (xdg-open) or player.
 fn validate_web_url(url: &str) -> Result<(), (StatusCode, String)> {
     if url.len() > MAX_URL_LEN {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "URL is too long".to_string()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "URL is too long".to_string(),
+        ));
     }
     let scheme = url
         .split_once("://")

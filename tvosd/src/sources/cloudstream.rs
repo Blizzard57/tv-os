@@ -46,8 +46,15 @@
 //! probes every source and auto-disables the ones that don't answer. All of
 //! this — the manifest, the per-source enabled flag, and the last probe result
 //! — is persisted to ~/.config/tvos/cloudstream.json so it survives a restart.
+//!
+//! Real CloudStream plugin repositories (`repo.json` / `plugins.json`) are also
+//! accepted. Those `.cs3` entries are compiled Android/Dalvik plugins, so this
+//! daemon can import their metadata and expand repository bundles like
+//! MegaProvider, but it cannot execute their scraper bytecode as a stream
+//! provider without an Android CloudStream runtime.
 
 use std::collections::HashSet;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
@@ -112,6 +119,14 @@ pub struct Manifest {
 pub struct SourceSummary {
     pub name: String,
     pub enabled: bool,
+    /// True when this source has URL templates the daemon can query directly.
+    pub playable: bool,
+    /// True when Settings can probe this entry. `.cs3` descriptors are
+    /// testable as package downloads even though they are not playable here.
+    pub testable: bool,
+    /// "template" for direct URL-template sources, "cs3" for CloudStream
+    /// plugin metadata imported from a repository.
+    pub kind: &'static str,
     /// Whether it declares a series template (movies-only sources can't play TV).
     pub series: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +140,7 @@ struct SourceDef {
     name: String,
     movie: Option<String>,
     series: Option<String>,
+    plugin: Option<String>,
     format: Format,
 }
 
@@ -132,6 +148,24 @@ struct SourceDef {
 enum Format {
     Stremio,
     Cloudstream,
+    Cs3,
+}
+
+impl SourceDef {
+    fn playable(&self) -> bool {
+        self.movie.is_some() || self.series.is_some()
+    }
+
+    fn testable(&self) -> bool {
+        self.playable() || self.plugin.is_some()
+    }
+
+    fn kind(&self) -> &'static str {
+        match self.format {
+            Format::Cs3 => "cs3",
+            _ => "template",
+        }
+    }
 }
 
 impl ManifestStore {
@@ -286,9 +320,7 @@ impl ManifestStore {
         let results: Vec<(String, String, Option<u64>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = targets
                 .iter()
-                .map(|t| {
-                    scope.spawn(move || (t.id.clone(), t.name.clone(), addons::probe(&t.url)))
-                })
+                .map(|t| scope.spawn(move || (t.id.clone(), t.name.clone(), addons::probe(&t.url))))
                 .collect();
             handles.into_iter().filter_map(|h| h.join().ok()).collect()
         });
@@ -332,6 +364,7 @@ impl ManifestStore {
                     .collect();
                 parse_sources(&s.manifest)
                     .into_iter()
+                    .filter(SourceDef::playable)
                     .filter(|d| !off.contains(d.name.as_str()))
                     .collect::<Vec<_>>()
             })
@@ -396,6 +429,9 @@ fn summarize(s: &Stored) -> Option<Manifest> {
             SourceSummary {
                 name: d.name.clone(),
                 enabled: st.map(|s| s.enabled).unwrap_or(true),
+                playable: d.playable(),
+                testable: d.testable(),
+                kind: d.kind(),
                 series: d.series.is_some(),
                 reachable: st.and_then(|s| s.reachable),
                 latency_ms: st.and_then(|s| s.latency_ms),
@@ -454,6 +490,7 @@ fn fetch_provider(source_name: &str, url: &str, format: Format) -> Vec<Stream> {
     match format {
         Format::Stremio => crate::sources::stremio::parse_streams(&body),
         Format::Cloudstream => parse_cloudstream(&body, source_name),
+        Format::Cs3 => Vec::new(),
     }
 }
 
@@ -466,6 +503,7 @@ fn probe_url(d: &SourceDef) -> Option<String> {
         d.series
             .as_ref()
             .map(|t| TemplateCtx::new("series", PROBE_EPISODE).fill(t))
+            .or_else(|| d.plugin.clone())
     }
 }
 
@@ -506,9 +544,7 @@ impl<'a> TemplateCtx<'a> {
 // ---- Manifest parsing ----
 
 /// Coerces arbitrary pasted/fetched JSON into a source-manifest object, or
-/// returns a specific, actionable error. The common mistake is pasting a
-/// CloudStream *plugin repository* (a list of compiled `.cs3` plugins) — we
-/// detect that and say so, instead of a confusing "no sources" message.
+/// returns a specific, actionable error.
 fn interpret_manifest(value: &Value) -> Result<Value, String> {
     // A source manifest is an object with an array of sources. Accept the
     // native "sources" key plus a couple of common synonyms, normalising to
@@ -525,19 +561,14 @@ fn interpret_manifest(value: &Value) -> Result<Value, String> {
         }
     }
 
-    // A CloudStream *plugin repository* — either repo.json (has "pluginLists")
-    // or a plugins.json array of compiled .cs3 plugins. These are Android/Kotlin
-    // extensions that this app has no runtime for; there's nothing to parse.
-    if value.get("pluginLists").is_some() || is_cs3_plugin_list(value) {
-        return Err(
-            "This lists CloudStream .cs3 plugins — compiled Android/Kotlin code (each \
-             plugin is Dalvik bytecode that scrapes a site), which this app has no \
-             runtime to execute; there are no stream URLs inside to import. Use a \
-             Stremio addon (Settings → Addons) for the same coverage over HTTP, or a \
-             source manifest here: a JSON object with a \"sources\" array whose entries \
-             give a \"movie\"/\"series\" URL template that returns stream links."
-                .to_string(),
-        );
+    // A real CloudStream plugin repository: repo.json (has "pluginLists"), a
+    // plugins.json array of compiled .cs3 plugins, or MegaProvider's central
+    // repository database. Import the metadata and expand repository bundles.
+    if value.get("pluginLists").is_some()
+        || is_cs3_plugin_list(value)
+        || is_cloudstream_repo_database(value)
+    {
+        return import_cloudstream_repository(value);
     }
 
     // A bare array of source objects (no wrapper) — accept it as the sources.
@@ -559,6 +590,294 @@ fn interpret_manifest(value: &Value) -> Result<Value, String> {
     )
 }
 
+const MAX_CLOUDSTREAM_FETCHES: usize = 96;
+const MAX_CLOUDSTREAM_PLUGINS: usize = 800;
+const MAX_CS3_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct CloudstreamImport {
+    visited: HashSet<String>,
+    plugin_urls: HashSet<String>,
+    sources: Vec<Value>,
+    fetches: usize,
+    repositories: usize,
+    plugin_lists: usize,
+    cs3_inspected: usize,
+    errors: Vec<String>,
+}
+
+fn import_cloudstream_repository(value: &Value) -> Result<Value, String> {
+    let name = value
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("CloudStream plugins")
+        .to_string();
+    let mut import = CloudstreamImport::default();
+    import.collect_value(value);
+    if import.sources.is_empty() {
+        let detail = import
+            .errors
+            .first()
+            .map(|e| format!(" Last error: {e}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "This is a CloudStream plugin repository, but no plugin metadata could be imported.{detail} \
+             CloudStream .cs3 files are compiled Android/Dalvik extensions; direct playback in this \
+             daemon still requires URL-template sources that return stream links."
+        ));
+    }
+    Ok(serde_json::json!({
+        "name": name,
+        "sources": import.sources,
+        "cloudstream": {
+            "repositories": import.repositories,
+            "pluginLists": import.plugin_lists,
+            "cs3Inspected": import.cs3_inspected,
+            "playback": "metadata-only; compiled .cs3 plugins require CloudStream's Android runtime"
+        }
+    }))
+}
+
+impl CloudstreamImport {
+    fn collect_value(&mut self, value: &Value) {
+        if self.sources.len() >= MAX_CLOUDSTREAM_PLUGINS {
+            return;
+        }
+
+        if let Some(plugin_lists) = value.get("pluginLists").and_then(|v| v.as_array()) {
+            self.repositories += 1;
+            for url in plugin_lists.iter().filter_map(|v| v.as_str()) {
+                self.collect_json_url(url);
+            }
+            return;
+        }
+
+        if is_cs3_plugin_list(value) {
+            self.plugin_lists += 1;
+            if let Some(arr) = value.as_array() {
+                for plugin in arr {
+                    self.collect_plugin(plugin);
+                    if self.sources.len() >= MAX_CLOUDSTREAM_PLUGINS {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        if is_cloudstream_repo_database(value) {
+            if let Some(arr) = value.as_array() {
+                for url in arr.iter().filter_map(repo_database_url) {
+                    self.collect_json_url(&url);
+                }
+            }
+        }
+    }
+
+    fn collect_json_url(&mut self, url: &str) {
+        if self.fetches >= MAX_CLOUDSTREAM_FETCHES || !self.visited.insert(url.to_string()) {
+            return;
+        }
+        self.fetches += 1;
+        let text = match addons::http_get(url) {
+            Ok(text) => text,
+            Err(e) => {
+                self.push_error(format!("{url}: {e}"));
+                return;
+            }
+        };
+        let value = match serde_json::from_str::<Value>(&text) {
+            Ok(value) => value,
+            Err(e) => {
+                self.push_error(format!("{url}: not JSON ({e})"));
+                return;
+            }
+        };
+        self.collect_value(&value);
+    }
+
+    fn collect_plugin(&mut self, plugin: &Value) {
+        if plugin
+            .get("status")
+            .and_then(|s| s.as_i64())
+            .is_some_and(|status| status == 0)
+        {
+            return;
+        }
+        if looks_like_repository_expander(plugin) {
+            let before = self.sources.len();
+            if let Some(url) = cs3_url(plugin) {
+                self.collect_cs3_urls(&url);
+                if self.sources.len() > before {
+                    return;
+                }
+            }
+        }
+        let Some(url) = cs3_url(plugin) else {
+            return;
+        };
+        if !self.plugin_urls.insert(url.clone()) {
+            return;
+        }
+        let name = plugin
+            .get("name")
+            .or_else(|| plugin.get("internalName"))
+            .and_then(|n| n.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("CloudStream plugin");
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), Value::String(name.to_string()));
+        obj.insert("format".to_string(), Value::String("cs3".to_string()));
+        obj.insert("pluginUrl".to_string(), Value::String(url));
+        for key in [
+            "internalName",
+            "repositoryUrl",
+            "language",
+            "description",
+            "iconUrl",
+            "tvTypes",
+            "authors",
+        ] {
+            if let Some(v) = plugin.get(key) {
+                obj.insert(key.to_string(), v.clone());
+            }
+        }
+        self.sources.push(Value::Object(obj));
+    }
+
+    fn collect_cs3_urls(&mut self, url: &str) {
+        if self.cs3_inspected >= 8 {
+            return;
+        }
+        let bytes = match addons::http_get_bytes(url, MAX_CS3_BYTES) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.push_error(format!("{url}: {e}"));
+                return;
+            }
+        };
+        self.cs3_inspected += 1;
+        for discovered in extract_urls_from_cs3(&bytes) {
+            if looks_like_cloudstream_index_url(&discovered) {
+                self.collect_json_url(&discovered);
+            }
+        }
+    }
+
+    fn push_error(&mut self, error: String) {
+        if self.errors.len() < 5 {
+            self.errors.push(error);
+        }
+    }
+}
+
+fn repo_database_url(value: &Value) -> Option<String> {
+    let url = if let Some(url) = value.as_str() {
+        url
+    } else {
+        let obj = value.as_object()?;
+        if obj
+            .keys()
+            .any(|key| key.as_str() != "url" && key.as_str() != "verified")
+        {
+            return None;
+        }
+        obj.get("url").and_then(|u| u.as_str())?
+    };
+    (!looks_like_cs3_url(url)).then(|| url.to_string())
+}
+
+fn is_cloudstream_repo_database(value: &Value) -> bool {
+    value.as_array().is_some_and(|arr| {
+        !arr.is_empty()
+            && arr.iter().all(|entry| {
+                repo_database_url(entry).is_some_and(|url| {
+                    let lower = url.to_ascii_lowercase();
+                    lower.contains("repo") || lower.ends_with(".json")
+                })
+            })
+            && !arr.iter().any(|entry| entry.get("apiVersion").is_some())
+    })
+}
+
+fn looks_like_repository_expander(plugin: &Value) -> bool {
+    let text = ["name", "internalName", "description"]
+        .iter()
+        .filter_map(|key| plugin.get(*key).and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    text.contains("megaprovider")
+        || (text.contains("repositories") && text.contains("add"))
+        || text.contains("all repositories")
+}
+
+fn extract_urls_from_cs3(bytes: &[u8]) -> Vec<String> {
+    let mut urls = extract_http_urls_from_bytes(bytes);
+    if let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) {
+        for i in 0..archive.len() {
+            let Ok(mut file) = archive.by_index(i) else {
+                continue;
+            };
+            if file.size() > MAX_CS3_BYTES {
+                continue;
+            }
+            let name = file.name().to_ascii_lowercase();
+            if !(name.ends_with(".json") || name.ends_with(".dex") || name.ends_with(".txt")) {
+                continue;
+            }
+            let mut buf = Vec::new();
+            if file.read_to_end(&mut buf).is_ok() {
+                urls.extend(extract_http_urls_from_bytes(&buf));
+            }
+        }
+    }
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+fn extract_http_urls_from_bytes(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut urls = Vec::new();
+    let mut start = 0;
+    while let Some(pos) = text[start..].find("http") {
+        let i = start + pos;
+        let rest = &text[i..];
+        if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+            start = i + 4;
+            continue;
+        }
+        let end = rest
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                (ch.is_whitespace()
+                    || ch.is_control()
+                    || matches!(
+                        ch,
+                        '"' | '\'' | '<' | '>' | '\\' | '{' | '}' | '[' | ']' | ')' | '(' | ','
+                    ))
+                .then_some(idx)
+            })
+            .unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(['.', ';', ':']).to_string();
+        if url.len() <= MAX_URL_LEN {
+            urls.push(url);
+        }
+        start = i + end.max(4);
+    }
+    urls
+}
+
+fn looks_like_cloudstream_index_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("repos-db")
+        || lower.contains("plugins.json")
+        || lower.contains("repo.json")
+        || lower.ends_with("/repo")
+}
+
 /// Recognises the CloudStream plugin-list JSON (the format at a repo's
 /// `plugins.json`): an array whose entries point to `.cs3` plugin files or
 /// carry CloudStream's plugin fields (`internalName`, `apiVersion`).
@@ -568,7 +887,7 @@ fn is_cs3_plugin_list(value: &Value) -> bool {
             && arr.iter().any(|e| {
                 e.get("url")
                     .and_then(|u| u.as_str())
-                    .is_some_and(|u| u.ends_with(".cs3"))
+                    .is_some_and(looks_like_cs3_url)
                     || e.get("internalName").is_some()
                     || e.get("apiVersion").is_some()
             })
@@ -581,6 +900,8 @@ const MOVIE_KEYS: &[&str] = &["movie", "movieUrl", "movie_url", "movieUrlTemplat
 const SERIES_KEYS: &[&str] = &["series", "tv", "seriesUrl", "series_url", "tv_url", "show"];
 /// A single template that serves both (a generic `url`/`template`).
 const GENERIC_KEYS: &[&str] = &["url", "template", "urlTemplate"];
+/// CloudStream repository entries point at compiled `.cs3` packages.
+const CS3_KEYS: &[&str] = &["cs3", "pluginUrl", "plugin_url", "packageUrl"];
 
 /// First non-empty string among `keys` on `s`.
 fn first_template(s: &Value, keys: &[&str]) -> Option<String> {
@@ -590,13 +911,27 @@ fn first_template(s: &Value, keys: &[&str]) -> Option<String> {
         .map(String::from)
 }
 
+fn looks_like_cs3_url(url: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase()
+        .ends_with(".cs3")
+}
+
+fn cs3_url(s: &Value) -> Option<String> {
+    first_template(s, CS3_KEYS)
+        .or_else(|| first_template(s, &["url"]).filter(|url| looks_like_cs3_url(url)))
+}
+
 /// Does this JSON value look like a stream source (declares some URL template)?
 /// Used to accept a bare array / single object of sources without a wrapper.
 fn looks_like_source(v: &Value) -> bool {
     !v.is_string()
         && (first_template(v, MOVIE_KEYS).is_some()
             || first_template(v, SERIES_KEYS).is_some()
-            || first_template(v, GENERIC_KEYS).is_some())
+            || first_template(v, GENERIC_KEYS).is_some()
+            || cs3_url(v).is_some())
 }
 
 /// Parses the `sources` array of a manifest into usable providers. A source is
@@ -611,7 +946,8 @@ fn parse_sources(manifest: &Value) -> Vec<SourceDef> {
     sources
         .iter()
         .filter_map(|s| {
-            let generic = first_template(s, GENERIC_KEYS);
+            let cs3 = cs3_url(s);
+            let generic = first_template(s, GENERIC_KEYS).filter(|url| !looks_like_cs3_url(url));
             let movie = first_template(s, MOVIE_KEYS).or_else(|| generic.clone());
             let series = first_template(s, SERIES_KEYS).or_else(|| {
                 // A generic template is a series template only if it can vary by
@@ -622,10 +958,14 @@ fn parse_sources(manifest: &Value) -> Vec<SourceDef> {
                     .cloned()
             });
             if movie.is_none() && series.is_none() {
-                return None; // nothing playable
+                if cs3.is_none() {
+                    return None; // nothing playable or importable
+                }
             }
             let format = match s.get("format").and_then(|f| f.as_str()) {
                 Some("stremio") => Format::Stremio,
+                Some("cs3") | Some("cloudstream-plugin") => Format::Cs3,
+                _ if cs3.is_some() && movie.is_none() && series.is_none() => Format::Cs3,
                 _ => Format::Cloudstream,
             };
             Some(SourceDef {
@@ -636,6 +976,7 @@ fn parse_sources(manifest: &Value) -> Vec<SourceDef> {
                     .to_string(),
                 movie,
                 series,
+                plugin: cs3,
                 format,
             })
         })
@@ -780,7 +1121,10 @@ mod tests {
         let stored = parse_store(&old);
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].id, "https://x/manifest.json");
-        assert_eq!(stored[0].source_url.as_deref(), Some("https://x/manifest.json"));
+        assert_eq!(
+            stored[0].source_url.as_deref(),
+            Some("https://x/manifest.json")
+        );
         // Every migrated source starts enabled.
         assert!(stored[0].states.iter().all(|s| s.enabled));
         assert_eq!(stored[0].states.len(), 3);
@@ -845,18 +1189,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cloudstream_cs3_plugin_repo_with_clear_error() {
-        // The real MegaRepo plugin list the user pasted.
-        let mega = r#"[
-            {"apiVersion": 1, "repositoryUrl": "https://github.com/self-similarity/MegaRepo",
-             "status": 1, "version": 2, "internalName": "MegaProvider",
-             "url": "https://raw.githubusercontent.com/self-similarity/MegaRepo/builds/MegaProvider.cs3",
-             "name": "MegaProvider"}
+    fn imports_cloudstream_cs3_plugin_list_as_metadata() {
+        let plugins = r#"[
+            {"apiVersion": 1, "repositoryUrl": "https://github.com/recloudstream/extensions",
+             "status": 1, "version": 4, "internalName": "DailymotionProvider",
+             "url": "https://raw.githubusercontent.com/recloudstream/extensions/builds/DailymotionProvider.cs3",
+             "name": "DailymotionProvider"}
         ]"#;
-        let value: Value = serde_json::from_str(mega).unwrap();
+        let value: Value = serde_json::from_str(plugins).unwrap();
         assert!(is_cs3_plugin_list(&value));
-        let err = interpret_manifest(&value).unwrap_err();
-        assert!(err.contains(".cs3"), "error should name the .cs3 problem: {err}");
+        let imported = interpret_manifest(&value).unwrap();
+        let defs = parse_sources(&imported);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "DailymotionProvider");
+        assert!(!defs[0].playable());
+        assert!(defs[0].format == Format::Cs3);
 
         // A genuine source manifest still passes through.
         assert!(interpret_manifest(&manifest()).is_ok());
@@ -867,14 +1214,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cloudstream_repo_json_with_pluginlists() {
-        // The canonical CloudStream repo.json — compiled .cs3 plugins, unrunnable.
-        let repo = serde_json::json!({
-            "name": "MyRepo", "description": "d", "manifestVersion": 1,
-            "pluginLists": ["https://host/builds/plugins.json"]
-        });
-        let err = interpret_manifest(&repo).unwrap_err();
-        assert!(err.contains(".cs3"), "pluginLists repo should get the plugin-repo error: {err}");
+    fn extracts_repository_urls_from_cs3_bytes() {
+        let bytes = b"classes.dex\0https://raw.githubusercontent.com/recloudstream/cs-repos/master/repos-db.json\0";
+        let urls = extract_http_urls_from_bytes(bytes);
+        assert_eq!(
+            urls,
+            vec!["https://raw.githubusercontent.com/recloudstream/cs-repos/master/repos-db.json"]
+        );
+        assert!(looks_like_cloudstream_index_url(&urls[0]));
     }
 
     #[test]
@@ -884,8 +1231,7 @@ mod tests {
         assert_eq!(parse_sources(&interpret_manifest(&bare).unwrap()).len(), 1);
 
         // Single source object (no wrapper).
-        let single =
-            serde_json::json!({ "name": "Solo", "series": "https://h/s/{imdb}/{season}/{episode}" });
+        let single = serde_json::json!({ "name": "Solo", "series": "https://h/s/{imdb}/{season}/{episode}" });
         let defs = parse_sources(&interpret_manifest(&single).unwrap());
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "Solo");

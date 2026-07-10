@@ -31,7 +31,7 @@ pub fn log_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_LOG_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/tvos/logs")
+    crate::settings::profile_dir().join("logs")
 }
 
 pub fn log_path() -> PathBuf {
