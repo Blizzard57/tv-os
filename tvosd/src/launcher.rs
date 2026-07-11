@@ -513,7 +513,11 @@ fn resolve_webtorrent() -> Option<String> {
         return Some("webtorrent".to_string());
     }
     let home = home_dir().to_string_lossy().into_owned();
+    let profile = crate::settings::profile_dir()
+        .to_string_lossy()
+        .into_owned();
     let mut candidates = vec![
+        format!("{profile}/node_modules/.bin/webtorrent"),
         format!("{home}/.npm-global/bin/webtorrent"),
         format!("{home}/.local/bin/webtorrent"),
         format!("{home}/node_modules/.bin/webtorrent"),
@@ -534,6 +538,20 @@ fn resolve_webtorrent() -> Option<String> {
 }
 
 fn resolve_mpv() -> String {
+    for var in ["TVOS_MPV", "TVOS_VIDEO_PLAYER"] {
+        if let Ok(player) = std::env::var(var) {
+            let player = player.trim();
+            if !player.is_empty() {
+                if std::path::Path::new(player).is_absolute() {
+                    if std::path::Path::new(player).exists() {
+                        return player.to_string();
+                    }
+                } else if command_exists(player) {
+                    return player.to_string();
+                }
+            }
+        }
+    }
     if command_exists("mpv") {
         return "mpv".to_string();
     }
@@ -551,7 +569,11 @@ fn resolve_mpv() -> String {
 fn child_path() -> String {
     let current = std::env::var("PATH").unwrap_or_default();
     if cfg!(target_os = "macos") {
-        format!("/opt/homebrew/bin:/usr/local/bin:{current}")
+        let profile_bin = crate::settings::profile_dir().join("node_modules/.bin");
+        format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:{current}",
+            profile_bin.display()
+        )
     } else {
         current
     }

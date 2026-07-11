@@ -1,7 +1,7 @@
 // Spatial focus movement for overlay panels (Settings): lets a d-pad / arrow
-// keys walk every button, input and select like a native TV UI. Left/Right
-// step linearly (covers horizontal groups like the accent swatches); Up/Down
-// jump to the nearest element in the previous/next visual row.
+// keys walk every button, input and select like a native TV UI. All four
+// directions use on-screen geometry, so moving right from the category rail
+// enters the detail pane instead of walking down the DOM-order category list.
 
 /** Focusable controls inside `root`, in document order, visible only. */
 export function focusables(root: HTMLElement): HTMLElement[] {
@@ -20,31 +20,52 @@ export function moveFocus(
   root: HTMLElement,
   dir: 'up' | 'down' | 'left' | 'right',
   smooth = true,
-): void {
+): boolean {
   const els = focusables(root);
-  if (els.length === 0) return;
+  if (els.length === 0) return false;
   const active = document.activeElement as HTMLElement | null;
   const current = active && els.indexOf(active);
   let next: HTMLElement | undefined;
 
   if (current === null || current === -1) {
     next = els[0];
-  } else if (dir === 'left' || dir === 'right') {
-    next = els[Math.min(els.length - 1, Math.max(0, current + (dir === 'right' ? 1 : -1)))];
   } else {
     const rect = els[current].getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
     const candidates = els
       .map((el) => ({ el, r: el.getBoundingClientRect() }))
-      .filter(({ r }) => (dir === 'down' ? r.top > rect.bottom - 1 : r.bottom < rect.top + 1));
-    // Nearest row first; within (roughly) the same row, nearest horizontally.
+      .filter(({ el, r }) => {
+        if (el === active) return false;
+        if (dir === 'down') return r.top >= rect.bottom - 1;
+        if (dir === 'up') return r.bottom <= rect.top + 1;
+        // Horizontal movement stays in the same visual row. Without this,
+        // pressing Left on a detail control can jump to an unrelated control
+        // several sections above instead of returning to the category rail.
+        const overlapsRow = r.top < rect.bottom && r.bottom > rect.top;
+        if (dir === 'right') return overlapsRow && r.left >= rect.right - 1;
+        return overlapsRow && r.right <= rect.left + 1;
+      });
+
+    // Prefer the nearest element along the requested axis, then the element
+    // whose centre is closest on the perpendicular axis. A weighted score
+    // keeps movement predictable across the settings rail and grouped cards.
     candidates.sort((a, b) => {
-      const rowDist = (c: { r: DOMRect }) =>
-        dir === 'down' ? c.r.top - rect.bottom : rect.top - c.r.bottom;
-      const d = rowDist(a) - rowDist(b);
-      if (Math.abs(d) > 4) return d;
-      const xDist = (c: { r: DOMRect }) => Math.abs(c.r.left + c.r.width / 2 - centerX);
-      return xDist(a) - xDist(b);
+      const score = ({ r }: { r: DOMRect }) => {
+        const horizontal = dir === 'left' || dir === 'right';
+        const primary = horizontal
+          ? dir === 'right'
+            ? r.left - rect.right
+            : rect.left - r.right
+          : dir === 'down'
+            ? r.top - rect.bottom
+            : rect.top - r.bottom;
+        const perpendicular = horizontal
+          ? Math.abs(r.top + r.height / 2 - centerY)
+          : Math.abs(r.left + r.width / 2 - centerX);
+        return primary * 4 + perpendicular;
+      };
+      return score(a) - score(b);
     });
     next = candidates[0]?.el;
   }
@@ -52,7 +73,9 @@ export function moveFocus(
   if (next && next !== active) {
     next.focus();
     next.scrollIntoView({ block: 'nearest', behavior: smooth ? 'smooth' : 'auto' });
+    return true;
   }
+  return false;
 }
 
 /** Activates the focused control the way A/Enter should on a TV: buttons and

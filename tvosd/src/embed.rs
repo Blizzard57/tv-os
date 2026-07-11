@@ -21,6 +21,9 @@ fn cell() -> &'static Mutex<Option<TextEmbedding>> {
 }
 
 fn cache_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return crate::settings::profile_dir().join("models");
+    }
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/tvos/models")
 }
 

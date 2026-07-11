@@ -58,6 +58,10 @@ const STICK_ENTER = 0.5;
 const STICK_RELEASE = 0.3;
 const REPEAT_DELAY_MS = 400;
 const REPEAT_RATE_MS = 130;
+// 30 Hz is more than enough for a 130 ms navigation repeat cadence and avoids
+// forcing the WebKit renderer to wake at display refresh rate just to sample a
+// controller. Polling stops entirely without a connected pad or while hidden.
+const GAMEPAD_POLL_MS = 33;
 
 // Directional actions may auto-repeat (hold-to-scroll); one-shot actions
 // (confirm/back/settings/…) must fire once per physical press, so we drop
@@ -123,7 +127,7 @@ export function useTvInput(onAction: (action: NavAction) => void) {
     let xWasDown = false;
     let yWasDown = false;
     let startWasDown = false;
-    let frame = 0;
+    let pollTimer: number | null = null;
     // Remembered axis direction for deadzone hysteresis (see axisDirection).
     let axisHeld: NavAction | null = null;
 
@@ -135,13 +139,26 @@ export function useTvInput(onAction: (action: NavAction) => void) {
       aWasDown = bWasDown = xWasDown = yWasDown = startWasDown = false;
     };
 
-    const poll = (now: number) => {
-      frame = requestAnimationFrame(poll);
-      const pad = navigator.getGamepads().find((p) => p?.connected);
+    const connectedPad = () => navigator.getGamepads?.().find((p) => p?.connected) ?? null;
+
+    const stopPolling = () => {
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
+      pollTimer = null;
+      resetPadState();
+    };
+
+    const poll = () => {
+      pollTimer = null;
+      if (document.hidden) {
+        resetPadState();
+        return;
+      }
+      const pad = connectedPad();
       if (!pad) {
         resetPadState();
         return;
       }
+      const now = performance.now();
 
       const dpadDir = DPAD.find(([i]) => pad.buttons[i]?.pressed)?.[1] ?? null;
       // The d-pad wins; only fall back to the stick, and reset stick hysteresis
@@ -177,19 +194,38 @@ export function useTvInput(onAction: (action: NavAction) => void) {
       xWasDown = xDown;
       yWasDown = yDown;
       startWasDown = startDown;
+      pollTimer = window.setTimeout(poll, GAMEPAD_POLL_MS);
     };
-    frame = requestAnimationFrame(poll);
 
-    // Nice-to-have: clear stale held state the moment a pad is (un)plugged.
-    const onGamepadChange = () => resetPadState();
-    window.addEventListener('gamepadconnected', onGamepadChange);
-    window.addEventListener('gamepaddisconnected', onGamepadChange);
+    const startPolling = () => {
+      if (pollTimer !== null || document.hidden || !connectedPad()) return;
+      poll();
+    };
+
+    startPolling();
+
+    const onGamepadConnected = () => {
+      resetPadState();
+      startPolling();
+    };
+    const onGamepadDisconnected = () => {
+      stopPolling();
+      startPolling(); // another connected controller may still be available
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) stopPolling();
+      else startPolling();
+    };
+    window.addEventListener('gamepadconnected', onGamepadConnected);
+    window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('gamepadconnected', onGamepadChange);
-      window.removeEventListener('gamepaddisconnected', onGamepadChange);
-      cancelAnimationFrame(frame);
+      window.removeEventListener('gamepadconnected', onGamepadConnected);
+      window.removeEventListener('gamepaddisconnected', onGamepadDisconnected);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      stopPolling();
     };
   }, []);
 }

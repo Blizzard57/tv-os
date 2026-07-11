@@ -137,6 +137,8 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
   useEffect(() => {
     deepToken.current++;
     setDeepRows(null);
+    setDeepBusy(false);
+    setZone((current) => (current === 'deep' ? 'kb' : current));
   }, [query]);
 
   // If the results under our feet disappear, step back to the keyboard.
@@ -154,9 +156,12 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
     searchDeep(q)
       .then((rows) => {
         if (token !== deepToken.current) return; // query changed / newer deep search
-        setDeepRows(rows);
+        // Empty sections cannot hold focus and would produce negative column
+        // indices. They add no useful UI, so keep them out of navigation.
+        const navigableRows = rows.filter((row) => row.items.length > 0);
+        setDeepRows(navigableRows);
         setDSel({ row: 0, col: 0 });
-        setZone(rows.length > 0 ? 'deep' : 'kb');
+        setZone(navigableRows.length > 0 ? 'deep' : 'kb');
       })
       .catch(() => {
         if (token !== deepToken.current) return;
@@ -293,10 +298,12 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
       // zone === 'results' (quick grid)
       switch (action) {
         case 'left':
-          setSel((i) => Math.max(0, i - 1));
+          setSel((i) => (i % COLS === 0 ? i : i - 1));
           break;
         case 'right':
-          setSel((i) => Math.min(results.length - 1, i + 1));
+          setSel((i) =>
+            i % COLS === COLS - 1 || i === results.length - 1 ? i : i + 1,
+          );
           break;
         case 'down':
           setSel((i) => Math.min(results.length - 1, i + COLS));

@@ -22,6 +22,7 @@ use crate::settings::{self, config_dir};
 use crate::{log_error, log_info, recommend};
 
 const SWEEP_SECS: u64 = 15;
+const MAC_SWEEP_SECS: u64 = 60;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a pull of Trakt history is reused before refetching.
 const HISTORY_TTL: Duration = Duration::from_secs(600);
@@ -35,9 +36,14 @@ static HISTORY_CACHE: LazyLock<Mutex<Option<(Instant, Vec<ContentItem>)>>> =
     LazyLock::new(|| Mutex::new(None));
 
 pub fn start_worker() {
-    std::thread::spawn(|| loop {
+    let sweep_secs = if matches!(std::env::var("TVOS_MAC_APP").as_deref(), Ok("1")) {
+        MAC_SWEEP_SECS
+    } else {
+        SWEEP_SECS
+    };
+    std::thread::spawn(move || loop {
         sweep_markers();
-        std::thread::sleep(Duration::from_secs(SWEEP_SECS));
+        std::thread::sleep(Duration::from_secs(sweep_secs));
     });
 }
 

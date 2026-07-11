@@ -151,32 +151,21 @@ type Shared = Arc<App>;
 #[tokio::main]
 async fn main() {
     logging::init();
-    // Warm the embedding model in the background (it downloads once and is slow
-    // to load); until it's ready the recommender uses the content-based fallback.
-    std::thread::spawn(|| {
-        if embed::init() {
-            sources::tmdb::prewarm_recommender();
-            log_info!("embedding recommender ready");
-        }
-    });
-    // Zero-config upscaling (PLAN §5): fetch the Enhance shader files once in
-    // the background so "Enhance" works out of the box, no manual script.
-    std::thread::spawn(|| {
-        if shaders::ensure() {
-            log_info!("upscaler shaders ready");
-        }
-    });
     let app = Arc::new(App {
         sources: sources::Registry::detect(),
         installs: install::InstallManager::default(),
         library_cache: Mutex::new(None),
     });
     // Warm the library cache so the first search/home-load doesn't wait on
-    // store CLIs and catalog fetches.
-    let warm = app.clone();
-    std::thread::spawn(move || {
-        warm.refresh_library();
-    });
+    // store CLIs and catalog fetches. The native Mac UI requests /api/library
+    // immediately after startup, so warming there would duplicate the same
+    // store/network scan and waste CPU and battery.
+    if !matches!(std::env::var("TVOS_MAC_APP").as_deref(), Ok("1")) {
+        let warm = app.clone();
+        std::thread::spawn(move || {
+            warm.refresh_library();
+        });
+    }
     // Sweep player completion markers → Trakt/AniList/MAL scrobbles.
     tracking::start_worker();
 
@@ -271,7 +260,38 @@ async fn main() {
         "tvosd listening on http://{addr} (ui: {})",
         ui_dir.display()
     );
+    start_background_warmups();
     axum::serve(listener, router).await.expect("server error");
+}
+
+fn start_background_warmups() {
+    if !background_warmups_enabled() {
+        log_info!("background model/shader warmups disabled");
+        return;
+    }
+    // Warm the embedding model in the background (it downloads once and is slow
+    // to load); until it's ready the recommender uses the content-based fallback.
+    std::thread::spawn(|| {
+        if embed::init() {
+            sources::tmdb::prewarm_recommender();
+            log_info!("embedding recommender ready");
+        }
+    });
+    // Zero-config upscaling (PLAN §5): fetch the Enhance shader files once in
+    // the background so "Enhance" works out of the box, no manual script.
+    std::thread::spawn(|| {
+        if shaders::ensure() {
+            log_info!("upscaler shaders ready");
+        }
+    });
+}
+
+fn background_warmups_enabled() -> bool {
+    match std::env::var("TVOS_BACKGROUND_WARMUPS").as_deref() {
+        Ok("0") | Ok("false") | Ok("no") => false,
+        Ok("1") | Ok("true") | Ok("yes") => true,
+        _ => !matches!(std::env::var("TVOS_MAC_APP").as_deref(), Ok("1")),
+    }
 }
 
 /// Unwraps a `spawn_blocking` join result, logging the `JoinError` (a panicked

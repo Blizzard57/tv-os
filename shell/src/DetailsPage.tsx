@@ -404,6 +404,10 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
       const navLen = base.length + offset;
       switch (action) {
         case 'down':
+          if (navLen === 0) {
+            if (strips.length > 0) setStrip({ zone: strips[0], idx: 0 });
+            break;
+          }
           // At the bottom of the list, drop into the strips if any exist.
           if (sel >= navLen - 1 && strips.length > 0) {
             setStrip({ zone: strips[0], idx: 0 });

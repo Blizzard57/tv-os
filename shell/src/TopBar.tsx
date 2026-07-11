@@ -100,8 +100,24 @@ export function TopBar({
 function Clock() {
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
-    const t = window.setInterval(() => setNow(new Date()), 15_000);
-    return () => window.clearInterval(t);
+    let timer: number;
+    const schedule = () => {
+      window.clearTimeout(timer);
+      if (document.hidden) return;
+      const current = new Date();
+      setNow(current);
+      timer = window.setTimeout(
+        schedule,
+        60_000 - current.getSeconds() * 1000 - current.getMilliseconds(),
+      );
+    };
+    const onVisibilityChange = () => schedule();
+    schedule();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, []);
   return (
     <div className="top-clock">

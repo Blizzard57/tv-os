@@ -2557,6 +2557,13 @@ select.select-editing {
   background: rgba(30, 36, 47, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.07);
   box-shadow: 0 26px 70px rgba(0, 0, 0, 0.42);
+  transition: border-color 0.16s, box-shadow 0.16s;
+}
+
+.settings-nav-pane:focus-within,
+.settings-detail-pane:focus-within {
+  border-color: rgba(138, 180, 248, 0.42);
+  box-shadow: 0 26px 70px rgba(0, 0, 0, 0.42), 0 0 0 2px rgba(138, 180, 248, 0.1);
 }
 
 .settings-nav-pane {
@@ -2624,7 +2631,7 @@ select.select-editing {
 .settings-nav-item {
   min-height: 72px;
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-columns: 44px minmax(0, 1fr) 18px;
   align-items: center;
   gap: 16px;
   width: 100%;
@@ -2637,9 +2644,33 @@ select.select-editing {
   cursor: pointer;
 }
 
-.settings-nav-item:focus,
-.settings-nav-item:hover,
+.settings-nav-enter {
+  font-size: 28px;
+  line-height: 1;
+  color: #7f8999;
+  transform: translateX(-2px);
+  transition: transform 0.14s, color 0.14s;
+}
+
+.settings-nav-active .settings-nav-enter {
+  color: #d7e7ff;
+  transform: translateX(2px);
+}
+
+.settings-nav-item:focus .settings-nav-enter,
+.settings-nav-item:hover .settings-nav-enter {
+  color: #17202b;
+  transform: translateX(2px);
+}
+
 .settings-nav-active {
+  outline: none;
+  background: rgba(138, 180, 248, 0.18);
+  color: #eef3fb;
+}
+
+.settings-nav-item:focus,
+.settings-nav-item:hover {
   outline: none;
   background: #eef3fb;
   color: #17202b;
@@ -2667,7 +2698,6 @@ select.select-editing {
 .settings-nav-icon-tv::before { content: '▭'; }
 .settings-nav-icon-gear::before { content: '○'; }
 
-.settings-nav-active .settings-nav-icon,
 .settings-nav-item:focus .settings-nav-icon,
 .settings-nav-item:hover .settings-nav-icon {
   background: rgba(23, 32, 43, 0.09);
@@ -2692,7 +2722,6 @@ select.select-editing {
   color: #aeb7c6;
 }
 
-.settings-nav-active .settings-nav-detail,
 .settings-nav-item:focus .settings-nav-detail,
 .settings-nav-item:hover .settings-nav-detail {
   color: rgba(23, 32, 43, 0.72);

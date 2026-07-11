@@ -249,26 +249,22 @@ export default function App() {
         return;
       }
       if (settingsOpen) {
-        if (action === 'back' || action === 'settings') setSettingsOpen(false);
-        else settingsActionRef.current?.(action);
-        return;
-      }
-      if (detailsItem) {
-        detailsActionRef.current?.(action);
+        settingsActionRef.current?.(action);
         return;
       }
 
-      // ---- Global shortcut buttons (gamepad X/Y/Start, keyboard /,s,t,e) ----
+      // These shortcuts are global: they behave the same from home and from a
+      // details page. Opening an overlay above details preserves the details
+      // stack, so closing it returns to exactly where the user was.
       if (action === 'search') return setSearchOpen(true);
       if (action === 'settings') return setSettingsOpen(true);
       if (action === 'theme') return toggleTheme();
       if (action === 'enhance') return cycleEnhance();
 
-      if (error) {
-        if (action === 'confirm') loadLibrary();
+      if (detailsItem) {
+        detailsActionRef.current?.(action);
         return;
       }
-      if (!rows) return;
 
       const f = focusRef.current;
       const list = shelvesRef.current;
@@ -303,13 +299,26 @@ export default function App() {
             }
             break;
           case 'confirm':
-            activateTop(f.col);
+            // Content tabs cannot be entered while the library is unavailable,
+            // but Search, Settings and Theme remain usable from the error page.
+            if (!error || f.col < FIRST_TAB_INDEX || f.col >= FIRST_TAB_INDEX + TABS.length) {
+              activateTop(f.col);
+            }
             break;
           default:
             break;
         }
         return;
       }
+
+      if (error) {
+        if (action === 'confirm') loadLibrary();
+        else if (action === 'up' || action === 'back') {
+          setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
+        }
+        return;
+      }
+      if (!rows) return;
 
       // ---- Rows ----
       const row = list[f.row];
@@ -510,14 +519,23 @@ function useInstallJobs(onFinished: () => void) {
   useEffect(() => {
     let timer: number;
     const tick = () => {
+      if (document.hidden) return;
       refresh();
       const delay = running
         ? 2000
         : Math.min(120_000, 15_000 * Math.max(1, idleStreak.current));
       timer = window.setTimeout(tick, delay);
     };
+    const onVisibilityChange = () => {
+      window.clearTimeout(timer);
+      if (!document.hidden) tick();
+    };
     tick();
-    return () => window.clearTimeout(timer);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [running, refresh]);
 
   return { jobs, refresh };

@@ -9,7 +9,8 @@
 //!   - source resolution: ffprobe for local files, else the file name —
 //!     4K sources skip the upscaling chain
 //!
-//! Shaders live in ~/.local/share/tvos/shaders (TVOS_SHADER_DIR to override);
+//! Shaders live in the TV OS profile dir on macOS and
+//! ~/.local/share/tvos/shaders elsewhere (TVOS_SHADER_DIR to override);
 //! system/get-shaders.sh downloads them. Chains only reference shaders that
 //! are actually on disk, so a missing download degrades to mpv's own
 //! high-quality scalers instead of failing playback.
@@ -223,6 +224,9 @@ fn shader_chain(dir: &Path, mode: EnhanceMode, anime: bool) -> Vec<PathBuf> {
 pub fn shader_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TVOS_SHADER_DIR") {
         return PathBuf::from(dir);
+    }
+    if cfg!(target_os = "macos") {
+        return crate::settings::profile_dir().join("shaders");
     }
     // Honor XDG_DATA_HOME; fall back to an absolute home so shaders never land
     // in a relative path (which would depend on the daemon's cwd) if HOME is

@@ -23,7 +23,7 @@ import {
   removeSourceManifest,
   saveSettings,
 } from './api';
-import { activateFocused, moveFocus, stepSelect } from './focusNav';
+import { activateFocused, focusables, moveFocus, stepSelect } from './focusNav';
 import { NavAction } from './input';
 import { OnScreenKeyboard } from './SearchOverlay';
 import { ACCENT_PRESETS, DEFAULT_ACCENT, Theme, applyAccent } from './theme';
@@ -131,6 +131,8 @@ export function SettingsPanel({
   } | null>(null);
   const oskAction = useRef<((a: NavAction) => void) | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const detailFocusByCategory = useRef<Partial<Record<SettingsCategory, number>>>({});
+  const enterFrame = useRef<number | null>(null);
   // The <select> currently in "edit mode": Enter opens it, Arrows then change
   // its value, Enter again commits. Held in a ref (not state) because the DOM
   // select is owned by a child section — we drive it directly.
@@ -178,23 +180,61 @@ export function SettingsPanel({
     }
   }, []);
 
-  // Close on Escape regardless of which field has focus — unless a select is
-  // being edited, in which case Escape just leaves edit mode.
+  const focusCategory = useCallback((category: SettingsCategory) => {
+    const button = panelRef.current?.querySelector<HTMLElement>(
+      `[data-settings-category="${category}"]`,
+    );
+    button?.focus();
+    button?.scrollIntoView({ block: 'nearest' });
+  }, []);
+
+  const enterDetail = useCallback((category: SettingsCategory) => {
+    setActiveCategory(category);
+    if (enterFrame.current !== null) window.cancelAnimationFrame(enterFrame.current);
+    enterFrame.current = window.requestAnimationFrame(() => {
+      enterFrame.current = null;
+      const detail = panelRef.current?.querySelector<HTMLElement>('.settings-detail-pane');
+      if (!detail) return;
+      const controls = focusables(detail);
+      const remembered = detailFocusByCategory.current[category] ?? 0;
+      const target = controls[Math.min(remembered, Math.max(0, controls.length - 1))];
+      target?.focus();
+      target?.scrollIntoView({ block: 'nearest' });
+    });
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (enterFrame.current !== null) window.cancelAnimationFrame(enterFrame.current);
+    },
+    [],
+  );
+
+  // Escape follows the same hierarchy as controller B: leave select editing,
+  // then return from detail to the category rail, then close Settings.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if (osk) return; // the OSK owns Escape while it's open
         e.stopPropagation();
         if (editingSelect.current) stopEditing();
+        else if ((document.activeElement as HTMLElement | null)?.closest('.settings-detail-pane')) {
+          focusCategory(activeCategory);
+        }
         else onClose();
       }
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, stopEditing, osk]);
+  }, [onClose, stopEditing, osk, activeCategory, focusCategory]);
 
   const handleAction = useCallback(
     (action: NavAction) => {
+      // Start/Menu is a true toggle even when the field keyboard is open.
+      if (action === 'settings') {
+        onClose();
+        return;
+      }
       // The on-screen keyboard takes over all input while open.
       if (osk) {
         oskAction.current?.(action);
@@ -204,6 +244,15 @@ export function SettingsPanel({
       if (!panel) return;
       const active = document.activeElement as HTMLElement | null;
       const editing = editingSelect.current;
+      const categoryButton = active?.closest<HTMLElement>('[data-settings-category]');
+      const detail = active?.closest<HTMLElement>('.settings-detail-pane');
+
+      if (action === 'back') {
+        if (editing) stopEditing();
+        else if (detail) focusCategory(activeCategory);
+        else onClose();
+        return;
+      }
 
       // A select being edited: arrows change the value, confirm commits.
       if (editing && active === editing) {
@@ -214,6 +263,25 @@ export function SettingsPanel({
       }
       if (editing) stopEditing(); // focus moved off somehow — leave edit mode
 
+      // The category rail is a master list, not part of one giant DOM-order
+      // form. Up/Down changes category in place; Right or A opens its detail.
+      if (categoryButton) {
+        const category = categoryButton.dataset.settingsCategory as SettingsCategory;
+        if (action === 'right' || action === 'confirm') {
+          enterDetail(category);
+        } else if (action === 'up' || action === 'down') {
+          const index = SETTINGS_CATEGORIES.findIndex((item) => item.id === category);
+          const nextIndex = Math.min(
+            SETTINGS_CATEGORIES.length - 1,
+            Math.max(0, index + (action === 'down' ? 1 : -1)),
+          );
+          const nextCategory = SETTINGS_CATEGORIES[nextIndex].id;
+          setActiveCategory(nextCategory);
+          focusCategory(nextCategory);
+        }
+        return;
+      }
+
       if (action === 'confirm') {
         if (active?.tagName === 'SELECT') {
           const select = active as HTMLSelectElement;
@@ -222,11 +290,17 @@ export function SettingsPanel({
         } else {
           activateFocused();
         }
+      } else if (detail && action === 'left') {
+        // Left still walks controls in the same visual row (button groups,
+        // accent swatches). At the row edge it returns to the category rail.
+        if (!moveFocus(detail, action)) focusCategory(activeCategory);
+      } else if (detail && (action === 'up' || action === 'down' || action === 'right')) {
+        moveFocus(detail, action);
       } else if (action === 'up' || action === 'down' || action === 'left' || action === 'right') {
         moveFocus(panel, action);
       }
     },
-    [stopEditing, osk],
+    [stopEditing, osk, onClose, activeCategory, enterDetail, focusCategory],
   );
 
   useEffect(() => {
@@ -240,7 +314,14 @@ export function SettingsPanel({
   // In the error branch there are no fields, so make sure the (always-present)
   // Close button gets focus — otherwise a controller user is stranded.
   useEffect(() => {
-    if (loaded || loadError) moveFocus(panelRef.current!, 'down');
+    if (!loaded && !loadError) return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const initial = panel.querySelector<HTMLElement>(
+      '.settings-nav-active, .settings-empty-state button',
+    );
+    initial?.focus();
+    initial?.scrollIntoView({ block: 'nearest' });
   }, [loaded, loadError]);
 
   const refreshAddons = () => fetchAddons().then(setAddons).catch(() => {});
@@ -322,14 +403,18 @@ export function SettingsPanel({
                 {SETTINGS_CATEGORIES.map((cat) => (
                   <button
                     key={cat.id}
+                    data-settings-category={cat.id}
                     className={`settings-nav-item ${activeCategory === cat.id ? 'settings-nav-active' : ''}`}
                     onClick={() => setActiveCategory(cat.id)}
+                    onFocus={() => setActiveCategory(cat.id)}
+                    aria-current={activeCategory === cat.id ? 'page' : undefined}
                   >
                     <span className={`settings-nav-icon settings-nav-icon-${cat.icon}`} aria-hidden />
                     <span>
                       <span className="settings-nav-label">{cat.label}</span>
                       <span className="settings-nav-detail">{cat.detail}</span>
                     </span>
+                    <span className="settings-nav-enter" aria-hidden>›</span>
                   </button>
                 ))}
               </nav>
@@ -339,7 +424,14 @@ export function SettingsPanel({
               </div>
             </aside>
 
-            <main className="settings-detail-pane">
+            <main
+              className="settings-detail-pane"
+              onFocusCapture={(event) => {
+                const controls = focusables(event.currentTarget);
+                const index = controls.indexOf(event.target as HTMLElement);
+                if (index >= 0) detailFocusByCategory.current[activeCategory] = index;
+              }}
+            >
               <div className="settings-detail-head">
                 <span className="settings-kicker">All settings</span>
                 <h2>{activeInfo.label}</h2>

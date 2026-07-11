@@ -5,6 +5,49 @@ Epic, retro), movies and shows (Stremio-compatible stream addons), with
 content-aware AI upscaling and a local recommender — navigated entirely with
 a gamepad or TV remote. See [PLAN.md](PLAN.md) for the full design.
 
+## Install as a native Mac app (Apple Silicon)
+
+On an Apple Silicon Mac, build a real `.app` bundle:
+
+```sh
+./macos/build-arm64-app.sh
+open "dist/mac/TV OS.app"
+```
+
+That produces:
+
+- `dist/mac/TV OS.app` — a native arm64 AppKit/WebKit host that launches the
+  bundled arm64 `tvosd` helper and serves the bundled UI over loopback using
+  macOS's system WebKit view stack (Safari's engine, no Electron runtime).
+- `dist/TV OS-<version>-macos-arm64.zip` — the distributable app archive.
+
+The app stores settings, logs, shaders, resume points and downloaded model data
+under `~/Library/Application Support/TV OS`. Optional playback tools still
+degrade gracefully; for the fullest Mac experience install `mpv`, `ffmpeg` and
+`yt-dlp` with Homebrew, plus `webtorrent-cli` with npm, when you want
+local/stream playback.
+
+To install the Mac playback/runtime tools used for direct streams and torrents:
+
+```sh
+./macos/install-runtime-tools.sh
+```
+
+### Update an existing Mac app
+
+Your library, settings and playback history live outside the app bundle in
+`~/Library/Application Support/TV OS`, so replacing the app does not remove
+them. To update:
+
+1. Quit **TV OS**.
+2. Pull or copy the updated source tree.
+3. Rebuild it with `./macos/build-arm64-app.sh`.
+4. Drag `dist/mac/TV OS.app` into **Applications** and choose **Replace**.
+5. Launch **TV OS** again.
+
+If you run the app directly from this repository instead, step 4 is not
+needed—open the newly rebuilt `dist/mac/TV OS.app`.
+
 ## Install as an app (CachyOS / Arch)
 
 Run it like any normal application — it appears in your app menu and opens in
@@ -130,6 +173,7 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
 | `system/get-player.sh` | Installs the mpv player UI (uosc + thumbfast) |
 | `shell/` | React UI: rows, focus engine, input, theming, downloads panel |
 | `system/` | Session scripts, SDDM/wayland session files, installer |
+| `macos/` | Native Apple Silicon `.app` host and build script |
 
 ## API
 
@@ -219,7 +263,7 @@ progress lines the real one does (see the real CLI's output, or
 ./system/package.sh
 ```
 
-produces `dist/tvos-<version>-<os>-<arch>.tar.gz` — a self-contained app:
+This produces `dist/tvos-<version>-<os>-<arch>.tar.gz` — a self-contained app:
 the release daemon, the built UI, session files, the shader fetcher, the
 sample addon, and two entry points:
 
@@ -231,6 +275,12 @@ sample addon, and two entry points:
 - **`./install.sh`** — installs the prebuilt package properly (no toolchains
   needed on the TV box). Note the binary matches the machine that ran
   `package.sh` — build on the gaming PC, or cross-compile.
+
+For a native Apple Silicon app bundle:
+
+```sh
+./macos/build-arm64-app.sh
+```
 
 ## Install on the gaming PC (Bazzite recommended)
 
