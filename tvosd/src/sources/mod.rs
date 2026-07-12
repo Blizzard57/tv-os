@@ -12,6 +12,7 @@ pub mod gamehub;
 pub mod gamerec;
 pub mod gog;
 pub mod hltb;
+pub mod live;
 pub mod retro;
 pub mod steam;
 pub mod stremio;
@@ -84,6 +85,7 @@ impl Registry {
                 Box::new(stremio::Stremio::default()),
                 Box::new(tmdb::Tmdb::default()),
                 Box::new(youtube::YouTube::detect()),
+                Box::new(live::Live::detect()),
                 Box::new(gamehub::GameShop),
             ],
         }

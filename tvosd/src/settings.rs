@@ -60,6 +60,26 @@ pub struct Settings {
     /// Two-letter country code for game store pricing ("" = US).
     #[serde(default)]
     pub game_region: String,
+    /// Two-letter country code for the Live tab: which region's free-to-air
+    /// sports channels to surface first and which fixtures to prioritise
+    /// ("" = IN, India — the default).
+    #[serde(default)]
+    pub live_region: String,
+    /// Sports the user follows, comma/space separated
+    /// (e.g. "cricket, football, tennis, f1"); empty = show all. Filters and
+    /// orders the Live tab's per-sport rows.
+    #[serde(default)]
+    pub live_sports: String,
+    /// Extra IPTV playlists to fold into the Live tab: M3U/M3U8 URLs,
+    /// comma/newline separated. Each channel becomes a live card. The built-in
+    /// public catalog (iptv-org) is always included on top of these.
+    #[serde(default)]
+    pub iptv_playlists: String,
+    /// XMLTV program-guide (EPG) URLs, comma/newline separated. Used to match
+    /// live sports fixtures to the channel currently carrying them, so a match
+    /// card becomes directly playable. IPTV providers ship one next to their M3U.
+    #[serde(default)]
+    pub epg_urls: String,
     /// Trakt API app credentials (trakt.tv/oauth/applications) + the OAuth
     /// token the device-code flow saves. Watched movies/episodes sync there.
     #[serde(default)]
@@ -145,14 +165,25 @@ const SECRET_FIELD_NAMES: [&str; 6] = [
     "mal_token",
 ];
 
-/// Normalizes a store region to a 2-letter uppercase code, defaulting to "US".
-fn normalize_region(raw: &str) -> String {
+/// Normalizes a 2-letter country code, falling back to `default` for anything
+/// that isn't two ASCII letters.
+fn normalize_country(raw: &str, default: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.len() == 2 && trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
         trimmed.to_ascii_uppercase()
     } else {
-        "US".to_string()
+        default.to_string()
     }
+}
+
+/// Store region for game pricing, defaulting to "US".
+fn normalize_region(raw: &str) -> String {
+    normalize_country(raw, "US")
+}
+
+/// Live-tab region, defaulting to "IN" (India).
+fn normalize_live_region(raw: &str) -> String {
+    normalize_country(raw, "IN")
 }
 
 pub struct SettingsStore {
@@ -192,6 +223,7 @@ impl SettingsStore {
             settings.merge_secrets_from(&current);
         }
         settings.game_region = normalize_region(&settings.game_region);
+        settings.live_region = normalize_live_region(&settings.live_region);
 
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;

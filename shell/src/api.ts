@@ -40,7 +40,7 @@ async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export type Kind = 'game' | 'video' | 'movie' | 'series';
+export type Kind = 'game' | 'video' | 'movie' | 'series' | 'live';
 
 // What pressing A/Enter on the item does — decided by the daemon.
 export type Action = 'play' | 'install' | 'none';
@@ -51,6 +51,8 @@ export interface ContentItem {
   title: string;
   art?: string;
   action: Action;
+  /** Optional subtitle override (e.g. a live fixture's carrier channel). */
+  note?: string;
 }
 
 export interface Row {
@@ -126,6 +128,14 @@ export interface Settings {
   youtube_account: boolean;
   /** Two-letter country code for game store pricing ("" = US). */
   game_region: string;
+  /** Two-letter country code for the Live tab's free-to-air channels ("" = IN). */
+  live_region: string;
+  /** Sports followed on the Live tab, comma/space separated ("" = all). */
+  live_sports: string;
+  /** Extra IPTV playlists (M3U/M3U8 URLs) folded into the Live tab. */
+  iptv_playlists: string;
+  /** XMLTV EPG URLs used to match live fixtures to the channel carrying them. */
+  epg_urls: string;
   /** Trakt API app credentials + saved OAuth token (device flow). */
   trakt_client_id: string;
   trakt_client_secret: string;
@@ -201,6 +211,19 @@ export interface YouTubeStatus {
 export async function fetchYouTubeStatus(): Promise<YouTubeStatus> {
   const res = await apiFetch('/api/youtube/status');
   if (!res.ok) throw new ApiError(`youtube status failed: ${res.status}`, 'http', res.status);
+  return res.json();
+}
+
+export interface LiveStatus {
+  detail: string;
+  programmes?: number;
+  matches?: number;
+}
+
+/** Live-tab state: region, EPG guide load + resolved matches (for the panel). */
+export async function fetchLiveStatus(): Promise<LiveStatus> {
+  const res = await apiFetch('/api/live/status');
+  if (!res.ok) throw new ApiError(`live status failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 

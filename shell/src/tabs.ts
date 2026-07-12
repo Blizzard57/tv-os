@@ -10,7 +10,7 @@
 
 import { ContentItem, Kind, Row } from './api';
 
-export type TabId = 'foryou' | 'movies' | 'shows' | 'library';
+export type TabId = 'foryou' | 'live' | 'movies' | 'shows' | 'library';
 
 export interface TabDef {
   id: TabId;
@@ -19,6 +19,7 @@ export interface TabDef {
 
 export const TABS: TabDef[] = [
   { id: 'foryou', label: 'For you' },
+  { id: 'live', label: 'Live' },
   { id: 'movies', label: 'Movies' },
   { id: 'shows', label: 'Shows' },
   { id: 'library', label: 'Library' },
@@ -31,7 +32,8 @@ const LIBRARY_ROW = /^(continue|ready to|watchlist|my )/i;
 
 // Which item kinds belong under each simple content tab. "Library" is
 // special-cased in rowsForTab.
-const TAB_KINDS: Record<'movies' | 'shows', Kind[]> = {
+const TAB_KINDS: Record<'live' | 'movies' | 'shows', Kind[]> = {
+  live: ['live'],
   movies: ['movie'],
   shows: ['series'],
 };

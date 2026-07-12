@@ -1,8 +1,7 @@
 import { MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ContentItem, Row, searchCatalog, searchDeep } from './api';
+import { activateFocused, moveFocus } from './focusNav';
 import { NavAction } from './input';
-
-const COLS = 6;
 
 // On-screen keyboard layout: four 9-key rows, then a special row. A physical
 // keyboard still types straight into the query; this exists so a controller
@@ -19,10 +18,6 @@ export function mapCol(col: number, fromLen: number, toLen: number): number {
   if (fromLen <= 1) return 0;
   return Math.round((col / (fromLen - 1)) * (toLen - 1));
 }
-
-// Where focus lives: the query line, the on-screen keys, the quick-result
-// grid, or the deep-search sections.
-type Zone = 'input' | 'kb' | 'results' | 'deep';
 
 // Items whose id belongs to a store/local source are things you already have —
 // their badge says what pressing A does (play/install) rather than what it is.
@@ -46,25 +41,18 @@ interface Props {
  *  a broken artwork URL falls back to the titled placeholder, never alt text. */
 function ResultCard({
   item,
-  selected,
-  refCb,
   onPick,
 }: {
   item: ContentItem;
-  selected: boolean;
-  refCb: (el: HTMLDivElement | null) => void;
   onPick: (item: ContentItem) => void;
 }) {
   const [artFailed, setArtFailed] = useState(false);
   const badge = badgeFor(item);
   // Google TV shows results as wide 16:9 cards (art_of now feeds landscape
-  // backdrops), so every search card is landscape.
+  // backdrops), so every search card is landscape. A real tab stop (tabIndex)
+  // so spatial nav (moveFocus) can walk it; the `:focus` state paints it.
   return (
-    <div
-      ref={refCb}
-      className={`search-card ${selected ? 'selected' : ''}`}
-      onClick={() => onPick(item)}
-    >
+    <div className="search-card" tabIndex={0} onClick={() => onPick(item)}>
       <div className="search-art">
         {item.art && !artFailed ? (
           <img
@@ -91,16 +79,12 @@ function ResultCard({
 export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<ContentItem[]>([]);
-  const [sel, setSel] = useState(0);
-  const [zone, setZone] = useState<Zone>('kb');
-  const [kb, setKb] = useState({ row: 0, col: 0 });
   // Deep search: sections replace the keyboard + quick grid until dismissed.
   const [deepRows, setDeepRows] = useState<Row[] | null>(null);
   const [deepBusy, setDeepBusy] = useState(false);
-  const [dSel, setDSel] = useState({ row: 0, col: 0 });
   const inputRef = useRef<HTMLInputElement>(null);
-  const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const deepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  // The whole overlay; spatial nav (moveFocus) walks its focusable controls.
+  const rootRef = useRef<HTMLDivElement>(null);
   // Monotonic request ids so an older in-flight fetch can't clobber newer
   // results (the debounce only clears the timer, not the pending request).
   const quickToken = useRef(0);
@@ -123,7 +107,6 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
         .then((r) => {
           if (token !== quickToken.current) return; // a newer query superseded us
           setResults(r);
-          setSel(0);
         })
         .catch(() => {
           if (token !== quickToken.current) return;
@@ -138,14 +121,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
     deepToken.current++;
     setDeepRows(null);
     setDeepBusy(false);
-    setZone((current) => (current === 'deep' ? 'kb' : current));
   }, [query]);
-
-  // If the results under our feet disappear, step back to the keyboard.
-  useEffect(() => {
-    if (zone === 'results' && results.length === 0) setZone('kb');
-    setSel((i) => Math.min(i, Math.max(0, results.length - 1)));
-  }, [results, zone]);
 
   const runDeep = useCallback(() => {
     const q = query.trim();
@@ -156,17 +132,13 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
     searchDeep(q)
       .then((rows) => {
         if (token !== deepToken.current) return; // query changed / newer deep search
-        // Empty sections cannot hold focus and would produce negative column
-        // indices. They add no useful UI, so keep them out of navigation.
+        // Empty sections cannot hold focus, so keep them out of the UI entirely.
         const navigableRows = rows.filter((row) => row.items.length > 0);
         setDeepRows(navigableRows);
-        setDSel({ row: 0, col: 0 });
-        setZone(navigableRows.length > 0 ? 'deep' : 'kb');
       })
       .catch(() => {
         if (token !== deepToken.current) return;
         setDeepRows([]);
-        setZone('kb');
       })
       .finally(() => {
         if (token === deepToken.current) setDeepBusy(false);
@@ -175,7 +147,6 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
 
   const exitDeep = useCallback(() => {
     setDeepRows(null);
-    setZone('kb');
   }, []);
 
   const pressKey = useCallback(
@@ -193,151 +164,58 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
     [runDeep],
   );
 
-  // One handler for every input device. The window key listener and the
-  // gamepad (via actionRef) both funnel into this.
-  const handle = useCallback(
+  // Spatial nav: directions walk the overlay's real controls by geometry, A
+  // activates the focused one, B peels a layer. Assigned to `actionRef` for the
+  // gamepad and called from the capture keydown listener for keyboard/CEC.
+  const navHandle = useCallback(
     (action: NavAction) => {
-      // Back peels one layer: deep sections → quick view → closed.
+      if (deepBusy) return; // nothing focusable behind the spinner
       if (action === 'back') {
         if (deepRows) exitDeep();
         else onClose();
         return;
       }
-
-      if (zone === 'deep' && deepRows) {
-        const row = deepRows[dSel.row];
-        switch (action) {
-          case 'left':
-            setDSel((s) => ({ ...s, col: Math.max(0, s.col - 1) }));
-            break;
-          case 'right':
-            setDSel((s) => ({
-              ...s,
-              col: Math.min((row?.items.length ?? 1) - 1, s.col + 1),
-            }));
-            break;
-          case 'up':
-            if (dSel.row === 0) {
-              setZone('input');
-              inputRef.current?.focus();
-            } else {
-              setDSel((s) => {
-                const r = s.row - 1;
-                return { row: r, col: Math.min(s.col, deepRows[r].items.length - 1) };
-              });
-            }
-            break;
-          case 'down':
-            setDSel((s) => {
-              const r = Math.min(deepRows.length - 1, s.row + 1);
-              return { row: r, col: Math.min(s.col, deepRows[r].items.length - 1) };
-            });
-            break;
-          case 'confirm': {
-            const item = row?.items[dSel.col];
-            if (item) onPick(item);
-            break;
+      if (action === 'confirm') {
+        // Enter on the query line runs the deep search; anywhere else it
+        // activates the focused key or result card.
+        if (document.activeElement === inputRef.current) runDeep();
+        else activateFocused();
+        return;
+      }
+      if (action === 'up' || action === 'down' || action === 'left' || action === 'right') {
+        // The query line spans the full width, so geometry alone would send
+        // Down to whichever key sits under its centre (a right-ish letter).
+        // Anchor Down from the query line to the first control below it instead.
+        if (action === 'down' && document.activeElement === inputRef.current) {
+          const first = rootRef.current?.querySelector<HTMLElement>('.osk-key, .search-card');
+          if (first) {
+            first.focus();
+            return;
           }
-          default:
-            break;
         }
-        return;
-      }
-
-      if (zone === 'input') {
-        if (action === 'down') {
-          inputRef.current?.blur();
-          setZone(deepRows && deepRows.length > 0 ? 'deep' : 'kb');
-        } else if (action === 'confirm') {
-          // Enter on the query line = search the entire space.
-          runDeep();
-        }
-        return;
-      }
-
-      if (zone === 'kb') {
-        const rowLen = kb.row === SPECIAL_ROW ? SPECIALS.length : KB_ROWS[kb.row].length;
-        switch (action) {
-          case 'left':
-            setKb((k) => ({ ...k, col: Math.max(0, k.col - 1) }));
-            break;
-          case 'right':
-            setKb((k) => ({ ...k, col: Math.min(rowLen - 1, k.col + 1) }));
-            break;
-          case 'up':
-            if (kb.row === 0) {
-              setZone('input');
-              inputRef.current?.focus();
-            } else if (kb.row === SPECIAL_ROW) {
-              setKb((k) => ({ row: SPECIAL_ROW - 1, col: mapCol(k.col, SPECIALS.length, KB_ROWS[SPECIAL_ROW - 1].length) }));
-            } else {
-              setKb((k) => ({ ...k, row: k.row - 1 }));
-            }
-            break;
-          case 'down':
-            if (kb.row === SPECIAL_ROW) {
-              if (results.length > 0) setZone('results');
-            } else if (kb.row === SPECIAL_ROW - 1) {
-              setKb((k) => ({
-                row: SPECIAL_ROW,
-                col: mapCol(k.col, KB_ROWS[SPECIAL_ROW - 1].length, SPECIALS.length),
-              }));
-            } else {
-              setKb((k) => ({ ...k, row: k.row + 1 }));
-            }
-            break;
-          case 'confirm':
-            pressKey(kb.row, kb.col);
-            break;
-          default:
-            break;
-        }
-        return;
-      }
-
-      // zone === 'results' (quick grid)
-      switch (action) {
-        case 'left':
-          setSel((i) => (i % COLS === 0 ? i : i - 1));
-          break;
-        case 'right':
-          setSel((i) =>
-            i % COLS === COLS - 1 || i === results.length - 1 ? i : i + 1,
-          );
-          break;
-        case 'down':
-          setSel((i) => Math.min(results.length - 1, i + COLS));
-          break;
-        case 'up':
-          if (sel < COLS) setZone('kb');
-          else setSel((i) => i - COLS);
-          break;
-        case 'confirm': {
-          const item = results[sel];
-          if (item) onPick(item);
-          break;
-        }
-        default:
-          break;
+        if (rootRef.current) moveFocus(rootRef.current, action);
       }
     },
-    [zone, kb, results, sel, deepRows, dSel, onPick, onClose, pressKey, runDeep, exitDeep],
+    [deepBusy, deepRows, exitDeep, onClose, runDeep],
   );
 
   // Gamepad path: App forwards d-pad / A / B here while the overlay is open.
   useEffect(() => {
-    actionRef.current = handle;
+    actionRef.current = navHandle;
     return () => {
-      actionRef.current = null;
+      if (actionRef.current === navHandle) actionRef.current = null;
     };
-  }, [actionRef, handle]);
+  }, [actionRef, navHandle]);
 
-  // Physical keyboard path (capture phase so the home grid never moves).
+  // Physical keyboard path (capture phase so the home grid never moves and
+  // typing lands here first). Letters/Backspace edit the query from anywhere —
+  // a keyboard user never has to return to the input line — while arrows/Enter
+  // drive the same spatial nav as the controller.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
-        handle('back');
+        navHandle('back');
         return;
       }
       const inInput = document.activeElement === inputRef.current;
@@ -354,11 +232,9 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
         if (inInput && (action === 'left' || action === 'right')) return;
         e.stopPropagation();
         e.preventDefault();
-        handle(action);
+        navHandle(action);
         return;
       }
-      // Typing while focus is on the keys/results still edits the query, so a
-      // keyboard user never has to navigate back up to the input line.
       if (!inInput) {
         if (e.key === 'Backspace') {
           e.stopPropagation();
@@ -373,43 +249,35 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [handle]);
+  }, [navHandle]);
 
+  // Re-anchor focus when deep sections appear or clear: land on the first
+  // result so ◀▶ browses immediately; drop back to the query line when a
+  // search finds nothing, or is dismissed (deepRows → null), so the user can
+  // refine it rather than losing focus to nowhere.
   useEffect(() => {
-    if (zone === 'results') cardRefs.current[sel]?.scrollIntoView({ block: 'nearest' });
-  }, [sel, zone]);
+    const firstCard =
+      deepRows && deepRows.length > 0
+        ? rootRef.current?.querySelector<HTMLElement>('.search-card')
+        : null;
+    (firstCard ?? inputRef.current)?.focus();
+  }, [deepRows]);
 
-  useEffect(() => {
-    if (zone === 'deep') {
-      deepRefs.current
-        .get(`${dSel.row}:${dSel.col}`)
-        ?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
-    }
-  }, [dSel, zone]);
-
-  const keyFocused = (row: number, col: number) =>
-    zone === 'kb' && kb.row === row && kb.col === col;
-
-  const renderCard = (
-    item: ContentItem,
-    selected: boolean,
-    refCb: (el: HTMLDivElement | null) => void,
-  ) => (
-    <ResultCard key={item.id} item={item} selected={selected} refCb={refCb} onPick={onPick} />
+  const renderCard = (item: ContentItem) => (
+    <ResultCard key={item.id} item={item} onPick={onPick} />
   );
 
   const deepView = deepRows !== null;
 
   return (
     <div className="search-scrim" onClick={onClose}>
-      <div className="search" onClick={(e) => e.stopPropagation()}>
+      <div className="search" ref={rootRef} onClick={(e) => e.stopPropagation()}>
         <input
           ref={inputRef}
           className="search-input"
           value={query}
           placeholder="Search anything — a title, an actor, “k drama”, “time travel”…"
           onChange={(e) => setQuery(e.target.value)}
-          onFocus={() => setZone('input')}
         />
 
         {deepBusy && (
@@ -431,23 +299,13 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
               </div>
             )}
             {deepRows.map((row, r) => (
-              <section
-                key={`${r}:${row.title}`}
-                className={`search-section ${
-                  zone === 'deep' && r === dSel.row ? 'section-active' : ''
-                }`}
-              >
+              <section key={`${r}:${row.title}`} className="search-section">
                 <h2 className="search-section-head">
                   {row.title}
                   <span className="search-section-count">{row.items.length}</span>
                 </h2>
                 <div className="search-section-strip">
-                  {row.items.map((item, c) =>
-                    renderCard(item, zone === 'deep' && r === dSel.row && c === dSel.col, (el) => {
-                      if (el) deepRefs.current.set(`${r}:${c}`, el);
-                      else deepRefs.current.delete(`${r}:${c}`);
-                    }),
-                  )}
+                  {row.items.map((item) => renderCard(item))}
                 </div>
               </section>
             ))}
@@ -462,12 +320,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
                 {KB_ROWS.map((row, r) => (
                   <div key={row} className="osk-row">
                     {row.split('').map((ch, c) => (
-                      <button
-                        key={ch}
-                        className={`osk-key ${keyFocused(r, c) ? 'focused' : ''}`}
-                        tabIndex={-1}
-                        onClick={() => pressKey(r, c)}
-                      >
+                      <button key={ch} className="osk-key" onClick={() => pressKey(r, c)}>
                         {ch}
                       </button>
                     ))}
@@ -477,10 +330,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
                   {SPECIALS.map((label, c) => (
                     <button
                       key={label}
-                      className={`osk-key osk-key-wide ${
-                        c === SEARCH_ALL_KEY ? 'osk-key-accent' : ''
-                      } ${keyFocused(SPECIAL_ROW, c) ? 'focused' : ''}`}
-                      tabIndex={-1}
+                      className={`osk-key osk-key-wide ${c === SEARCH_ALL_KEY ? 'osk-key-accent' : ''}`}
                       onClick={() => pressKey(SPECIAL_ROW, c)}
                     >
                       {label}
@@ -511,11 +361,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
             </div>
 
             <div className="search-grid">
-              {results.map((item, i) =>
-                renderCard(item, zone === 'results' && i === sel, (el) => {
-                  cardRefs.current[i] = el;
-                }),
-              )}
+              {results.map((item) => renderCard(item))}
               {query.trim().length >= 2 && results.length === 0 && (
                 <div className="details-hint">No title matches — press Enter to search deeper.</div>
               )}

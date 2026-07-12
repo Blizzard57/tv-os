@@ -2,9 +2,8 @@
 --
 -- mpv (built with sdl2-gamepad) emits GAMEPAD_* keys when input-gamepad=yes,
 -- which tvosd sets in mpv.conf. We translate them into the ordinary keyboard
--- keys that the OSC, the upscaler menu, and input.conf already handle, so a
--- controller behaves exactly like the remote. Every press also flashes the
--- ModernZ control bar (it's otherwise mouse-driven, which a TV has no use for).
+-- keys that the TV overlay, the upscaler menu, and input.conf already handle,
+-- so a controller behaves exactly like the remote.
 --
 -- Edit the layout here (tvosd/player/scripts/controller.lua).
 
@@ -35,7 +34,6 @@ local layout = {
 
 for button, key in pairs(layout) do
   mp.add_forced_key_binding(button, 'tvos-gp-' .. button, function()
-    mp.commandv('script-message-to', 'modernz', 'osc-show')
     mp.commandv('keypress', key)
   end, { repeatable = true })
 end

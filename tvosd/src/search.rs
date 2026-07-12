@@ -601,7 +601,8 @@ mod tests {
             title: "Dune".into(),
             art: None,
             action: crate::model::Action::Play,
-        };
+            note: None,
+                };
         let mut b = a.clone();
         b.id = "strm:movie:tt1160419".into();
         assert!(d.insert(&a));

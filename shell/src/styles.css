@@ -10,7 +10,7 @@
   /* Roboto everywhere — the Android/Google-TV system typeface. Applied on the
      universal selector (not just body) so no UA-styled element (buttons,
      inputs, headings) can fall back to a platform sans. */
-  font-family: 'Roboto', 'Roboto Flex', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family: 'Google Sans Text', 'Google Sans', 'Roboto', 'Roboto Flex', system-ui, -apple-system, 'Segoe UI', sans-serif;
 }
 
 button,
@@ -48,8 +48,8 @@ textarea {
   --overscan: 36px;
   --safe-top: env(safe-area-inset-top, var(--overscan));
   --safe-bottom: env(safe-area-inset-bottom, var(--overscan));
-  --edge: max(56px, env(safe-area-inset-left, 56px));
-  --topbar-h: 88px;
+  --edge: max(72px, env(safe-area-inset-left, 72px));
+  --topbar-h: 104px;
 
   /* ---- 10-foot size scale ----
      Google TV shows content as wide 16:9 cards, ~4 across with generous
@@ -57,13 +57,13 @@ textarea {
      reads the same on a 1080p panel and a dev laptop, and everything derives
      from them so the whole shell resizes in one place. (Grid ~= the Android TV
      spec: 48–58dp side margins, 20dp gutter, doubled for 1080p.) */
-  --card-w: clamp(300px, 21vw, 404px);
-  --card-gap: clamp(18px, 1.7vw, 32px);
-  --shelf-gap: clamp(14px, 2.4vh, 36px);
+  --card-w: clamp(340px, 23.5vw, 456px);
+  --card-gap: clamp(22px, 1.9vw, 38px);
+  --shelf-gap: clamp(18px, 2.8vh, 44px);
   /* Vertical breathing room baked into each strip so the focus ring + scale
      never clip against the row above/below. Must exceed the upward growth of a
      scaled card plus the ring width. */
-  --strip-pad: 26px;
+  --strip-pad: 32px;
   /* Google-TV card focus is a gentle lift, not a big zoom. */
   --card-lift: 1.05;
 }
@@ -97,7 +97,7 @@ body {
   background: var(--bg);
   color: var(--text);
   /* Roboto — the Android/Google-TV system typeface. */
-  font-family: 'Roboto', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family: 'Google Sans Text', 'Google Sans', 'Roboto', system-ui, -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   overflow: hidden;
@@ -151,7 +151,7 @@ body {
   z-index: 40;
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 22px;
   height: calc(var(--topbar-h) + var(--safe-top));
   padding: var(--safe-top) var(--edge) 0;
   background: linear-gradient(to bottom, rgba(0, 0, 0, 0.78) 0%, rgba(0, 0, 0, 0.32) 55%, transparent 100%);
@@ -165,13 +165,13 @@ body {
 .top-avatar {
   display: grid;
   place-items: center;
-  width: 44px;
-  height: 44px;
+  width: 50px;
+  height: 50px;
   flex: 0 0 auto;
   border-radius: 50%;
   background: linear-gradient(135deg, var(--accent), #c86bff);
   color: #fff;
-  font-size: 20px;
+  font-size: 22px;
   font-weight: 600;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
 }
@@ -179,8 +179,8 @@ body {
 .top-icon {
   display: grid;
   place-items: center;
-  width: 48px;
-  height: 48px;
+  width: 54px;
+  height: 54px;
   border: none;
   border-radius: 50%;
   background: transparent;
@@ -190,7 +190,7 @@ body {
 }
 
 .top-icon-glyph {
-  font-size: 24px;
+  font-size: 27px;
   line-height: 1;
 }
 
@@ -199,13 +199,13 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  height: 48px;
-  padding: 0 24px 0 20px;
+  height: 54px;
+  padding: 0 28px 0 22px;
   border: none;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.1);
   color: var(--text);
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 500;
   cursor: pointer;
   transition: background 0.14s, color 0.14s, transform 0.14s;
@@ -216,7 +216,7 @@ body {
 }
 
 .top-search-glyph {
-  font-size: 22px;
+  font-size: 25px;
   line-height: 1;
 }
 
@@ -238,12 +238,12 @@ body {
 
 .top-tab {
   position: relative;
-  padding: 10px 22px;
+  padding: 12px 26px;
   border: none;
   border-radius: 999px;
   background: transparent;
   color: var(--text-dim);
-  font-size: 19px;
+  font-size: 21px;
   font-weight: 500;
   cursor: pointer;
   transition: color 0.14s, background 0.14s, transform 0.14s;
@@ -264,12 +264,16 @@ body {
   opacity: 0.5;
 }
 
-/* Focus on any top-bar control: the bright white Google-TV focus pill. */
-.top-focused {
+/* Focus on any top-bar control: the bright white Google-TV focus pill. Real
+   DOM focus (spatial nav) drives it. */
+.top-pill:focus,
+.top-tab:focus,
+.top-icon:focus {
   background: #fff;
   color: #0d0e13;
   transform: translateY(-1px);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  outline: none;
 }
 
 .top-right {
@@ -293,7 +297,7 @@ body {
   position: relative;
   flex-shrink: 0;
   height: 56vh;
-  min-height: 420px;
+  min-height: 500px;
   overflow: hidden;
 }
 
@@ -337,13 +341,20 @@ body {
 .hero-content {
   position: absolute;
   left: var(--edge);
-  bottom: 40px;
-  max-width: min(720px, 48%);
-  padding-top: calc(var(--topbar-h) + var(--safe-top));
+  /* Bounded below the top bar and above the shelves, with the block bottom-
+     anchored. Previously a bottom-only anchor plus padding-top grew the box
+     *upward*, sliding the kind chip under the top bar — the padding made the
+     clip worse, not better. */
+  top: calc(var(--topbar-h) + var(--safe-top));
+  bottom: 54px;
+  max-width: min(820px, 50%);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
 }
 
 .hero-kind {
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 700;
   letter-spacing: 0.18em;
   color: var(--accent);
@@ -351,8 +362,8 @@ body {
 }
 
 .hero-logo {
-  max-width: min(520px, 100%);
-  max-height: 176px;
+  max-width: min(640px, 100%);
+  max-height: 220px;
   object-fit: contain;
   object-position: left bottom;
   filter: drop-shadow(0 4px 18px rgba(0, 0, 0, 0.5));
@@ -360,21 +371,21 @@ body {
 }
 
 .hero-title {
-  font-size: clamp(40px, 5vw, 68px);
+  font-size: clamp(48px, 5.8vw, 84px);
   line-height: 1.02;
   text-shadow: var(--title-shadow);
 }
 
 .hero-sub {
-  margin-top: 14px;
-  font-size: 18px;
+  margin-top: 16px;
+  font-size: 21px;
   color: var(--text-dim);
   font-weight: 500;
 }
 
 .hero-desc {
-  margin-top: 14px;
-  font-size: 19px;
+  margin-top: 16px;
+  font-size: 22px;
   line-height: 1.5;
   color: var(--text);
   opacity: 0.92;
@@ -385,8 +396,8 @@ body {
 }
 
 .hero-hint {
-  margin-top: 18px;
-  font-size: 15px;
+  margin-top: 20px;
+  font-size: 17px;
   color: var(--text-dim);
 }
 
@@ -397,7 +408,7 @@ body {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 6px 0 calc(var(--safe-bottom) + 32px);
+  padding: 10px 0 calc(var(--safe-bottom) + 40px);
   scrollbar-width: none;
 }
 
@@ -412,14 +423,14 @@ body {
 }
 
 .shelf-title {
-  margin: 0 var(--edge) 2px;
-  font-size: 24px;
+  margin: 0 var(--edge) 4px;
+  font-size: 28px;
   font-weight: 500;
   color: var(--text-dim);
   transition: color 0.15s;
 }
 
-.shelf-active .shelf-title {
+.shelf:focus-within .shelf-title {
   color: var(--text);
 }
 
@@ -478,6 +489,19 @@ body {
   display: block;
 }
 
+/* Live channel tiles: the logo is centered and CONTAINED on a tinted tile
+   (Google-TV live style), never cropped to fill. */
+.card-art--logo {
+  object-fit: contain;
+  padding: 15%;
+  box-sizing: border-box;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.5));
+}
+.card-thumb--logo {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06),
+    0 8px 22px rgba(0, 0, 0, 0.4);
+}
+
 .card-placeholder {
   width: 100%;
   height: 100%;
@@ -485,7 +509,7 @@ body {
   place-items: center;
   padding: 12px 16px;
   text-align: center;
-  font-size: 17px;
+  font-size: 20px;
   font-weight: 500;
   line-height: 1.25;
   color: var(--text);
@@ -494,7 +518,7 @@ body {
 
 /* The label sits below the thumbnail (Standard card), dim until focused. */
 .card-label {
-  padding: 10px 2px 0;
+  padding: 12px 2px 0;
 }
 
 .card-title {
@@ -502,7 +526,7 @@ body {
   -webkit-line-clamp: 1;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  font-size: 18px;
+  font-size: 21px;
   font-weight: 500;
   line-height: 1.25;
   color: var(--text-dim);
@@ -510,22 +534,23 @@ body {
 }
 
 .card-subtitle {
-  margin-top: 2px;
-  font-size: 14px;
+  margin-top: 3px;
+  font-size: 16px;
   color: var(--text-dim);
   opacity: 0.75;
 }
 
-.card-focused {
+.card:focus {
   transform: scale(var(--card-lift));
   z-index: 2;
+  outline: none;
 }
 
-.card-focused .card-thumb {
+.card:focus .card-thumb {
   box-shadow: var(--card-focus);
 }
 
-.card-focused .card-title {
+.card:focus .card-title {
   color: var(--text);
 }
 
@@ -558,6 +583,27 @@ body {
 .card-badge-buy {
   background: #16a34a;
   color: #fff;
+}
+
+/* Live broadcasts wear a red LIVE badge with a pulsing dot, Google-TV style. */
+.badge-live {
+  background: #e5342a;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.badge-live::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #fff;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 .card-progress {
@@ -782,20 +828,30 @@ textarea:focus-visible {
   position: relative;
   z-index: 2;
   min-height: 100vh;
-  padding: calc(var(--safe-top) + 112px) var(--edge) calc(var(--safe-bottom) + 96px);
+  display: grid;
+  grid-template-columns: minmax(0, min(940px, 58vw)) minmax(220px, clamp(240px, 17vw, 330px));
+  column-gap: clamp(44px, 6vw, 112px);
+  align-items: start;
+  padding: calc(var(--safe-top) + 128px) var(--edge) calc(var(--safe-bottom) + 150px);
   max-width: 1760px;
   margin: 0 auto;
 }
 
 .details-head {
-  width: min(840px, 55vw);
-  min-height: clamp(360px, 50vh, 560px);
+  grid-column: 1;
+  width: 100%;
+  min-height: clamp(360px, 48vh, 560px);
   display: flex;
   align-items: flex-end;
-  padding-bottom: 28px;
+  padding-bottom: 22px;
 }
 
 @media (max-width: 1180px) {
+  .details-body {
+    display: block;
+    padding-bottom: calc(var(--safe-bottom) + 132px);
+  }
+
   .details-head {
     width: min(100%, 780px);
   }
@@ -813,22 +869,22 @@ textarea:focus-visible {
   background: rgba(255, 255, 255, 0.12);
   border: 1px solid rgba(255, 255, 255, 0.14);
   color: rgba(255, 255, 255, 0.84);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.12em;
   backdrop-filter: blur(10px);
 }
 
 .details-title {
-  font-size: clamp(46px, 5.4vw, 78px);
+  font-size: clamp(48px, 5.4vw, 84px);
   line-height: 1.02;
   text-shadow: var(--title-shadow);
 }
 
 .details-title-logo {
   display: block;
-  max-width: min(620px, 100%);
-  max-height: clamp(112px, 17vh, 210px);
+  max-width: min(700px, 100%);
+  max-height: clamp(118px, 18vh, 226px);
   object-fit: contain;
   object-position: left bottom;
   filter: drop-shadow(0 6px 26px rgba(0, 0, 0, 0.58));
@@ -845,9 +901,9 @@ textarea:focus-visible {
 .details-chip {
   display: inline-flex;
   align-items: center;
-  min-height: 26px;
+  min-height: 30px;
   color: rgba(244, 245, 250, 0.82);
-  font-size: 17px;
+  font-size: 20px;
   font-weight: 500;
 }
 
@@ -858,6 +914,20 @@ textarea:focus-visible {
   margin-right: 14px;
   border-radius: 50%;
   background: rgba(244, 245, 250, 0.46);
+}
+
+[data-theme='light'] .details-kind {
+  background: rgba(23, 27, 35, 0.08);
+  border-color: rgba(23, 27, 35, 0.12);
+  color: rgba(23, 27, 35, 0.66);
+}
+
+[data-theme='light'] .details-chip {
+  color: rgba(23, 27, 35, 0.68);
+}
+
+[data-theme='light'] .details-chip + .details-chip::before {
+  background: rgba(23, 27, 35, 0.34);
 }
 
 .chip-rating::before,
@@ -877,7 +947,7 @@ textarea:focus-visible {
   display: flex;
   flex-wrap: wrap;
   gap: 16px;
-  font-size: 15px;
+  font-size: 17px;
 }
 
 .game-stat {
@@ -889,6 +959,11 @@ textarea:focus-visible {
   background: rgba(255, 255, 255, 0.1);
   font-weight: 600;
   backdrop-filter: blur(10px);
+}
+
+[data-theme='light'] .game-stat {
+  background: rgba(255, 255, 255, 0.46);
+  color: #171b23;
 }
 
 .game-stat-label,
@@ -912,17 +987,17 @@ textarea:focus-visible {
   border-radius: 999px;
   background: var(--surface-2);
   border: 1px solid var(--overlay-border);
-  font-size: 13px;
+  font-size: 15px;
   color: var(--text-dim);
 }
 
 .details-desc {
   margin-top: 20px;
-  font-size: clamp(18px, 1.45vw, 23px);
+  font-size: clamp(19px, 1.45vw, 24px);
   line-height: 1.43;
   color: var(--text);
   opacity: 0.88;
-  max-width: 820px;
+  max-width: 920px;
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
@@ -931,12 +1006,20 @@ textarea:focus-visible {
 
 /* ---- Google-TV detail affordances ---- */
 
+/* Details controls are real focus targets (spatial nav), but the highlight is
+   drawn by the `.selected` class — so suppress the browser's own focus ring,
+   which otherwise stamps a hard rectangle (white on dark, black on light)
+   around every focused control, including the round pref buttons and rows. */
+.details :focus {
+  outline: none;
+}
+
 .details-quick-actions {
-  margin-top: 30px;
+  margin-top: 28px;
   display: flex;
   align-items: flex-start;
   flex-wrap: wrap;
-  gap: clamp(22px, 2.8vw, 44px);
+  gap: clamp(16px, 2vw, 32px);
 }
 
 .details-round-action {
@@ -944,36 +1027,54 @@ textarea:focus-visible {
   background: transparent;
   display: grid;
   justify-items: center;
-  gap: 9px;
-  min-width: 80px;
+  gap: 11px;
+  min-width: 86px;
   color: rgba(244, 245, 250, 0.72);
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
   cursor: pointer;
   transition: color 0.12s, transform 0.12s;
 }
 
+[data-theme='light'] .details-round-action {
+  color: rgba(23, 27, 35, 0.66);
+}
+
 .round-action-icon {
   display: grid;
   place-items: center;
-  width: 54px;
-  height: 54px;
+  width: 60px;
+  height: 60px;
   border: 1.5px solid rgba(244, 245, 250, 0.72);
   border-radius: 50%;
   color: #fff;
-  font-size: 25px;
+  font-size: 30px;
   line-height: 1;
   transition: background 0.12s, border-color 0.12s, color 0.12s, box-shadow 0.12s;
+}
+
+[data-theme='light'] .round-action-icon {
+  background: rgba(255, 255, 255, 0.26);
+  border-color: rgba(23, 27, 35, 0.28);
+  color: #171b23;
 }
 
 .details-round-action.active {
   color: #fff;
 }
 
+[data-theme='light'] .details-round-action.active {
+  color: #171b23;
+}
+
 .details-round-action.active .round-action-icon {
   background: rgba(138, 180, 248, 0.26);
   border-color: #8ab4f8;
   color: #fff;
+}
+
+[data-theme='light'] .details-round-action.active .round-action-icon {
+  color: #171b23;
 }
 
 .details-round-action.selected {
@@ -989,11 +1090,14 @@ textarea:focus-visible {
 }
 
 .details-box-panel {
-  position: absolute;
-  top: calc(var(--safe-top) + 140px);
-  right: var(--edge);
-  width: clamp(170px, 14vw, 260px);
-  z-index: 1;
+  grid-column: 2;
+  grid-row: 1 / span 5;
+  position: sticky;
+  top: calc(var(--safe-top) + 132px);
+  width: 100%;
+  align-self: start;
+  margin-top: 22px;
+  z-index: 2;
 }
 
 .details-box-art {
@@ -1014,6 +1118,20 @@ textarea:focus-visible {
   }
 }
 
+.details-actions,
+.resume-btn,
+.episodes,
+.streams,
+.details-facts {
+  grid-column: 1;
+  min-width: 0;
+}
+
+.shots {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
 /* ---- Facts panels below the primary action ---- */
 
 .details-facts {
@@ -1031,6 +1149,11 @@ textarea:focus-visible {
   border-radius: 12px;
   background: rgba(13, 14, 19, 0.42);
   backdrop-filter: blur(12px);
+}
+
+[data-theme='light'] .details-fact-panel {
+  background: rgba(255, 255, 255, 0.54);
+  border-color: rgba(23, 27, 35, 0.08);
 }
 
 .details-facts-head {
@@ -1073,7 +1196,7 @@ textarea:focus-visible {
 
 /* Action / list rows on the details page share the pill look. */
 .details-actions {
-  margin-top: 8px;
+  margin-top: 14px;
   position: relative;
   z-index: 2;
 }
@@ -1091,13 +1214,13 @@ textarea:focus-visible {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 240px;
-  min-height: 64px;
-  padding: 14px 42px;
+  min-width: 284px;
+  min-height: 76px;
+  padding: 17px 50px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.18);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  font-size: 18px;
+  font-size: 21px;
   font-weight: 700;
   color: var(--text);
   backdrop-filter: blur(14px);
@@ -1114,15 +1237,15 @@ textarea:focus-visible {
 .resume-btn {
   display: inline-flex;
   align-items: center;
-  gap: 14px;
-  margin-top: 8px;
-  min-width: 300px;
-  min-height: 68px;
-  padding: 10px 30px 10px 12px;
+  gap: 16px;
+  margin-top: 12px;
+  min-width: 360px;
+  min-height: 80px;
+  padding: 12px 36px 12px 14px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.18);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  font-size: 17px;
+  font-size: 20px;
   font-weight: 600;
   color: var(--text);
   backdrop-filter: blur(14px);
@@ -1131,8 +1254,8 @@ textarea:focus-visible {
 .resume-play {
   display: grid;
   place-items: center;
-  width: 46px;
-  height: 46px;
+  width: 54px;
+  height: 54px;
   border-radius: 50%;
   background: var(--accent);
   color: var(--on-accent);
@@ -1150,9 +1273,9 @@ textarea:focus-visible {
 }
 
 .resume-detail {
-  margin-top: 2px;
+  margin-top: 3px;
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
 }
 
@@ -1163,7 +1286,7 @@ textarea:focus-visible {
 /* ---- Episodes ---- */
 
 .episodes {
-  margin-top: 22px;
+  margin-top: 30px;
   position: relative;
   z-index: 2;
 }
@@ -1172,16 +1295,18 @@ textarea:focus-visible {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 16px;
+  gap: 12px;
+  margin-bottom: 20px;
 }
 
 .season-tab {
-  padding: 8px 18px;
+  padding: 11px 24px;
   border-radius: 999px;
+  border: 1px solid transparent;
   background: rgba(255, 255, 255, 0.12);
-  font-size: 15px;
+  font-size: 18px;
   color: rgba(244, 245, 250, 0.74);
+  cursor: pointer;
   backdrop-filter: blur(12px);
 }
 
@@ -1191,9 +1316,15 @@ textarea:focus-visible {
   font-weight: 500;
 }
 
+/* Focus highlight: a bright ring so the focused season reads even when it is
+   also the active one (white-on-white). */
+.season-tab.selected {
+  box-shadow: 0 0 0 3px var(--bg), 0 0 0 6px #ffffff;
+}
+
 .details-hint,
 .search-hint {
-  font-size: 14px;
+  font-size: 16px;
   color: var(--text-dim);
 }
 
@@ -1201,8 +1332,8 @@ textarea:focus-visible {
 .stream-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  max-width: 1040px;
+  gap: 12px;
+  max-width: 1160px;
   /* Keep long lists compact: cap the height and scroll inside instead of
      stretching the page down forever. Selection scrollIntoView keeps the
      focused row visible. */
@@ -1211,8 +1342,8 @@ textarea:focus-visible {
   scrollbar-width: thin;
   scrollbar-color: var(--overlay-border) transparent;
   /* Room so the focused row's lift + ring isn't clipped by the scroll box. */
-  padding: 6px 4px;
-  margin-left: -4px;
+  padding: 8px 6px;
+  margin-left: -6px;
 }
 
 .ep-list::-webkit-scrollbar,
@@ -1228,9 +1359,9 @@ textarea:focus-visible {
 
 .ep-item {
   display: flex;
-  gap: 18px;
-  padding: 15px 18px;
-  border-radius: 12px;
+  gap: 22px;
+  padding: 20px 22px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid transparent;
   backdrop-filter: blur(12px);
@@ -1247,7 +1378,7 @@ textarea:focus-visible {
 
 .ep-num {
   flex: 0 0 auto;
-  font-size: 15px;
+  font-size: 18px;
   font-weight: 700;
   color: var(--accent);
   padding-top: 2px;
@@ -1264,13 +1395,13 @@ textarea:focus-visible {
 }
 
 .ep-title {
-  font-size: 17px;
+  font-size: 20px;
   font-weight: 600;
 }
 
 .ep-overview {
-  margin-top: 4px;
-  font-size: 14px;
+  margin-top: 6px;
+  font-size: 16px;
   color: var(--text-dim);
   line-height: 1.45;
   display: -webkit-box;
@@ -1282,25 +1413,29 @@ textarea:focus-visible {
 /* ---- Streams / sources ---- */
 
 .streams {
-  margin-top: 22px;
+  margin-top: 30px;
   position: relative;
   z-index: 2;
 }
 
 .streams-head {
-  font-size: 18px;
+  font-size: 21px;
   font-weight: 600;
   letter-spacing: 0;
   color: rgba(244, 245, 250, 0.86);
   margin-bottom: 14px;
 }
 
+[data-theme='light'] .streams-head {
+  color: rgba(23, 27, 35, 0.78);
+}
+
 .stream-item {
   display: flex;
-  gap: 16px;
+  gap: 18px;
   align-items: center;
-  padding: 15px 18px;
-  border-radius: 12px;
+  padding: 20px 22px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid transparent;
   backdrop-filter: blur(12px);
@@ -1308,9 +1443,9 @@ textarea:focus-visible {
 
 .stream-badge {
   flex: 0 0 auto;
-  padding: 4px 10px;
+  padding: 5px 12px;
   border-radius: 6px;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.05em;
   color: #fff;
@@ -1337,7 +1472,7 @@ textarea:focus-visible {
 }
 
 .stream-name {
-  font-size: 16px;
+  font-size: 19px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1345,8 +1480,8 @@ textarea:focus-visible {
 }
 
 .stream-detail {
-  margin-top: 3px;
-  font-size: 13px;
+  margin-top: 4px;
+  font-size: 15px;
   color: var(--text-dim);
 }
 
@@ -1360,23 +1495,31 @@ textarea:focus-visible {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 14px;
-  max-width: 1040px;
+  gap: 18px;
+  max-width: 100%;
 }
 
 .best-source {
+  flex: 1 1 min(650px, 100%);
   display: flex;
   align-items: center;
-  gap: 16px;
-  min-width: min(520px, 100%);
-  min-height: 68px;
-  padding: 10px 30px 10px 12px;
+  gap: 18px;
+  min-width: 0;
+  max-width: min(820px, 100%);
+  min-height: 80px;
+  padding: 12px 36px 12px 14px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.18);
   border: 1px solid rgba(255, 255, 255, 0.12);
   cursor: pointer;
   transition: background 0.12s, box-shadow 0.12s, transform 0.12s;
   backdrop-filter: blur(14px);
+}
+
+[data-theme='light'] .best-source {
+  background: rgba(255, 255, 255, 0.58);
+  border-color: rgba(23, 27, 35, 0.08);
+  color: #171b23;
 }
 
 .best-source.selected {
@@ -1391,12 +1534,12 @@ textarea:focus-visible {
   flex: 0 0 auto;
   display: grid;
   place-items: center;
-  width: 46px;
-  height: 46px;
+  width: 54px;
+  height: 54px;
   border-radius: 999px;
   background: var(--accent);
   color: var(--on-accent);
-  font-size: 20px;
+  font-size: 23px;
   padding-left: 3px;
 }
 
@@ -1407,6 +1550,7 @@ textarea:focus-visible {
 
 .best-text {
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .best-line {
@@ -1417,18 +1561,26 @@ textarea:focus-visible {
 }
 
 .best-label {
-  font-size: 20px;
+  font-size: 23px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .source-chip {
-  padding: 3px 9px;
+  padding: 4px 10px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.11);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text);
+  white-space: nowrap;
+}
+
+[data-theme='light'] .source-chip {
+  background: rgba(23, 27, 35, 0.07);
+  border-color: rgba(23, 27, 35, 0.08);
+  color: #171b23;
 }
 
 .best-source.selected .source-chip {
@@ -1438,13 +1590,13 @@ textarea:focus-visible {
 }
 
 .best-detail {
-  margin-top: 6px;
-  font-size: 13px;
+  margin-top: 7px;
+  font-size: 15px;
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 760px;
+  max-width: 100%;
 }
 
 .best-source.selected .best-detail {
@@ -1452,16 +1604,24 @@ textarea:focus-visible {
 }
 
 .source-toggle {
-  padding: 14px 24px;
+  flex: 0 1 auto;
+  padding: 18px 30px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.14);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  font-size: 15px;
+  font-size: 17px;
   font-weight: 600;
   color: rgba(244, 245, 250, 0.82);
   cursor: pointer;
   transition: background 0.12s, box-shadow 0.12s, color 0.12s;
   backdrop-filter: blur(14px);
+  white-space: nowrap;
+}
+
+[data-theme='light'] .source-toggle {
+  background: rgba(255, 255, 255, 0.48);
+  border-color: rgba(23, 27, 35, 0.08);
+  color: rgba(23, 27, 35, 0.72);
 }
 
 .source-toggle.selected {
@@ -1629,17 +1789,24 @@ textarea:focus-visible {
 
 .details-legend {
   position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  right: var(--edge);
+  bottom: calc(var(--safe-bottom) + 14px);
   z-index: 3;
   display: flex;
   gap: 26px;
   justify-content: center;
-  padding: 14px var(--edge) calc(var(--safe-bottom) + 12px);
-  background: linear-gradient(to top, var(--bg), transparent);
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: rgba(13, 14, 19, 0.58);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(16px);
   font-size: 14px;
   color: var(--text-dim);
+}
+
+[data-theme='light'] .details-legend {
+  background: rgba(255, 255, 255, 0.62);
+  border-color: rgba(23, 27, 35, 0.08);
 }
 
 .search-section-count {
@@ -1829,11 +1996,15 @@ textarea:focus-visible {
   font-size: 15px;
 }
 
-.osk-key.focused {
+/* `.focused` is the class the OnScreenKeyboard drives by index; `:focus` is the
+   search keyboard, which moves real DOM focus (spatial nav). Both look the same. */
+.osk-key.focused,
+.osk-key:focus {
   background: var(--accent);
   color: var(--on-accent);
   box-shadow: 0 0 0 2px var(--accent), 0 8px 20px var(--accent-glow);
   transform: translateY(-1px);
+  outline: none;
 }
 
 .osk-key-accent {
@@ -1870,7 +2041,8 @@ textarea:focus-visible {
   margin-bottom: 14px;
 }
 
-.search-section.section-active .search-section-head {
+.search-section.section-active .search-section-head,
+.search-section:focus-within .search-section-head {
   color: var(--text);
 }
 
@@ -1915,12 +2087,15 @@ textarea:focus-visible {
   object-fit: cover;
 }
 
-.search-card.selected {
+.search-card.selected,
+.search-card:focus {
   transform: scale(1.08);
   z-index: 2;
+  outline: none;
 }
 
-.search-card.selected .search-art {
+.search-card.selected .search-art,
+.search-card:focus .search-art {
   box-shadow: var(--focus-ring);
 }
 
@@ -1934,7 +2109,8 @@ textarea:focus-visible {
   overflow: hidden;
 }
 
-.search-card.selected .search-card-title {
+.search-card.selected .search-card-title,
+.search-card:focus .search-card-title {
   color: var(--text);
 }
 
@@ -2134,6 +2310,37 @@ textarea:focus-visible {
   border-radius: 10px;
   background: transparent;
   transition: background 0.12s, color 0.12s, box-shadow 0.12s, transform 0.12s;
+}
+
+/* Sport multi-select chips (Live settings). */
+.settings-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+  max-width: 62%;
+}
+.settings-chip {
+  padding: 9px 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, transform 0.12s;
+}
+.settings-chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.settings-chip:focus {
+  outline: none;
+  transform: scale(1.06);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
 }
 
 .settings-field-label {
@@ -2506,9 +2713,7 @@ select.select-editing {
 /* ---- Google TV-style Settings refresh ---- */
 .settings-scrim {
   background:
-    linear-gradient(90deg, rgba(4, 7, 12, 0.94), rgba(7, 10, 16, 0.82)),
-    radial-gradient(circle at 84% 12%, rgba(138, 180, 248, 0.22), transparent 32%),
-    radial-gradient(circle at 18% 92%, rgba(80, 185, 144, 0.15), transparent 28%),
+    linear-gradient(90deg, rgba(4, 7, 12, 0.96), rgba(7, 10, 16, 0.88)),
     #0b0f16;
   display: block;
 }
@@ -2519,14 +2724,14 @@ select.select-editing {
   padding: 0;
   overflow: hidden;
   color: #eef3fb;
-  font-family: 'Roboto', system-ui, sans-serif;
+  font-family: 'Google Sans Text', 'Google Sans', 'Roboto', system-ui, sans-serif;
 }
 
 .settings-tv-page {
   height: 100%;
   display: grid;
-  grid-template-columns: clamp(320px, 30vw, 430px) minmax(0, 1fr);
-  gap: clamp(22px, 3vw, 44px);
+  grid-template-columns: clamp(370px, 31vw, 500px) minmax(0, 1fr);
+  gap: clamp(28px, 3.4vw, 56px);
   padding:
     calc(var(--safe-top) + clamp(34px, 5vh, 70px))
     max(var(--edge), clamp(54px, 7vw, 116px))
@@ -2553,6 +2758,7 @@ select.select-editing {
 .settings-nav-pane,
 .settings-detail-pane {
   min-height: 0;
+  min-width: 0;
   border-radius: 28px;
   background: rgba(30, 36, 47, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.07);
@@ -2569,7 +2775,7 @@ select.select-editing {
 .settings-nav-pane {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
-  padding: 22px 18px 18px;
+  padding: 28px 22px 22px;
 }
 
 .settings-brand {
@@ -2578,6 +2784,12 @@ select.select-editing {
   justify-content: space-between;
   gap: 16px;
   padding: 4px 4px 18px;
+}
+
+.settings-brand > div,
+.settings-detail-head,
+.settings-section {
+  min-width: 0;
 }
 
 .settings-kicker {
@@ -2590,19 +2802,19 @@ select.select-editing {
 
 .settings-brand h1,
 .settings-detail-head h2 {
-  font-size: clamp(34px, 4vw, 48px);
+  font-size: clamp(40px, 4.5vw, 58px);
   line-height: 1;
   font-weight: 400;
 }
 
 .settings-gear-button {
-  width: 46px;
-  height: 46px;
+  width: 54px;
+  height: 54px;
   border-radius: 50%;
   border: 0;
   background: rgba(255, 255, 255, 0.08);
   color: #edf2fb;
-  font-size: 30px;
+  font-size: 34px;
   line-height: 1;
   cursor: pointer;
 }
@@ -2617,7 +2829,7 @@ select.select-editing {
 .settings-nav-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   overflow-y: auto;
   padding-right: 4px;
   scrollbar-width: none;
@@ -2629,15 +2841,16 @@ select.select-editing {
 }
 
 .settings-nav-item {
-  min-height: 72px;
+  min-height: 86px;
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 18px;
+  grid-template-columns: 52px minmax(0, 1fr) 24px;
   align-items: center;
   gap: 16px;
   width: 100%;
-  padding: 12px 16px;
+  min-width: 0;
+  padding: 15px 18px;
   border: 0;
-  border-radius: 16px;
+  border-radius: 18px;
   background: transparent;
   color: #eef3fb;
   text-align: left;
@@ -2678,8 +2891,8 @@ select.select-editing {
 }
 
 .settings-nav-icon {
-  width: 40px;
-  height: 40px;
+  width: 48px;
+  height: 48px;
   border-radius: 50%;
   display: grid;
   place-items: center;
@@ -2688,7 +2901,7 @@ select.select-editing {
 }
 
 .settings-nav-icon::before {
-  font-size: 19px;
+  font-size: 22px;
   font-weight: 500;
 }
 
@@ -2712,13 +2925,13 @@ select.select-editing {
 }
 
 .settings-nav-label {
-  font-size: 16px;
+  font-size: 19px;
   font-weight: 500;
 }
 
 .settings-nav-detail {
-  margin-top: 5px;
-  font-size: 13px;
+  margin-top: 6px;
+  font-size: 15px;
   color: #aeb7c6;
 }
 
@@ -2732,14 +2945,14 @@ select.select-editing {
   justify-content: space-between;
   gap: 12px;
   padding: 16px 8px 2px;
-  font-size: 13px;
+  font-size: 15px;
   color: #aeb7c6;
 }
 
 .settings-detail-pane {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  padding: clamp(28px, 4vw, 46px);
+  padding: clamp(34px, 4.4vw, 58px);
 }
 
 .settings-detail-head {
@@ -2760,7 +2973,7 @@ select.select-editing {
 .settings-section {
   position: relative;
   margin: 0;
-  padding: 18px 0 26px;
+  padding: 24px 0 34px;
   border-top: 1px solid rgba(255, 255, 255, 0.07);
 }
 
@@ -2775,7 +2988,7 @@ select.select-editing {
 
 .settings-section h2 {
   min-height: 0;
-  font-size: 25px;
+  font-size: 30px;
   line-height: 1.2;
   font-weight: 400;
   margin-bottom: 8px;
@@ -2784,7 +2997,7 @@ select.select-editing {
 .settings-muted {
   max-width: 920px;
   color: #b3bcc9;
-  font-size: 15px;
+  font-size: 17px;
   line-height: 1.5;
   margin-bottom: 16px;
 }
@@ -2851,13 +3064,21 @@ select.select-editing {
 }
 
 .settings-field {
-  min-height: 68px;
-  padding: 12px 16px;
-  margin-top: 6px;
+  display: grid;
+  grid-template-columns: minmax(180px, 0.42fr) minmax(260px, 0.58fr);
+  align-items: center;
+  gap: 20px;
+  min-height: 80px;
+  padding: 15px 18px;
+  margin-top: 8px;
+  min-width: 0;
 }
 
 .settings-field-label {
-  font-size: 16px;
+  font-size: 18px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .settings input[type='text'],
@@ -2865,18 +3086,63 @@ select.select-editing {
 .settings select,
 .settings-textarea,
 .locked-value {
+  width: 100%;
+  min-width: 0;
   border-radius: 14px;
   background: rgba(10, 14, 21, 0.7);
 }
 
+.settings-field:has(.settings-textarea) {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+
+.settings-field .locked-row,
+.locked-row {
+  min-width: 0;
+  width: 100%;
+}
+
+.settings-field .settings-check {
+  justify-self: end;
+}
+
 .settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
   margin-top: 16px;
+}
+
+.settings-status {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+
+.lib-row,
+.addon-item,
+.manifest-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.addon-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .settings .btn {
   border: 0;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.1);
+  min-height: 52px;
+  padding-inline: 28px;
+  font-size: 17px;
 }
 
 .settings .btn-primary {
@@ -2907,14 +3173,30 @@ select.select-editing {
 }
 
 .manifest-source {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
   min-height: 54px;
   padding: 10px 16px;
+  min-width: 0;
+}
+
+.manifest-source-toggle {
+  min-width: 0;
 }
 
 .manifest-source-name {
-  max-width: min(46vw, 520px);
+  display: inline-block;
+  max-width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manifest-source-meta {
+  justify-self: end;
   white-space: nowrap;
 }
 
@@ -2951,6 +3233,23 @@ select.select-editing {
 
   .source-overview-grid {
     grid-template-columns: 1fr;
+  }
+
+  .settings-field,
+  .lib-row,
+  .addon-item,
+  .manifest-head,
+  .manifest-source {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-field .settings-check,
+  .manifest-source-meta {
+    justify-self: start;
+  }
+
+  .addon-buttons {
+    justify-content: flex-start;
   }
 }
 

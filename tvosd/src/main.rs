@@ -206,6 +206,7 @@ async fn main() {
         .route("/api/search/deep", get(get_search_deep))
         .route("/api/similar", get(get_similar))
         .route("/api/youtube/status", get(get_youtube_status))
+        .route("/api/live/status", get(get_live_status))
         .route("/api/game", get(get_game))
         .route("/api/tracking/status", get(get_tracking_status))
         .route("/api/trakt/connect", post(post_trakt_connect))
@@ -365,6 +366,7 @@ fn is_personal_row(title: &str) -> bool {
 /// runs on a blocking thread instead of stalling the async executor.
 /// Personalized rows (Continue / Recommended) come first.
 async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
+    tracking::sync_local_play_markers();
     // "Continue" comes from the in-memory event log (instant).
     let mut rows = recommend::LOG.rows();
     rows.extend(recommend::LOG.preference_rows());
@@ -424,11 +426,18 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             // are dropped — the home is recommendation-only.
             let mut owned_games: Vec<model::ContentItem> = Vec::new();
             let mut personal: Vec<model::Row> = Vec::new();
+            // Live rows (the Live tab) are kept whole, like games — the tab is a
+            // client-side filter over this feed, so the data must reach it.
+            let mut live_rows: Vec<model::Row> = Vec::new();
             for mut row in library {
                 let all_games =
                     !row.items.is_empty() && row.items.iter().all(|i| i.kind == model::Kind::Game);
+                let all_live =
+                    !row.items.is_empty() && row.items.iter().all(|i| i.kind == model::Kind::Live);
                 if all_games {
                     owned_games.append(&mut row.items);
+                } else if all_live {
+                    live_rows.push(row);
                 } else if is_personal_row(&row.title) {
                     personal.push(row);
                 }
@@ -467,6 +476,9 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             // Taste-biased, lightly random item order per row — fresh finds
             // mixed with the familiar on every visit.
             sources::tmdb::personalize(&mut r, &recent);
+            // Live rows last, in their curated order (Live now → sports → what's
+            // coming up), untouched by the taste shuffle above.
+            r.extend(live_rows);
             if !disliked.is_empty() {
                 for row in &mut r {
                     row.items.retain(|i| !disliked.contains(&i.id));
@@ -477,11 +489,13 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
         })
         .await,
     ));
-    // No blank movie/show cards: drop catalog items without artwork. Games are
-    // kept regardless (you want to see your whole library, art or not).
+    // No blank movie/show cards: drop catalog items without artwork. Games and
+    // live channels are kept regardless — a logo-less IPTV channel still plays,
+    // and you want your whole library and every live stream visible, art or not.
     for row in &mut rows {
         row.items.retain(|i| {
-            i.kind == model::Kind::Game || i.art.as_deref().is_some_and(|a| !a.is_empty())
+            matches!(i.kind, model::Kind::Game | model::Kind::Live)
+                || i.art.as_deref().is_some_and(|a| !a.is_empty())
         });
     }
     rows.retain(|row| !row.items.is_empty());
@@ -520,7 +534,8 @@ async fn post_preference(
             title: req.item.title,
             art: req.item.art,
             action: req.item.action.unwrap_or(model::Action::Play),
-        },
+            note: None,
+                },
         action,
     );
     Ok(Json(status))
@@ -716,7 +731,8 @@ async fn post_launch(
                 title,
                 art: req.art,
                 action: model::Action::Play,
-            });
+                note: None,
+                        });
         }
     }
     result
@@ -791,6 +807,14 @@ fn meta_for(id: &str, title: Option<&str>) -> media::Meta {
             kind: "video".to_string(),
             ..Default::default()
         }),
+        // Live streams/fixtures: a light stub (title from the library) — never a
+        // Steam game lookup like the fallback below would do.
+        "live" => media::Meta {
+            id: id.to_string(),
+            kind: "video".to_string(),
+            title: title.unwrap_or_default().to_string(),
+            ..Default::default()
+        },
         // Unowned games (GameHub): the Steam storefront has rich metadata.
         "gshop" => {
             sources::steam::store_meta(id.trim_start_matches("gshop:")).unwrap_or(media::Meta {
@@ -977,6 +1001,17 @@ async fn get_youtube_status() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "connected": connected, "detail": detail }))
 }
 
+async fn get_live_status() -> Json<serde_json::Value> {
+    Json(
+        tokio::task::spawn_blocking(sources::live::status)
+            .await
+            .unwrap_or_else(|e| {
+                log_error!("live status task failed: {e}");
+                serde_json::json!({ "detail": "status check failed" })
+            }),
+    )
+}
+
 /// "More like this" for a details page item. Video items resolve through
 /// TMDB recommendations (addon items map IMDb → TMDB first); other kinds
 /// (games) have no similar-content source yet and return empty.
@@ -1076,9 +1111,28 @@ async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCo
     }
     let stream = req.stream;
     let item_id = req.item.as_ref().map(|i| i.id.clone());
+    let display_title = req.item.as_ref().map(|i| i.title.clone());
     let track_id = req.track_id.clone();
+    if let (Some(item), Some(content_id)) = (req.item.as_ref(), item_id.as_deref()) {
+        tracking::remember_local_play(
+            content_id,
+            &model::ContentItem {
+                id: item.id.clone(),
+                kind: item.kind,
+                title: item.title.clone(),
+                art: item.art.clone(),
+                action: model::Action::Play,
+                note: None,
+                        },
+        );
+    }
     let result = tokio::task::spawn_blocking(move || {
-        let first = sources::stremio::play_stream(&stream, item_id.as_deref(), track_id.as_deref());
+        let first = sources::stremio::play_stream(
+            &stream,
+            item_id.as_deref(),
+            track_id.as_deref(),
+            display_title.as_deref(),
+        );
         if first.is_ok() || stream.kind == media::StreamKind::External {
             return first;
         }
@@ -1093,7 +1147,7 @@ async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCo
             item_id,
             util::scrub_secrets(first.as_ref().err().unwrap())
         );
-        sources::stremio::play_meta(&kind, &sid, Some(item_id)).or(first)
+        sources::stremio::play_meta(&kind, &sid, Some(item_id), display_title.as_deref()).or(first)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1108,7 +1162,8 @@ async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCo
                 title: item.title,
                 art: item.art,
                 action: model::Action::Play,
-            });
+                note: None,
+                        });
         }
     }
     result

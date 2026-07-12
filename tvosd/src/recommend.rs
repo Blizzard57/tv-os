@@ -547,7 +547,8 @@ mod tests {
                 title: id.to_string(),
                 art: None,
                 action: Action::Play,
-            },
+                note: None,
+                        },
         }
     }
 

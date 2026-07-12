@@ -2,24 +2,11 @@ import { useEffect, useState } from 'react';
 import { Theme } from './theme';
 import { TABS, TabId } from './tabs';
 
-// Top-bar focus order: [search, ...tabs, settings, theme]. App drives focus
-// with a single index into this order; these helpers keep App and TopBar in
-// agreement about what each index means. The profile avatar on the far left is
-// decorative chrome (like Google TV's account chip) and takes no focus.
-export const SEARCH_INDEX = 0;
-export const FIRST_TAB_INDEX = 1;
-export const SETTINGS_INDEX = FIRST_TAB_INDEX + TABS.length;
-export const THEME_INDEX = SETTINGS_INDEX + 1;
-export const TOPBAR_COUNT = THEME_INDEX + 1;
-
-/** The topbar index that selects a given tab (so B/Home can land on it). */
-export const tabIndex = (id: TabId): number =>
-  FIRST_TAB_INDEX + TABS.findIndex((t) => t.id === id);
+// The profile avatar on the far left is decorative chrome (like Google TV's
+// account chip) and takes no focus. Every other control is a real focus target.
 
 interface Props {
   activeTab: TabId;
-  /** Focused topbar index, or null when focus is down in the rows. */
-  focusIndex: number | null;
   theme: Theme;
   /** Tabs that currently have content — others render dimmed. */
   enabled: Set<TabId>;
@@ -27,23 +14,28 @@ interface Props {
   onSelectTab: (id: TabId) => void;
   onSettings: () => void;
   onToggleTheme: () => void;
+  /** Focus reached a tab (arrowing across the bar switches to it live). */
+  onFocusTab: (id: TabId, el: HTMLElement) => void;
+  /** Focus reached the search pill or a right-side icon. */
+  onFocusChrome: (el: HTMLElement) => void;
 }
 
 /** The Google-TV top navigation: a profile chip, a Search pill, the content
- *  tabs, then the clock, settings and a theme toggle. Purely presentational —
- *  App owns focus and routing; clicks call the same handlers a controller's
- *  confirm would. */
+ *  tabs, then the clock, settings and a theme toggle. Controls are real focus
+ *  targets (spatial nav walks them by geometry); App is told which one gained
+ *  focus so it can preview the tab and remember the spot. The `:focus` state
+ *  paints the highlight. */
 export function TopBar({
   activeTab,
-  focusIndex,
   theme,
   enabled,
   onSearch,
   onSelectTab,
   onSettings,
   onToggleTheme,
+  onFocusTab,
+  onFocusChrome,
 }: Props) {
-  const f = (i: number) => (focusIndex === i ? 'top-focused' : '');
   return (
     <header className="topbar">
       <div className="top-avatar" aria-hidden="true">
@@ -51,8 +43,9 @@ export function TopBar({
       </div>
 
       <button
-        className={`top-pill top-search ${f(SEARCH_INDEX)}`}
+        className="top-pill top-search"
         onClick={onSearch}
+        onFocus={(e) => onFocusChrome(e.currentTarget)}
         aria-label="Search"
       >
         <span className="top-search-glyph">⌕</span>
@@ -60,14 +53,15 @@ export function TopBar({
       </button>
 
       <nav className="top-tabs">
-        {TABS.map((t, i) => {
-          const idx = FIRST_TAB_INDEX + i;
+        {TABS.map((t) => {
           const dim = !enabled.has(t.id) && t.id !== activeTab;
           return (
             <button
               key={t.id}
-              className={`top-tab ${t.id === activeTab ? 'top-tab-active' : ''} ${dim ? 'top-tab-dim' : ''} ${f(idx)}`}
+              data-tab={t.id}
+              className={`top-tab ${t.id === activeTab ? 'top-tab-active' : ''} ${dim ? 'top-tab-dim' : ''}`}
               onClick={() => onSelectTab(t.id)}
+              onFocus={(e) => onFocusTab(t.id, e.currentTarget)}
             >
               {t.label}
             </button>
@@ -78,15 +72,17 @@ export function TopBar({
       <div className="top-right">
         <Clock />
         <button
-          className={`top-icon ${f(SETTINGS_INDEX)}`}
+          className="top-icon"
           onClick={onSettings}
+          onFocus={(e) => onFocusChrome(e.currentTarget)}
           aria-label="Settings"
         >
           <span className="top-icon-glyph">⚙</span>
         </button>
         <button
-          className={`top-icon ${f(THEME_INDEX)}`}
+          className="top-icon"
           onClick={onToggleTheme}
+          onFocus={(e) => onFocusChrome(e.currentTarget)}
           aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
         >
           <span className="top-icon-glyph">{theme === 'dark' ? '◐' : '◑'}</span>

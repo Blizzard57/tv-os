@@ -108,13 +108,16 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
   - **Videos** — files in `~/Videos` plus built-in sample streams, played
     fullscreen in mpv through the Enhance pipeline (below).
 - **Player** — video plays in mpv dressed up as a real 10-foot player:
-  `system/get-player.sh` installs **uosc** (a modern, Stremio-like on-screen
-  UI — seek bar, subtitle/audio/chapter menus, settings) and **thumbfast**
-  (hover/seek thumbnail previews). It's driven by a private `MPV_HOME` that
-  tvosd writes a fresh `mpv.conf` into on every play (good streaming cache,
-  subtitle defaults, and the resolved Enhance shaders), so the same player +
-  upscaler apply to direct streams *and* torrents. Without uosc, mpv's
-  built-in OSC is used, so there's always a seek bar.
+  tvosd draws its own **Google-TV-style overlay** (`tvos_player.lua` — a
+  D-pad-first UI with a title block, bottom scrim, accent seek bar, a centered
+  transport, and full subtitle/audio/speed/Enhance sheets) and bundles
+  **thumbfast** (seek thumbnail previews), provisioning them into a private
+  `MPV_HOME` on first launch (`system/get-player.sh` does the same for the
+  portable demo). tvosd writes a fresh `mpv.conf` into that home on every play
+  (good streaming cache, subtitle defaults, Roboto to match the shell, and the
+  resolved Enhance shaders), so the same player + upscaler apply to direct
+  streams *and* torrents. mpv's built-in OSC stays off — the overlay is the
+  sole UI.
 - **Enhance — content-aware upscaling** (phase 4): every video launch goes
   through a resolver that picks the best mpv chain from the user's mode
   (**Auto / Quality / Performance / Off**, cycled with X / E, shown in the
@@ -170,7 +173,7 @@ gracefully — no mpv yet means video won't play, but the rest of the UI runs.
 | `system/package.sh` | Builds the self-contained distributable package |
 | `tvosd/src/settings.rs` | Persisted user settings (single store shared across the daemon) |
 | `system/get-shaders.sh` | Fetches Anime4K v4 + FSRCNNX shader packs |
-| `system/get-player.sh` | Installs the mpv player UI (uosc + thumbfast) |
+| `system/get-player.sh` | Installs the mpv player UI (tvos_player overlay + thumbfast) |
 | `shell/` | React UI: rows, focus engine, input, theming, downloads panel |
 | `system/` | Session scripts, SDDM/wayland session files, installer |
 | `macos/` | Native Apple Silicon `.app` host and build script |
@@ -323,6 +326,16 @@ install. Four sections:
 - **Movies & TV (TMDB)** — paste a free TMDB API key to fill the Trending
   Movies and Shows rows. Playing one maps the title to its IMDb id and resolves
   a stream through your installed addons.
+- **Live** — a dedicated tab of what's broadcasting *right now*, grouped by
+  sport (Cricket, Football, Tennis, Formula 1, …). It probes curated official
+  **YouTube-live** channels (shown only while actually live) and folds in
+  **free-to-air** sports/news channels from the built-in public catalog
+  (iptv-org), filtered to your **region** (default India, set in Settings). Add
+  your own **IPTV playlists** (M3U/M3U8) to include a provider you subscribe to.
+  A built-in **schedule** (TheSportsDB) fills each sport row with what's **live
+  now** and **coming up** — "IND vs AUS · Starts in 2h" — even when no stream is
+  held for it. Live streams play in the same upscaled mpv player, which shows a
+  **● LIVE** marker in place of the seek bar.
 - **Stremio addons** — paste any addon's `manifest.json` URL to install it,
   see what's installed, and remove with one click.
 - **Appearance & playback** — theme and Enhance (upscaling) mode.

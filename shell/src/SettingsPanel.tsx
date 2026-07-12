@@ -11,6 +11,7 @@ import {
   fetchSettings,
   fetchSourceManifests,
   fetchSources,
+  fetchLiveStatus,
   fetchSteamStatus,
   fetchTrackingStatus,
   fetchVersion,
@@ -52,6 +53,10 @@ const BLANK: Settings = {
   youtube_channels: '',
   youtube_account: false,
   game_region: '',
+  live_region: '',
+  live_sports: '',
+  iptv_playlists: '',
+  epg_urls: '',
   trakt_client_id: '',
   trakt_client_secret: '',
   trakt_token: '',
@@ -64,6 +69,13 @@ const BLANK: Settings = {
 const GAME_REGIONS = [
   'US', 'CA', 'GB', 'DE', 'FR', 'ES', 'IT', 'NL', 'SE', 'PL',
   'BR', 'MX', 'AR', 'IN', 'JP', 'KR', 'AU', 'NZ', 'TR', 'ZA',
+];
+
+/** Regions for the Live tab (which country's free-to-air sports channels to
+ *  surface first). India leads — it's the default. */
+const LIVE_REGIONS = [
+  'IN', 'GB', 'US', 'AU', 'ZA', 'PK', 'BD', 'LK', 'AE', 'SG',
+  'CA', 'NZ', 'DE', 'FR', 'ES', 'IT', 'BR', 'JP', 'KR', 'NL',
 ];
 
 /** Secret fields the daemon returns BLANKED — never echoed back. We only send
@@ -450,6 +462,7 @@ export function SettingsPanel({
                 )}
                 {activeCategory === 'sources' && (
                   <>
+                    <LiveSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
                     <SourceHealthPanel
                       addons={addons}
                       manifests={manifests}
@@ -680,6 +693,131 @@ function YouTubeSection({ form, update, reload, submit, openOsk }: SectionProps)
         </button>
         <button className="btn" onClick={check} disabled={checking}>
           Check connection
+        </button>
+        {status && <span className="settings-status">{status}</span>}
+      </div>
+    </section>
+  );
+}
+
+/// Live tab: which sports to follow, the region whose free-to-air channels to
+/// surface first, and any personal IPTV playlists to fold in. The public
+/// iptv-org catalog + curated official YouTube-live channels are built in.
+const LIVE_SPORTS: { id: string; label: string }[] = [
+  { id: 'cricket', label: 'Cricket' },
+  { id: 'football', label: 'Football' },
+  { id: 'tennis', label: 'Tennis' },
+  { id: 'f1', label: 'Formula 1' },
+  { id: 'basketball', label: 'Basketball' },
+  { id: 'americanfootball', label: 'NFL' },
+  { id: 'baseball', label: 'Baseball' },
+  { id: 'hockey', label: 'Ice Hockey' },
+  { id: 'rugby', label: 'Rugby' },
+  { id: 'golf', label: 'Golf' },
+  { id: 'combat', label: 'Combat (UFC/Box)' },
+  { id: 'kabaddi', label: 'Kabaddi' },
+  { id: 'fieldhockey', label: 'Hockey' },
+  { id: 'badminton', label: 'Badminton' },
+  { id: 'tabletennis', label: 'Table Tennis' },
+  { id: 'volleyball', label: 'Volleyball' },
+  { id: 'cycling', label: 'Cycling' },
+  { id: 'esports', label: 'Esports' },
+];
+
+function LiveSection({ form, update, reload, submit, openOsk }: SectionProps) {
+  const [status, setStatus] = useState<string | null>(null);
+  const region = form.live_region?.trim().toUpperCase() || 'IN';
+  const regionOptions = LIVE_REGIONS.includes(region) ? LIVE_REGIONS : [region, ...LIVE_REGIONS];
+
+  const selectedSports = new Set(
+    form.live_sports
+      .split(/[,\s]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const toggleSport = (id: string) => {
+    const next = new Set(selectedSports);
+    next.has(id) ? next.delete(id) : next.add(id);
+    const value = [...next].join(', ');
+    update({ live_sports: value });
+    submit({ live_sports: value }).catch(() => {});
+  };
+
+  const changeRegion = (next: string) => {
+    update({ live_region: next });
+    submit({ live_region: next }).catch(() => {});
+  };
+
+  const save = async () => {
+    try {
+      await submit();
+      setStatus('Saved — open the Live tab to see what’s on');
+      reload();
+    } catch (e) {
+      setStatus(`Error: ${(e as Error).message}`);
+    }
+  };
+
+  const checkGuide = async () => {
+    setStatus('Checking guide…');
+    try {
+      setStatus((await fetchLiveStatus()).detail);
+    } catch (e) {
+      setStatus(`Error: ${(e as Error).message}`);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Live</h2>
+      <p className="settings-muted">
+        The Live tab gathers what’s broadcasting right now: currently-live official YouTube
+        channels and free-to-air sports/news channels for your region (via the built-in public
+        catalog), grouped by sport. Add your own IPTV playlists to fold in a provider you
+        subscribe to. Live streams play in the same upscaled player.
+      </p>
+      <Field label="Region (which country’s free-to-air channels come first)">
+        <select value={region} onChange={(e) => changeRegion(e.target.value)}>
+          {regionOptions.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
+      </Field>
+      <Field label="Sports you follow (none selected = all)">
+        <div className="settings-chips">
+          {LIVE_SPORTS.map((s) => (
+            <button
+              key={s.id}
+              className={`settings-chip${selectedSports.has(s.id) ? ' active' : ''}`}
+              onClick={() => toggleSport(s.id)}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </Field>
+      <LockedField
+        label="Your IPTV playlists (M3U/M3U8 URLs)"
+        value={form.iptv_playlists}
+        openOsk={openOsk}
+        onChange={(v) => update({ iptv_playlists: v })}
+        placeholder="https://example.com/playlist.m3u8, …"
+      />
+      <LockedField
+        label="Program guide (XMLTV EPG URL)"
+        value={form.epg_urls}
+        openOsk={openOsk}
+        onChange={(v) => update({ epg_urls: v })}
+        placeholder="https://example.com/epg.xml — makes live matches playable"
+      />
+      <div className="settings-actions">
+        <button className="btn btn-primary" onClick={save}>
+          Save
+        </button>
+        <button className="btn" onClick={checkGuide}>
+          Check guide
         </button>
         {status && <span className="settings-status">{status}</span>}
       </div>

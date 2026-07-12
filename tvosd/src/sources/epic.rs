@@ -161,6 +161,7 @@ impl EpicGame {
             title: self.title,
             art: self.art,
             action,
+            note: None,
         }
     }
 }

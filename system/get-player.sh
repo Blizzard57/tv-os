@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Installs the bundled mpv player into TV OS's private mpv config dir (MPV_HOME):
-#   uosc        — modern, minimal, Stremio-like on-screen UI (the default)
-#   thumbfast   — hover/seek thumbnail previews
+#   tvos_player — remote-first TV playback overlay
 #   controller  — game controller support (TV OS)
 #   upscaler    — realtime upscaler switching menu (TV OS)
 #   input.conf  — remote/controller/keyboard bindings (TV OS)
@@ -16,5 +15,6 @@ DIR="${TVOS_MPV_HOME:-$HOME/.local/share/tvos/mpv}"
 
 mkdir -p "$DIR"
 cp -r "$SRC"/. "$DIR"/
+rm -f "$DIR/.player-version"
 
-echo "Player installed in $DIR (uosc + thumbfast + controller + upscaler)"
+echo "Player installed in $DIR (TV overlay + controller + upscaler)"

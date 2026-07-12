@@ -1,4 +1,13 @@
-import { MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  MutableRefObject,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from 'react';
 import {
   ContentItem,
   Episode,
@@ -21,6 +30,7 @@ import {
 } from './api';
 import { gameLogo } from './cards';
 import { NavAction } from './input';
+import { focusPrimary, useSpatialNav } from './spatialNav';
 
 interface Props {
   item: ContentItem;
@@ -35,9 +45,6 @@ interface Props {
 
 type Stage = 'actions' | 'episodes' | 'streams';
 type PrefButton = { action: PreferenceAction; icon: string; label: string; active: boolean };
-
-/// The horizontal strips below the main list, in navigation order.
-type StripZone = 'shots' | 'ach' | 'similar';
 
 const isGameId = (id: string) => id.startsWith('steam:') || id.startsWith('gshop:');
 
@@ -61,25 +68,21 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   // Sources are compact by default (auto-chosen best pick + a toggle); this
   // expands the full ranked list.
   const [showAllSources, setShowAllSources] = useState(false);
-  const [sel, setSel] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState<{ label: string; kind: LoadingKind } | null>(null);
-  // When non-null, focus is in a horizontal strip (screenshots / similar).
-  const [strip, setStrip] = useState<{ zone: StripZone; idx: number } | null>(null);
   const [similar, setSimilar] = useState<ContentItem[]>([]);
   const [extras, setExtras] = useState<GameExtras>({});
   const [metaError, setMetaError] = useState(false);
+  // Which control the on-screen highlight paints, mirrored from real DOM focus
+  // (browser focus is the source of truth; geometry in `moveFocus` drives it).
+  const [focusedKey, setFocusedKey] = useState<string | null>(null);
   // Monotonic tokens so a late stream/meta response for a previous item can
   // never overwrite the current one.
   const streamToken = useRef(0);
   const metaToken = useRef(0);
   // Track pending status/flash timeouts so we can clear them on unmount.
   const flashTimer = useRef<number | null>(null);
-  const shotRefs = useRef<(HTMLImageElement | null)[]>([]);
-  const simRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const achRefs = useRef<(HTMLDivElement | null)[]>([]);
-  // The selected entry of the active list, so navigation scrolls the page.
-  const selRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const [resume, setResume] = useState<ResumeInfo | null>(null);
   const [logoFailed, setLogoFailed] = useState(false);
   const [pref, setPref] = useState<PreferenceStatus>({
@@ -88,13 +91,21 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     liked: false,
     disliked: false,
   });
-  const [prefFocus, setPrefFocus] = useState<number | null>(null);
+  // Bumped whenever focus should re-anchor to the page's primary action (page
+  // opened, streams arrived, episode picked, sub-view toggled).
+  const [refocusKey, bumpRefocus] = useReducer((n: number) => n + 1, 0);
 
   const series = (meta?.kind ?? item.kind) === 'series';
   const isGame = (meta?.kind ?? item.kind) === 'game';
-  // A "Resume" entry leads the episodes/streams list when there's a saved spot.
-  const resumeShown = !!resume && isStreamItem(item.id) && (stage === 'streams' || stage === 'episodes');
-  const resumeOffset = resumeShown ? 1 : 0;
+  // A "Resume" entry leads the list when there's a saved spot to continue from.
+  // The saved position is keyed by the show (item.id), so it belongs on the
+  // episode *overview* (continue the last-watched episode) and on a movie's
+  // sources — but NOT inside one specific episode's source list, where it would
+  // advertise a position that may belong to a different episode entirely.
+  const resumeShown =
+    !!resume &&
+    isStreamItem(item.id) &&
+    (stage === 'episodes' || (stage === 'streams' && !episode));
   // Only real stream sources (Torrentio &c.) get the "best pick + reveal the
   // rest" treatment. Shop offers are always shown in full (cheapest first).
   const canCompactSources = isStreamItem(item.id) && !isShopItem(item.id);
@@ -132,11 +143,9 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   useEffect(() => {
     const token = ++metaToken.current;
     // Reset per-item view state so a stale stage/selection can't leak across.
-    setStrip(null);
     setMeta(null);
     setMetaError(false);
     setEpisode(null);
-    setSel(0);
     fetchMeta(item.id)
       .then((m) => {
         if (token !== metaToken.current) return; // superseded by a newer item
@@ -148,10 +157,12 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           loadStreams(item.id);
         } else if (!isStreamItem(item.id)) {
           setStage('actions');
+          bumpRefocus();
         } else if (isSeries) {
           const seasons = [...new Set(m.episodes.map((e) => e.season))].sort((a, b) => a - b);
           setSeason(seasons.find((s) => s >= 1) ?? seasons[0] ?? 1);
           setStage('episodes');
+          bumpRefocus();
         } else {
           setStage('streams');
           loadStreams(item.id);
@@ -169,7 +180,6 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
   useEffect(() => {
     setPref({ watchlist: false, watched: false, liked: false, disliked: false });
-    setPrefFocus(null);
     fetchPreference(item.id)
       .then(setPref)
       .catch(() => {});
@@ -178,13 +188,12 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const loadStreams = useCallback((id: string) => {
     const token = ++streamToken.current;
     setStreams(null);
-    setSel(0);
-    setStrip(null);
     setShowAllSources(false);
     fetchStreams(id)
       .then((s) => {
         if (token !== streamToken.current) return; // a newer load won
         setStreams(s);
+        bumpRefocus();
       })
       .catch(() => {
         if (token !== streamToken.current) return;
@@ -225,10 +234,17 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
   const playChosen = useCallback(
     (s: Stream) => {
+      const playbackItem: ContentItem = {
+        ...item,
+        title: episode?.title
+          ? `${meta?.title || item.title} - ${episode.title}`
+          : meta?.title || item.title,
+        art: meta?.poster || meta?.background || item.art,
+      };
       // External links just open elsewhere — no loading screen needed.
       if (s.kind === 'external') {
         flash(`Opening ${s.name.split('\n')[0]}…`);
-        playStream(s, item, trackId)
+        playStream(s, playbackItem, trackId)
           .then(onPlayed)
           .catch((e) => flash(`Could not open: ${e.message}`));
         return;
@@ -236,7 +252,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
       // The play request blocks until playback actually starts (or fails), so
       // show a loading screen meanwhile — never a frozen-looking blank.
       setLoading({ label: s.name.split('\n')[0] || meta?.title || item.title, kind: 'stream' });
-      playStream(s, item, trackId)
+      playStream(s, playbackItem, trackId)
         .then(() => {
           setLoading(null);
           onPlayed();
@@ -246,7 +262,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           flash(`Could not play: ${e.message}`);
         });
     },
-    [item, onPlayed, flash, meta, trackId],
+    [item, episode, onPlayed, flash, meta, trackId],
   );
 
   const runAction = useCallback(() => {
@@ -310,190 +326,41 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     [loadStreams],
   );
 
-  // The list the current stage navigates, and how to activate an entry.
-  const handleAction = useCallback(
-    (action: NavAction) => {
-      if (loading) return; // ignore input while a stream is starting
-      const shots = meta?.screenshots ?? [];
-      const achAll = extras.achievements
-        ? [...extras.achievements.unlocked, ...extras.achievements.locked]
-        : [];
-      // The strips below the list, top to bottom, skipping empty ones.
-      const strips: StripZone[] = [
-        ...(shots.length > 0 ? (['shots'] as const) : []),
-        ...(achAll.length > 0 ? (['ach'] as const) : []),
-        ...(similar.length > 0 ? (['similar'] as const) : []),
-      ];
-      const prefCount = 4;
+  const expandSources = useCallback(() => {
+    setShowAllSources(true);
+    bumpRefocus();
+  }, []);
 
-      if (prefFocus !== null) {
-        switch (action) {
-          case 'left':
-            setPrefFocus((i) => (i == null ? 0 : Math.max(0, i - 1)));
-            break;
-          case 'right':
-            setPrefFocus((i) => (i == null ? 0 : Math.min(prefCount - 1, i + 1)));
-            break;
-          case 'down':
-            setPrefFocus(null);
-            setSel(0);
-            break;
-          case 'confirm': {
-            const prefActions: PreferenceAction[] = ['watchlist', 'watched', 'like', 'dislike'];
-            runPreference(prefActions[prefFocus]);
-            break;
-          }
-          case 'back':
-            setPrefFocus(null);
-            break;
-          default:
-            break;
-        }
-        return;
-      }
+  const pickSeason = useCallback((s: number) => {
+    setSeason(s);
+    bumpRefocus();
+  }, []);
 
-      // Focus is in a horizontal strip: ◀▶ browse, ↑↓ move between strips.
-      if (strip) {
-        const items =
-          strip.zone === 'shots' ? shots : strip.zone === 'ach' ? achAll : similar;
-        const at = strips.indexOf(strip.zone);
-        switch (action) {
-          case 'left':
-            setStrip((s) => s && { ...s, idx: Math.max(0, s.idx - 1) });
-            break;
-          case 'right':
-            setStrip((s) => s && { ...s, idx: Math.min(items.length - 1, s.idx + 1) });
-            break;
-          case 'up':
-            if (at > 0) setStrip({ zone: strips[at - 1], idx: 0 });
-            else setStrip(null); // back up into the main list
-            break;
-          case 'down':
-            if (at < strips.length - 1) setStrip({ zone: strips[at + 1], idx: 0 });
-            break;
-          case 'confirm':
-            if (strip.zone === 'similar') {
-              const next = similar[strip.idx];
-              if (next) onOpen(next);
-            }
-            break;
-          case 'back':
-            setStrip(null);
-            break;
-          default:
-            break;
-        }
-        return;
-      }
+  // B / Esc peels one layer: expanded sources → compact, series streams →
+  // episode list, otherwise close the page.
+  const handleBack = useCallback(() => {
+    if (stage === 'streams' && showAllSources && canCompactSources) {
+      setShowAllSources(false);
+      bumpRefocus();
+    } else if (stage === 'streams' && series) {
+      setStage('episodes');
+      bumpRefocus();
+    } else {
+      onClose();
+    }
+  }, [stage, showAllSources, canCompactSources, series, onClose]);
 
-      // In the streams stage the navigable rows depend on whether the compact
-      // "best pick + reveal" view or the full ranked list is showing.
-      const streamRows = !streams
-        ? 0
-        : sourcesExpanded
-          ? streams.length
-          : Math.min(streams.length, 2); // best pick + "show all" toggle
-      const base: unknown[] =
-        stage === 'episodes'
-          ? episodesInSeason
-          : stage === 'streams'
-            ? new Array(streamRows)
-            : [0];
-      // A "Resume" entry takes index 0 when we have somewhere to continue from.
-      const offset = resumeShown ? 1 : 0;
-      const navLen = base.length + offset;
-      switch (action) {
-        case 'down':
-          if (navLen === 0) {
-            if (strips.length > 0) setStrip({ zone: strips[0], idx: 0 });
-            break;
-          }
-          // At the bottom of the list, drop into the strips if any exist.
-          if (sel >= navLen - 1 && strips.length > 0) {
-            setStrip({ zone: strips[0], idx: 0 });
-          } else {
-            setSel((i) => Math.min(navLen - 1, i + 1));
-          }
-          break;
-        case 'up':
-          if (sel === 0) setPrefFocus(0);
-          else setSel((i) => Math.max(0, i - 1));
-          break;
-        case 'left':
-        case 'right':
-          if (stage === 'episodes' && seasons.length > 1) {
-            const i = seasons.indexOf(season);
-            const next = action === 'left' ? i - 1 : i + 1;
-            if (next >= 0 && next < seasons.length) {
-              setSeason(seasons[next]);
-              setSel(0);
-            }
-          }
-          break;
-        case 'confirm':
-          if (resumeShown && sel === 0) {
-            if (resume) playChosen(resume.stream);
-          } else if (stage === 'actions') {
-            runAction();
-          } else if (stage === 'episodes') {
-            const ep = episodesInSeason[sel - offset];
-            if (ep) openEpisode(ep);
-          } else if (stage === 'streams') {
-            const idx = sel - offset;
-            if (sourcesExpanded) {
-              const s = streams?.[idx];
-              if (s) playChosen(s);
-            } else if (idx === 0) {
-              if (streams?.[0]) playChosen(streams[0]);
-            } else if (idx === 1) {
-              // Reveal the full ranked list, landing on the best pick.
-              setShowAllSources(true);
-              setSel(offset);
-            }
-          }
-          break;
-        case 'back':
-          if (stage === 'streams' && showAllSources && canCompactSources) {
-            // Collapse back to the compact best-pick view.
-            setShowAllSources(false);
-            setSel(offset);
-          } else if (stage === 'streams' && series) {
-            setStage('episodes');
-            setSel(0);
-          } else onClose();
-          break;
-        default:
-          break;
-      }
-    },
-    [stage, episodesInSeason, streams, seasons, season, sel, series, runAction, runPreference, openEpisode, playChosen, onClose, onOpen, loading, strip, similar, extras, meta, resume, resumeShown, sourcesExpanded, showAllSources, canCompactSources, prefFocus],
-  );
+  // One nav model for the whole OS: directions walk on-screen controls by
+  // geometry, A activates the focused one, B runs `handleBack`.
+  useSpatialNav(actionRef, rootRef, {
+    onBack: handleBack,
+    blocked: () => !!loading,
+  });
 
-  // Navigation must always keep the selection on screen: the selected list
-  // entry when walking the list, the focused card when in a strip.
-  useEffect(() => {
-    if (strip) return;
-    selRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [sel, stage, strip, streams, episode, episodesInSeason, showAllSources]);
-
-  useEffect(() => {
-    if (!strip) return;
-    const el =
-      strip.zone === 'shots'
-        ? shotRefs.current[strip.idx]
-        : strip.zone === 'ach'
-          ? achRefs.current[strip.idx]
-          : simRefs.current[strip.idx];
-    el?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'center' });
-  }, [strip]);
-
-  // Register the handler so App forwards controller/keyboard nav here.
-  useEffect(() => {
-    actionRef.current = handleAction;
-    return () => {
-      actionRef.current = null;
-    };
-  }, [actionRef, handleAction]);
+  // Re-anchor focus on the primary action after an intentional context change.
+  useLayoutEffect(() => {
+    focusPrimary(rootRef.current);
+  }, [refocusKey]);
 
   const title = meta?.title || item.title;
   const background = meta?.background || item.art;
@@ -533,13 +400,46 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   ].filter(Boolean) as { label: string; value: string }[];
   const prefButtons: PrefButton[] = [
     { action: 'watchlist', icon: '+', label: 'Watchlist', active: pref.watchlist },
-    { action: 'watched', icon: '○', label: 'Watched it?', active: pref.watched },
+    { action: 'watched', icon: '○', label: 'Watched', active: pref.watched },
     { action: 'like', icon: '↑', label: 'Like', active: pref.liked },
     { action: 'dislike', icon: '↓', label: 'Dislike', active: pref.disliked },
   ];
 
+  const achAll = extras.achievements
+    ? [...extras.achievements.unlocked, ...extras.achievements.locked]
+    : [];
+
+  // Which control gets `data-primary` (the focus target after a context reset).
+  const primaryKey: string | null = resumeShown
+    ? 'resume'
+    : stage === 'actions'
+      ? 'action'
+      : stage === 'episodes'
+        ? episodesInSeason.length > 0
+          ? 'ep:0'
+          : null
+        : stage === 'streams'
+          ? sourcesExpanded
+            ? streams && streams.length > 0
+              ? 'source:0'
+              : null
+            : bestStream
+              ? 'source:best'
+              : null
+          : null;
+
+  // Focus wiring shared by every navigable control: makes it a real tab stop,
+  // mirrors focus into `focusedKey` for the highlight, and flags the primary.
+  const nav = (key: string) => ({
+    tabIndex: 0,
+    'data-primary': key === primaryKey ? true : undefined,
+    onFocus: () => setFocusedKey(key),
+  });
+  const on = (key: string) => (focusedKey === key ? 'selected' : '');
+  const focusZone = focusedKey?.split(':')[0];
+
   return (
-    <div className="details">
+    <div className="details" ref={rootRef}>
       {background && (
         <div className="details-bg" style={{ backgroundImage: `url(${background})` }} />
       )}
@@ -623,13 +523,9 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 <button
                   key={button.action}
                   type="button"
-                  className={`details-round-action ${button.active ? 'active' : ''} ${
-                    prefFocus === i ? 'selected' : ''
-                  }`}
-                  onClick={() => {
-                    setPrefFocus(i);
-                    runPreference(button.action);
-                  }}
+                  className={`details-round-action ${button.active ? 'active' : ''} ${on(`pref:${i}`)}`}
+                  {...nav(`pref:${i}`)}
+                  onClick={() => runPreference(button.action)}
                 >
                   <span className="round-action-icon">{button.icon}</span>
                   <span>{button.label}</span>
@@ -648,8 +544,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
         {stage === 'actions' && (
           <div className="details-actions">
             <div
-              ref={!strip && prefFocus === null ? selRef : undefined}
-              className={`row-item action-button ${!strip && prefFocus === null ? 'selected' : ''}`}
+              className={`row-item action-button ${on('action')}`}
+              {...nav('action')}
               onClick={runAction}
             >
               {item.action === 'install' ? 'Install' : 'Play'}
@@ -659,8 +555,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
         {resumeShown && resume && (
           <div
-            ref={sel === 0 && !strip && prefFocus === null ? selRef : undefined}
-            className={`resume-btn ${sel === 0 && !strip && prefFocus === null ? 'selected' : ''}`}
+            className={`resume-btn ${on('resume')}`}
+            {...nav('resume')}
             onClick={() => playChosen(resume.stream)}
           >
             <span className="resume-play">▶</span>
@@ -676,23 +572,25 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
             {seasons.length > 1 && (
               <div className="season-tabs">
                 {seasons.map((s) => (
-                  <span key={s} className={`season-tab ${s === season ? 'season-tab-active' : ''}`}>
+                  <button
+                    key={s}
+                    type="button"
+                    className={`season-tab ${s === season ? 'season-tab-active' : ''} ${on(`season:${s}`)}`}
+                    {...nav(`season:${s}`)}
+                    onClick={() => pickSeason(s)}
+                  >
                     {s === 0 ? 'Specials' : `Season ${s}`}
-                  </span>
+                  </button>
                 ))}
-                <span className="details-hint">◀ ▶ to change season</span>
               </div>
             )}
             <div className="ep-list">
               {episodesInSeason.map((ep, i) => (
                 <div
                   key={ep.id}
-                  ref={i === sel - resumeOffset && !strip && prefFocus === null ? selRef : undefined}
-                  className={`ep-item ${i === sel - resumeOffset && !strip && prefFocus === null ? 'selected' : ''}`}
-                  onClick={() => {
-                    setSel(i + resumeOffset);
-                    openEpisode(ep);
-                  }}
+                  className={`ep-item ${on(`ep:${i}`)}`}
+                  {...nav(`ep:${i}`)}
+                  onClick={() => openEpisode(ep)}
                 >
                   <span className="ep-num">
                     {ep.season}×{String(ep.episode).padStart(2, '0')}
@@ -715,7 +613,9 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 ? 'Where to buy — cheapest first'
                 : episode
                   ? `${episode.season}×${String(episode.episode).padStart(2, '0')} — ${episode.title}`
-                  : 'Play'}
+                  : resumeShown
+                    ? 'Play from the start'
+                    : 'Play'}
             </div>
             {streams === null && (
               <div className="details-hint">
@@ -737,16 +637,16 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                   const d = describeSource(bestStream);
                   return (
                     <div
-                      ref={sel - resumeOffset === 0 && !strip && prefFocus === null ? selRef : undefined}
-                      className={`best-source ${sel - resumeOffset === 0 && !strip && prefFocus === null ? 'selected' : ''}`}
-                      onClick={() => {
-                        setSel(resumeOffset);
-                        playChosen(bestStream);
-                      }}
+                      className={`best-source ${on('source:best')}`}
+                      {...nav('source:best')}
+                      onClick={() => playChosen(bestStream)}
                     >
                       <span className="best-play">▶</span>
                       <div className="best-text">
                         <div className="best-line">
+                          {/* The "Play from the start" section header already says
+                              this when a Resume entry is present, so keep the card
+                              label short rather than repeating the phrase. */}
                           <span className="best-label">Play now</span>
                           {d.chips.map((c) => (
                             <span key={c} className="source-chip">
@@ -764,12 +664,9 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 })()}
                 {streams && streams.length > 1 && (
                   <div
-                    ref={sel - resumeOffset === 1 && !strip && prefFocus === null ? selRef : undefined}
-                    className={`source-toggle ${sel - resumeOffset === 1 && !strip && prefFocus === null ? 'selected' : ''}`}
-                    onClick={() => {
-                      setShowAllSources(true);
-                      setSel(resumeOffset);
-                    }}
+                    className={`source-toggle ${on('source:toggle')}`}
+                    {...nav('source:toggle')}
+                    onClick={expandSources}
                   >
                     Show all {streams.length} sources ▾
                   </div>
@@ -783,14 +680,11 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 {streams.map((s, i) => (
                   <div
                     key={`${s.url}-${i}`}
-                    ref={i === sel - resumeOffset && !strip && prefFocus === null ? selRef : undefined}
-                    className={`stream-item ${i === sel - resumeOffset && !strip && prefFocus === null ? 'selected' : ''} ${
+                    className={`stream-item ${on(`source:${i}`)} ${
                       i === 0 && canCompactSources ? 'stream-best' : ''
                     }`}
-                    onClick={() => {
-                      setSel(i + resumeOffset);
-                      playChosen(s);
-                    }}
+                    {...nav(`source:${i}`)}
+                    onClick={() => playChosen(s)}
                   >
                     <span className={`stream-badge badge-${s.kind}`}>{KIND_BADGE[s.kind]}</span>
                     <div className="stream-text">
@@ -839,80 +733,68 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
         {!!meta?.screenshots?.length && (
           <div className="shots">
-            <div className={`shots-head ${strip?.zone === 'shots' ? 'focused' : ''}`}>
-              Screenshots <span className="details-hint">↓ then ◀ ▶ to browse</span>
+            <div className={`shots-head ${focusZone === 'shot' ? 'focused' : ''}`}>
+              Screenshots
             </div>
             <div className="shots-strip">
               {meta.screenshots.map((src, i) => (
                 <img
                   key={src}
-                  ref={(el) => {
-                    shotRefs.current[i] = el;
-                  }}
-                  className={`shot ${strip?.zone === 'shots' && i === strip.idx ? 'focused' : ''}`}
+                  className={`shot ${focusedKey === `shot:${i}` ? 'focused' : ''}`}
                   src={src}
                   alt=""
                   loading="lazy"
-                  onClick={() => setStrip({ zone: 'shots', idx: i })}
+                  {...nav(`shot:${i}`)}
                 />
               ))}
             </div>
           </div>
         )}
 
-        {extras.achievements &&
-          extras.achievements.unlocked.length + extras.achievements.locked.length > 0 && (
-            <div className="shots">
-              <div className={`shots-head ${strip?.zone === 'ach' ? 'focused' : ''}`}>
-                Achievements
-                <span className="search-section-count">
-                  {extras.achievements.unlocked.length} of{' '}
-                  {extras.achievements.unlocked.length + extras.achievements.locked.length} earned
-                </span>{' '}
-                <span className="details-hint">↓ then ◀ ▶ to browse</span>
-              </div>
-              <div className="shots-strip">
-                {[...extras.achievements.unlocked, ...extras.achievements.locked].map((a, i) => (
-                  <div
-                    key={`${a.name}-${i}`}
-                    ref={(el) => {
-                      achRefs.current[i] = el;
-                    }}
-                    className={`ach-tile ${a.unlocked_at == null ? 'ach-locked' : ''} ${
-                      strip?.zone === 'ach' && i === strip.idx ? 'focused' : ''
-                    }`}
-                  >
-                    {a.icon && <img src={a.icon} alt="" loading="lazy" />}
-                    <div className="ach-text">
-                      <div className="ach-name">{a.name}</div>
-                      {a.description && <div className="ach-desc">{a.description}</div>}
-                      {a.unlocked_at != null && a.unlocked_at > 0 && (
-                        <div className="ach-date">
-                          {new Date(a.unlocked_at * 1000).toLocaleDateString()}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
+        {achAll.length > 0 && extras.achievements && (
+          <div className="shots">
+            <div className={`shots-head ${focusZone === 'ach' ? 'focused' : ''}`}>
+              Achievements
+              <span className="search-section-count">
+                {extras.achievements.unlocked.length} of {achAll.length} earned
+              </span>
             </div>
-          )}
+            <div className="shots-strip">
+              {achAll.map((a, i) => (
+                <div
+                  key={`${a.name}-${i}`}
+                  className={`ach-tile ${a.unlocked_at == null ? 'ach-locked' : ''} ${
+                    focusedKey === `ach:${i}` ? 'focused' : ''
+                  }`}
+                  {...nav(`ach:${i}`)}
+                >
+                  {a.icon && <img src={a.icon} alt="" loading="lazy" />}
+                  <div className="ach-text">
+                    <div className="ach-name">{a.name}</div>
+                    {a.description && <div className="ach-desc">{a.description}</div>}
+                    {a.unlocked_at != null && a.unlocked_at > 0 && (
+                      <div className="ach-date">
+                        {new Date(a.unlocked_at * 1000).toLocaleDateString()}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {similar.length > 0 && (
           <div className="shots similar-block">
-            <div className={`shots-head ${strip?.zone === 'similar' ? 'focused' : ''}`}>
-              More like this <span className="details-hint">↓ then ◀ ▶ · A to open</span>
+            <div className={`shots-head ${focusZone === 'sim' ? 'focused' : ''}`}>
+              More like this <span className="details-hint">A to open</span>
             </div>
             <div className="shots-strip">
               {similar.map((s, i) => (
                 <div
                   key={s.id}
-                  ref={(el) => {
-                    simRefs.current[i] = el;
-                  }}
-                  className={`sim-card ${
-                    strip?.zone === 'similar' && i === strip.idx ? 'focused' : ''
-                  }`}
+                  className={`sim-card ${focusedKey === `sim:${i}` ? 'focused' : ''}`}
+                  {...nav(`sim:${i}`)}
                   onClick={() => onOpen(s)}
                 >
                   {s.art ? (
@@ -930,7 +812,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
       <div className="details-legend">
         <span>
-          <span className="key">↑↓</span> Browse
+          <span className="key">↑↓←→</span> Move
         </span>
         <span>
           <span className="key">A</span> Select
@@ -938,11 +820,6 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
         <span>
           <span className="key">B</span> Back
         </span>
-        {stage === 'episodes' && seasons.length > 1 && (
-          <span>
-            <span className="key">◀▶</span> Season
-          </span>
-        )}
       </div>
 
       {status && <div className="toast">{status}</div>}

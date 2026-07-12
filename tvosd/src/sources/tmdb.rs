@@ -160,7 +160,7 @@ impl Source for Tmdb {
             imdb_id(&key, media, tmdb_id).ok_or("Couldn't find this title's IMDb id on TMDB")?;
         // TMDB "tv" is Stremio "series".
         let stremio_kind = if media == "tv" { "series" } else { "movie" };
-        stremio::play_meta(stremio_kind, &imdb, Some(item_id))
+        stremio::play_meta(stremio_kind, &imdb, Some(item_id), None)
     }
 }
 
@@ -485,7 +485,8 @@ fn parse_rich(
                 title: title.clone(),
                 art: Some(art),
                 action: Action::Play,
-            };
+                note: None,
+                        };
             Some((item, format!("{title}. {genre_names}. {overview}")))
         })
         .collect()
@@ -704,7 +705,8 @@ fn parse_search(json: &str) -> (Vec<ContentItem>, Vec<Person>) {
                 title,
                 art: Some(art),
                 action: Action::Play,
-            })
+                note: None,
+                        })
         })
         .take(ROW_LIMIT * 2)
         .collect();
@@ -790,7 +792,8 @@ pub fn person_credits(person_id: i64) -> Vec<ContentItem> {
                     title,
                     art: Some(art),
                     action: Action::Play,
-                },
+                    note: None,
+                                },
             ))
         })
         .collect();
@@ -1046,7 +1049,8 @@ fn parse_trending(json: &str, media: &str) -> Vec<ContentItem> {
                 title,
                 art: Some(art),
                 action: Action::Play,
-            })
+                note: None,
+                        })
         })
         .collect()
 }

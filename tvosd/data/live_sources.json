@@ -1,0 +1,132 @@
+{
+  "_comment": "Seed for the Live tab. `tsdb` = TheSportsDB sport name for fixtures (omit = no schedule). `youtube` handles are probed for a CURRENT live broadcast (shown only while actually live). `keywords` bucket IPTV/free-to-air channels into each sport (whole-word, case-insensitive, matched against channel name + category). Row order below is the display order. Edit freely or point TVOS_LIVE_SOURCES at your own copy.",
+  "sports": [
+    {
+      "id": "cricket",
+      "label": "Cricket",
+      "tsdb": "Cricket",
+      "youtube": ["@icc", "@BCCI", "@englandcricket", "@cricketaustralia"],
+      "keywords": ["cricket", "willow", "star sports 1", "star sports 3", "sports18 1", "ten cricket", "a sports", "ptv sports"]
+    },
+    {
+      "id": "football",
+      "label": "Football",
+      "tsdb": "Soccer",
+      "youtube": ["@FIFA", "@UEFA", "@DAZNFootball", "@LaLiga", "@Bundesliga"],
+      "keywords": ["football", "soccer", "futbol", "futebol", "bein sports", "espn fc", "la liga", "laliga", "premier league", "bundesliga", "serie a", "ligue 1", "sky sports football", "sky sports premier", "premier sports", "sony sports ten 2"]
+    },
+    {
+      "id": "tennis",
+      "label": "Tennis",
+      "tsdb": "Tennis",
+      "youtube": ["@atptour", "@wta", "@Wimbledon", "@usopentennis"],
+      "keywords": ["tennis", "wimbledon", "roland garros", "atp tour", "wta tour"]
+    },
+    {
+      "id": "f1",
+      "label": "Formula 1 & Motorsport",
+      "tsdb": "Motorsport",
+      "youtube": ["@Formula1", "@MotoGP", "@FIA", "@FormulaE"],
+      "keywords": ["formula 1", "formula1", "motogp", "moto gp", "motorsport", "nascar", "wrc", "grand prix", "superbike", "indycar"]
+    },
+    {
+      "id": "basketball",
+      "label": "Basketball",
+      "tsdb": "Basketball",
+      "youtube": ["@NBA", "@euroleague", "@wnba"],
+      "keywords": ["basketball", "nba", "wnba", "euroleague", "ncaa basketball"]
+    },
+    {
+      "id": "americanfootball",
+      "label": "American Football",
+      "tsdb": "American Football",
+      "youtube": ["@NFL"],
+      "keywords": ["american football", "nfl", "gridiron", "ncaa football", "college football"]
+    },
+    {
+      "id": "baseball",
+      "label": "Baseball",
+      "tsdb": "Baseball",
+      "youtube": ["@MLB"],
+      "keywords": ["baseball", "mlb", "world series"]
+    },
+    {
+      "id": "hockey",
+      "label": "Ice Hockey",
+      "tsdb": "Ice Hockey",
+      "youtube": ["@NHL"],
+      "keywords": ["ice hockey", "nhl", "khl"]
+    },
+    {
+      "id": "rugby",
+      "label": "Rugby",
+      "tsdb": "Rugby",
+      "youtube": ["@WorldRugby", "@sixnationsrugby"],
+      "keywords": ["rugby", "six nations", "super rugby"]
+    },
+    {
+      "id": "golf",
+      "label": "Golf",
+      "tsdb": "Golf",
+      "youtube": ["@PGATOUR", "@DPWorldTour"],
+      "keywords": ["golf", "pga tour", "the open", "masters golf"]
+    },
+    {
+      "id": "combat",
+      "label": "Combat Sports",
+      "tsdb": "Fighting",
+      "youtube": ["@UFC", "@WWE", "@boxing"],
+      "keywords": ["ufc", "mma", "boxing", "wwe", "wrestling", "bellator", "one championship", "fight sports"]
+    },
+    {
+      "id": "kabaddi",
+      "label": "Kabaddi",
+      "youtube": ["@prokabaddi"],
+      "keywords": ["kabaddi"]
+    },
+    {
+      "id": "fieldhockey",
+      "label": "Hockey",
+      "youtube": ["@fihockey"],
+      "keywords": ["field hockey", "hockey india", "fih hockey"]
+    },
+    {
+      "id": "badminton",
+      "label": "Badminton",
+      "youtube": ["@bwftv"],
+      "keywords": ["badminton", "bwf"]
+    },
+    {
+      "id": "tabletennis",
+      "label": "Table Tennis",
+      "youtube": ["@WTTGlobal"],
+      "keywords": ["table tennis", "ping pong", "wtt"]
+    },
+    {
+      "id": "volleyball",
+      "label": "Volleyball",
+      "tsdb": "Volleyball",
+      "youtube": ["@FIVBVolleyball"],
+      "keywords": ["volleyball", "fivb"]
+    },
+    {
+      "id": "cycling",
+      "label": "Cycling",
+      "tsdb": "Cycling",
+      "youtube": ["@UCI_cycling"],
+      "keywords": ["cycling", "tour de france", "giro d'italia", "vuelta"]
+    },
+    {
+      "id": "esports",
+      "label": "Esports",
+      "youtube": ["@valorant", "@LeagueofLegends", "@ESLCS"],
+      "keywords": ["esports", "e-sports", "dota", "valorant", "league of legends", "counter-strike", "csgo", "overwatch"]
+    },
+    {
+      "id": "general",
+      "label": "Live Sports",
+      "youtube": ["@ESPN", "@SkySports", "@Olympics", "@beINSPORTS", "@RedBull"],
+      "keywords": []
+    }
+  ]
+}

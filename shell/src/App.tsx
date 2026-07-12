@@ -14,31 +14,15 @@ import {
   saveSettings,
 } from './api';
 import { DetailsPage } from './DetailsPage';
+import { activateFocused, moveFocus } from './focusNav';
 import { Hero } from './Hero';
 import { NavAction, useTvInput } from './input';
 import { SearchOverlay } from './SearchOverlay';
 import { SettingsPanel } from './SettingsPanel';
 import { Shelf } from './Shelf';
-import {
-  FIRST_TAB_INDEX,
-  SEARCH_INDEX,
-  SETTINGS_INDEX,
-  THEME_INDEX,
-  TOPBAR_COUNT,
-  TopBar,
-  tabIndex,
-} from './TopBar';
 import { TABS, TabId, rowsForTab, tabHasContent } from './tabs';
+import { TopBar } from './TopBar';
 import { Theme, applyAccent, applyTheme, initialTheme, otherTheme } from './theme';
-
-// Focus lives in one of two zones. In `topbar`, `col` is an index into
-// [search, ...tabs, settings, theme]. In `rows`, `row` is the shelf and `col`
-// the card. Each remembers its own spot so leaving and returning is seamless.
-interface Focus {
-  zone: 'topbar' | 'rows';
-  row: number;
-  col: number;
-}
 
 const ENHANCE_CYCLE: EnhanceMode[] = ['auto', 'quality', 'performance', 'off'];
 const ENHANCE_LABELS: Record<EnhanceMode, string> = {
@@ -59,6 +43,10 @@ const BLANK_SETTINGS: Settings = {
   youtube_channels: '',
   youtube_account: false,
   game_region: '',
+  live_region: '',
+  live_sports: '',
+  iptv_playlists: '',
+  epg_urls: '',
   trakt_client_id: '',
   trakt_client_secret: '',
   trakt_token: '',
@@ -88,6 +76,7 @@ const ERROR_COPY: Record<LoadError, string> = {
 
 const EMPTY_TAB_COPY: Record<TabId, string> = {
   foryou: '',
+  live: 'Nothing live right now — follow sports channels and set your region in Settings, then check back around game time.',
   movies: 'No movies yet — add a TMDB key in Settings to fill this tab.',
   shows: 'No shows yet — add a TMDB key in Settings to fill this tab.',
   library: 'Your library is empty — connect Steam, Epic or GOG, or start watching to fill it.',
@@ -97,7 +86,10 @@ export default function App() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [error, setError] = useState<LoadError | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('foryou');
-  const [focus, setFocus] = useState<Focus>({ zone: 'rows', row: 0, col: 0 });
+  // Navigation moves real DOM focus (spatial nav, shared with Details/Search/
+  // Settings). These mirror the focused element for the hero preview only.
+  const [heroItem, setHeroItem] = useState<ContentItem | undefined>(undefined);
+  const [zone, setZone] = useState<'topbar' | 'rows'>('rows');
   const [toast, setToast] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [settings, setSettings] = useState<Settings>(BLANK_SETTINGS);
@@ -122,18 +114,19 @@ export default function App() {
     return set;
   }, [rows]);
 
-  // Where to land in the rows when dropping down from the top bar.
-  const gridReturn = useRef<Focus>({ zone: 'rows', row: 0, col: 0 });
+  const appRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<number>();
+  const didMountTabRefresh = useRef(false);
   // Overlays register their nav handlers here; App forwards input while open.
   const detailsActionRef = useRef<((a: NavAction) => void) | null>(null);
   const settingsActionRef = useRef<((a: NavAction) => void) | null>(null);
   const searchActionRef = useRef<((a: NavAction) => void) | null>(null);
-  // Mirrors read inside event handlers (avoid stale closures / setState purity).
-  const focusRef = useRef(focus);
-  focusRef.current = focus;
-  const shelvesRef = useRef(shelves);
-  shelvesRef.current = shelves;
+  // The last home control that held focus, restored when an overlay closes.
+  const lastHomeFocus = useRef<HTMLElement | null>(null);
+  // Mirrors read inside event handlers (avoid stale closures).
+  const overlayOpen = detailsItem !== null || settingsOpen || searchOpen;
+  const overlayOpenRef = useRef(overlayOpen);
+  overlayOpenRef.current = overlayOpen;
   const activeTabRef = useRef(activeTab);
   activeTabRef.current = activeTab;
 
@@ -148,6 +141,13 @@ export default function App() {
   }, []);
 
   useEffect(loadLibrary, [loadLibrary]);
+  useEffect(() => {
+    if (!didMountTabRefresh.current) {
+      didMountTabRefresh.current = true;
+      return;
+    }
+    loadLibrary();
+  }, [activeTab, loadLibrary]);
   useEffect(() => applyTheme(theme), [theme]);
   useEffect(() => applyAccent(settings.accent), [settings.accent]);
   useEffect(() => {
@@ -166,19 +166,6 @@ export default function App() {
       .catch(() => {});
     loadLibrary();
   }, [loadLibrary]);
-
-  // Keep focus in bounds when the visible shelves change (library refresh or
-  // tab switch can shrink/replace them).
-  useEffect(() => {
-    setFocus((f) => {
-      if (f.zone !== 'rows') return f;
-      if (shelves.length === 0) return { zone: 'rows', row: 0, col: 0 };
-      const row = Math.min(f.row, shelves.length - 1);
-      const len = shelves[row].items.length;
-      const col = Math.min(f.col, Math.max(0, len - 1));
-      return row === f.row && col === f.col ? f : { zone: 'rows', row, col };
-    });
-  }, [shelves]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -213,32 +200,74 @@ export default function App() {
     saveSettings(updated).catch((e) => showToast(`Could not save: ${e.message}`));
   }, [settings, settingsLoaded, showToast]);
 
-  // Switch tabs (live, as focus moves across the bar). Resets the rows return
-  // spot so dropping into the new tab lands at its first card.
-  const switchTab = useCallback((id: TabId) => {
-    setActiveTab(id);
-    gridReturn.current = { zone: 'rows', row: 0, col: 0 };
-  }, []);
+  const switchTab = useCallback((id: TabId) => setActiveTab(id), []);
 
   // Confirm on a card opens its details page.
   const activateItem = useCallback((item: ContentItem) => pushDetails(item), [pushDetails]);
 
-  const activateTop = useCallback(
-    (col: number) => {
-      if (col === SEARCH_INDEX) setSearchOpen(true);
-      else if (col === SETTINGS_INDEX) setSettingsOpen(true);
-      else if (col === THEME_INDEX) toggleTheme();
-      else {
-        // A tab: switch to it and drop focus into its content.
-        const id = TABS[col - FIRST_TAB_INDEX]?.id;
-        if (id) {
-          switchTab(id);
-          setFocus({ zone: 'rows', row: 0, col: 0 });
-        }
-      }
-    },
-    [switchTab, toggleTheme],
+  // ---- Home focus helpers (DOM focus, geometry nav) ----
+  const rowsRoot = useCallback(
+    () => appRef.current?.querySelector<HTMLElement>('.home-rows, .screen-message') ?? null,
+    [],
   );
+  const topbarRoot = useCallback(
+    () => appRef.current?.querySelector<HTMLElement>('.topbar') ?? null,
+    [],
+  );
+  const focusFirstCard = useCallback(() => {
+    const target = rowsRoot()?.querySelector<HTMLElement>(
+      '.card, .tv-retry, button, [tabindex]:not([tabindex="-1"])',
+    );
+    target?.focus();
+  }, [rowsRoot]);
+  const focusActiveTab = useCallback(() => {
+    (topbarRoot()?.querySelector<HTMLElement>('.top-tab-active') ??
+      topbarRoot()?.querySelector<HTMLElement>('.top-tab'))?.focus();
+  }, [topbarRoot]);
+
+  // Report focus from home controls: keeps the hero in sync and remembers the
+  // spot so returning from an overlay lands where you left.
+  const onCardFocus = useCallback((item: ContentItem, el: HTMLElement) => {
+    setHeroItem(item);
+    setZone('rows');
+    lastHomeFocus.current = el;
+  }, []);
+  const firstItemOfTab = useCallback(
+    (id: TabId) => rowsForTab(id, rows ?? [])[0]?.items[0],
+    [rows],
+  );
+  const onTabFocus = useCallback(
+    (id: TabId, el: HTMLElement) => {
+      // Moving across the bar switches the tab live (its content previews below).
+      switchTab(id);
+      setHeroItem(firstItemOfTab(id));
+      setZone('topbar');
+      lastHomeFocus.current = el;
+    },
+    [switchTab, firstItemOfTab],
+  );
+  const onChromeFocus = useCallback(
+    (el: HTMLElement) => {
+      setHeroItem(firstItemOfTab(activeTabRef.current));
+      setZone('topbar');
+      lastHomeFocus.current = el;
+    },
+    [firstItemOfTab],
+  );
+
+  // B / Home: from the rows, jump to the active tab; on the bar, fall back to
+  // the For-you tab (then a second B on For-you is a no-op — nowhere higher).
+  // Focusing the For-you tab directly lets its onFocus do the switch, avoiding
+  // a switch-then-refocus race against React's commit.
+  const homeBack = useCallback(() => {
+    if (topbarRoot()?.contains(document.activeElement)) {
+      if (activeTabRef.current !== 'foryou') {
+        topbarRoot()?.querySelector<HTMLElement>('.top-tab[data-tab="foryou"]')?.focus();
+      }
+    } else {
+      focusActiveTab();
+    }
+  }, [topbarRoot, focusActiveTab]);
 
   const onAction = useCallback(
     (action: NavAction) => {
@@ -253,9 +282,7 @@ export default function App() {
         return;
       }
 
-      // These shortcuts are global: they behave the same from home and from a
-      // details page. Opening an overlay above details preserves the details
-      // stack, so closing it returns to exactly where the user was.
+      // Global shortcuts, identical from home and from a details page.
       if (action === 'search') return setSearchOpen(true);
       if (action === 'settings') return setSettingsOpen(true);
       if (action === 'theme') return toggleTheme();
@@ -266,142 +293,83 @@ export default function App() {
         return;
       }
 
-      const f = focusRef.current;
-      const list = shelvesRef.current;
+      // ---- Home: real DOM focus, moved by geometry (same as every overlay) ----
+      const root = appRef.current;
+      if (!root) return;
+      if (action === 'back') return homeBack();
+      if (action === 'confirm') return activateFocused();
 
-      // ---- Top bar ----
-      if (f.zone === 'topbar') {
-        switch (action) {
-          case 'left': {
-            const col = Math.max(0, f.col - 1);
-            setFocus({ zone: 'topbar', row: 0, col });
-            liveTab(col);
-            break;
-          }
-          case 'right': {
-            const col = Math.min(TOPBAR_COUNT - 1, f.col + 1);
-            setFocus({ zone: 'topbar', row: 0, col });
-            liveTab(col);
-            break;
-          }
-          case 'down':
-            if (list.length > 0) {
-              const back = gridReturn.current;
-              const row = Math.min(back.row, list.length - 1);
-              const col = Math.min(back.col, Math.max(0, list[row].items.length - 1));
-              setFocus({ zone: 'rows', row, col });
-            }
-            break;
-          case 'back':
-            if (activeTabRef.current !== 'foryou') {
-              switchTab('foryou');
-              setFocus({ zone: 'topbar', row: 0, col: tabIndex('foryou') });
-            }
-            break;
-          case 'confirm':
-            // Content tabs cannot be entered while the library is unavailable,
-            // but Search, Settings and Theme remain usable from the error page.
-            if (!error || f.col < FIRST_TAB_INDEX || f.col >= FIRST_TAB_INDEX + TABS.length) {
-              activateTop(f.col);
-            }
-            break;
-          default:
-            break;
-        }
+      const inTopbar = topbarRoot()?.contains(document.activeElement) ?? false;
+      if (inTopbar) {
+        // The bar is a widget with its own semantics: ◀▶ walks it (switching
+        // tabs live via onFocus), ▼ drops into the grid, ▲ stays put.
+        if (action === 'left' || action === 'right') moveFocus(topbarRoot()!, action);
+        else if (action === 'down') focusFirstCard();
         return;
       }
-
-      if (error) {
-        if (action === 'confirm') loadLibrary();
-        else if (action === 'up' || action === 'back') {
-          setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
-        }
-        return;
-      }
+      // In the grid: geometry within the rows. ▲ off the top row (no card above)
+      // returns to the active tab rather than jumping to an arbitrary one.
+      const rows = rowsRoot();
       if (!rows) return;
-
-      // ---- Rows ----
-      const row = list[f.row];
-      if (!row) {
-        // Empty tab: only route back to the bar.
-        if (action === 'up' || action === 'back') setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
-        return;
-      }
-      switch (action) {
-        case 'left':
-          setFocus({ ...f, col: Math.max(0, f.col - 1) });
-          break;
-        case 'right':
-          setFocus({ ...f, col: Math.min(row.items.length - 1, f.col + 1) });
-          break;
-        case 'up':
-          if (f.row === 0) {
-            gridReturn.current = f;
-            setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
-          } else {
-            const prev = list[f.row - 1];
-            setFocus({ zone: 'rows', row: f.row - 1, col: Math.min(f.col, prev.items.length - 1) });
-          }
-          break;
-        case 'down':
-          if (f.row + 1 < list.length) {
-            const next = list[f.row + 1];
-            setFocus({ zone: 'rows', row: f.row + 1, col: Math.min(f.col, next.items.length - 1) });
-          }
-          break;
-        case 'confirm': {
-          const item = row.items[f.col];
-          if (item) activateItem(item);
-          break;
-        }
-        case 'back':
-          gridReturn.current = f;
-          setFocus({ zone: 'topbar', row: 0, col: tabIndex(activeTabRef.current) });
-          break;
-        default:
-          break;
-      }
-
-      // Live tab preview while arrowing across the top bar.
-      function liveTab(col: number) {
-        if (col >= FIRST_TAB_INDEX && col < FIRST_TAB_INDEX + TABS.length) {
-          const id = TABS[col - FIRST_TAB_INDEX].id;
-          if (id !== activeTabRef.current) switchTab(id);
-        }
+      if (action === 'up') {
+        if (!moveFocus(rows, 'up')) focusActiveTab();
+      } else {
+        moveFocus(rows, action);
       }
     },
     [
-      rows,
-      error,
-      loadLibrary,
       searchOpen,
       settingsOpen,
       detailsItem,
       toggleTheme,
       cycleEnhance,
-      switchTab,
-      activateTop,
-      activateItem,
+      homeBack,
+      topbarRoot,
+      rowsRoot,
+      focusFirstCard,
+      focusActiveTab,
     ],
   );
   useTvInput(onAction);
 
-  // The item the hero previews: the focused card, or (on the top bar) the first
-  // card of the active tab.
-  const inRows = focus.zone === 'rows';
-  const heroItem: ContentItem | undefined = inRows
-    ? shelves[Math.min(focus.row, shelves.length - 1)]?.items[focus.col]
-    : shelves[0]?.items[0];
-  const preview = useHeroPreview(heroItem);
+  // Initial focus, and re-anchoring when returning from an overlay: land on the
+  // remembered home control, else the first card. Skipped while an overlay owns
+  // input so it can manage its own focus.
+  useEffect(() => {
+    if (overlayOpen) return;
+    if (error) {
+      rowsRoot()?.querySelector<HTMLElement>('.tv-retry')?.focus();
+      return;
+    }
+    if (!rows) return;
+    const el = lastHomeFocus.current;
+    if (el && el.isConnected) el.focus();
+    else focusFirstCard();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overlayOpen, rows === null, error]);
 
-  const topFocus = focus.zone === 'topbar' ? focus.col : null;
+  // Keep focus valid when the visible shelves change under us (library refresh
+  // or a live tab switch can replace/shrink them): if the focused card fell out
+  // of the document, drop to the first card so nav never dead-ends.
+  useEffect(() => {
+    if (overlayOpenRef.current || zone !== 'rows') return;
+    const active = document.activeElement as HTMLElement | null;
+    if (!active || active === document.body || !active.isConnected) {
+      requestAnimationFrame(() => {
+        if (!overlayOpenRef.current) focusFirstCard();
+      });
+    }
+  }, [shelves, zone, focusFirstCard]);
+
+  const preview = useHeroPreview(heroItem);
+  const inRows = zone === 'rows';
 
   let body: React.ReactNode;
   if (error) {
     body = (
       <div className="screen-message">
         <p>{ERROR_COPY[error]}</p>
-        <button className="tv-retry" autoFocus onClick={loadLibrary}>
+        <button className="tv-retry" onClick={loadLibrary} onFocus={(e) => onChromeFocus(e.currentTarget)}>
           Retry
         </button>
       </div>
@@ -428,9 +396,9 @@ export default function App() {
                 key={`${activeTab}-${i}-${shelf.title}`}
                 title={shelf.title}
                 items={shelf.items}
-                focused={inRows && i === focus.row ? focus.col : null}
-                jobs={jobs}
                 onPick={activateItem}
+                onFocusItem={onCardFocus}
+                jobs={jobs}
               />
             ))
           )}
@@ -440,19 +408,20 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app" ref={appRef}>
       <TopBar
         activeTab={activeTab}
-        focusIndex={topFocus}
         theme={theme}
         enabled={enabledTabs}
         onSearch={() => setSearchOpen(true)}
         onSelectTab={(id) => {
           switchTab(id);
-          setFocus({ zone: 'rows', row: 0, col: 0 });
+          requestAnimationFrame(focusFirstCard);
         }}
         onSettings={() => setSettingsOpen(true)}
         onToggleTheme={toggleTheme}
+        onFocusTab={onTabFocus}
+        onFocusChrome={onChromeFocus}
       />
 
       {body}
@@ -501,7 +470,6 @@ function useInstallJobs(onFinished: () => void) {
   onFinishedRef.current = onFinished;
   const runningIds = useRef<Set<string>>(new Set());
   const running = jobs.some((j) => j.status === 'running');
-  const idleStreak = useRef(0);
 
   const refresh = useCallback(() => {
     fetchInstalls()
@@ -510,30 +478,33 @@ function useInstallJobs(onFinished: () => void) {
           onFinishedRef.current();
         }
         runningIds.current = new Set(next.filter((j) => j.status === 'running').map((j) => j.id));
-        idleStreak.current = next.length > 0 ? 0 : idleStreak.current + 1;
         setJobs(next);
       })
       .catch(() => {});
   }, []);
 
   useEffect(() => {
-    let timer: number;
+    refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!running) return;
+    let timer: number | null = null;
     const tick = () => {
-      if (document.hidden) return;
       refresh();
-      const delay = running
-        ? 2000
-        : Math.min(120_000, 15_000 * Math.max(1, idleStreak.current));
-      timer = window.setTimeout(tick, delay);
+      timer = window.setTimeout(tick, 2000);
     };
     const onVisibilityChange = () => {
-      window.clearTimeout(timer);
-      if (!document.hidden) tick();
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+      if (!document.hidden) {
+        tick();
+      }
     };
-    tick();
+    if (!document.hidden) tick();
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
-      window.clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [running, refresh]);

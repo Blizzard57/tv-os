@@ -102,6 +102,7 @@ impl Source for YouTube {
             "YouTube",
             Some(item_id),
             Some(item_id),
+            Some(&launcher::PlayerMeta::new("YouTube")),
         )
     }
 }
@@ -381,7 +382,8 @@ fn parse_entries(json: &Value) -> Vec<ContentItem> {
                         // Deterministic thumbnail — no need to parse the list.
                         art: Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")),
                         action: Action::Play,
-                    })
+                        note: None,
+                                        })
                 })
                 .collect()
         })

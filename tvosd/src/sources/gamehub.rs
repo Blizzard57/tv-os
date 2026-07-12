@@ -165,6 +165,7 @@ fn shop_item(id: i64, name: String) -> ContentItem {
         title: name,
         art: Some(crate::sources::steam::art_url(id)),
         action: Action::None, // not playable — its page shows where to buy
+        note: None,
     }
 }
 
@@ -675,7 +676,8 @@ mod tests {
                 title: "Portal 2".into(),
                 art: None,
                 action: Action::Play,
-            }],
+                note: None,
+                        }],
         }];
         let mut owned_titles = HashSet::new();
         let mut owned_apps = HashSet::new();

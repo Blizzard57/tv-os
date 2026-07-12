@@ -10,6 +10,10 @@ pub enum Kind {
     Video,
     Movie,
     Series,
+    /// A live stream (a sports channel, a YouTube live broadcast). Rendered
+    /// under the "Live" tab. `Action::Play` = currently live and playable;
+    /// `Action::None` = a scheduled/upcoming event shown for information.
+    Live,
 }
 
 /// What pressing A/Enter on the item should do. Decided by the daemon so the
@@ -34,6 +38,11 @@ pub struct ContentItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub art: Option<String>,
     pub action: Action,
+    /// Optional subtitle override the card shows instead of the kind-derived
+    /// line — e.g. a live fixture's carrier ("On Star Sports 1"). Most items
+    /// leave this None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// One horizontal row on the home screen.

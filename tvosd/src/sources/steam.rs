@@ -379,7 +379,8 @@ fn owned_item(game: &Value) -> Option<ContentItem> {
         title: name,
         art: Some(art_url(appid)),
         action: Action::Play,
-    })
+        note: None,
+        })
 }
 
 /// Public Steam CDN poster art; the UI falls back to a placeholder on 404.
@@ -623,7 +624,8 @@ fn games_in(steamapps: &Path) -> Vec<ContentItem> {
             title: name,
             art: Some(art_url(&appid)),
             action: Action::Play,
-        })
+            note: None,
+                })
         .collect()
 }
 

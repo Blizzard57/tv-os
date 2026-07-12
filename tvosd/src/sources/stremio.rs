@@ -85,7 +85,7 @@ impl Source for Stremio {
 
     fn launch(&self, item_id: &str) -> Result<(), String> {
         let (kind, meta_id) = parse_id(item_id)?;
-        play_meta(kind, meta_id, Some(item_id))
+        play_meta(kind, meta_id, Some(item_id), None)
     }
 }
 
@@ -271,9 +271,15 @@ pub fn play_stream(
     stream: &Stream,
     item_id: Option<&str>,
     track_id: Option<&str>,
+    display_title: Option<&str>,
 ) -> Result<(), String> {
     let mode = settings::STORE.get().enhance;
     let hint = describe(stream);
+    let meta = display_title.map(|title| {
+        let mut meta = launcher::PlayerMeta::new(title);
+        meta.source = Some(stream.name.replace('\n', " "));
+        meta
+    });
     // Remember the source so Continue / the next episode can reuse it.
     if let Some(id) = item_id {
         if stream.kind != StreamKind::External {
@@ -284,7 +290,15 @@ pub fn play_stream(
     match stream.kind {
         StreamKind::Direct | StreamKind::Youtube => {
             let profile = upscale::resolve(mode, &hint);
-            launcher::play_video(&stream.url, &profile, mode, &hint, item_id, track_id)
+            launcher::play_video(
+                &stream.url,
+                &profile,
+                mode,
+                &hint,
+                item_id,
+                track_id,
+                meta.as_ref(),
+            )
         }
         StreamKind::External => launcher::open_external(&stream.url),
         StreamKind::Torrent => {
@@ -297,6 +311,7 @@ pub fn play_stream(
                 &hint,
                 item_id,
                 track_id,
+                meta.as_ref(),
             )
         }
     }
@@ -313,7 +328,12 @@ const AUTO_PICK_ATTEMPTS: usize = 5;
 /// source the show last used (so the next episode stays on the same addon /
 /// quality), then directly-playable streams, then torrents. `item_id` is the
 /// content id, used for resume and same-source memory.
-pub fn play_meta(kind: &str, id: &str, item_id: Option<&str>) -> Result<(), String> {
+pub fn play_meta(
+    kind: &str,
+    id: &str,
+    item_id: Option<&str>,
+    display_title: Option<&str>,
+) -> Result<(), String> {
     let mut found = streams(kind, id);
     if found.is_empty() && kind == "series" && !id.contains(':') {
         found = streams(kind, &format!("{id}:1:1"));
@@ -348,7 +368,7 @@ pub fn play_meta(kind: &str, id: &str, item_id: Option<&str>) -> Result<(), Stri
             stream.kind,
             stream.name.replace('\n', " ")
         );
-        match play_stream(stream, item_id, None) {
+        match play_stream(stream, item_id, None, display_title) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 crate::log_warn!("source failed, trying next: {e}");
@@ -656,13 +676,24 @@ fn parse_meta(json: &str) -> Option<Meta> {
         .unwrap_or_default();
     episodes.sort_by_key(|e| (e.season, e.episode));
 
+    let id = str_of("id").unwrap_or_default();
+    // The stylized title logo is what the details/hero panels want, but Cinemeta
+    // (and many meta addons) omit the `logo` field. Stremio itself falls back to
+    // metahub's title-treatment art keyed by IMDb id, so we do the same: the
+    // shell already degrades to a text title if this 404s for an obscure entry.
+    let logo = str_of("logo").or_else(|| {
+        let imdb = id.split(':').next().unwrap_or(&id);
+        imdb.starts_with("tt")
+            .then(|| format!("https://images.metahub.space/logo/medium/{imdb}/img"))
+    });
+
     Some(Meta {
-        id: str_of("id").unwrap_or_default(),
+        id: id.clone(),
         kind,
         title: str_of("name").unwrap_or_default(),
         poster: str_of("poster"),
         background: str_of("background"),
-        logo: str_of("logo"),
+        logo,
         description: str_of("description").or_else(|| str_of("overview")),
         release_info: str_of("releaseInfo").or_else(|| str_of("year")),
         rating: str_of("imdbRating"),
@@ -743,7 +774,8 @@ fn parse_catalog(json: &str) -> Vec<ContentItem> {
                 title: m.get("name")?.as_str()?.to_string(),
                 art: Some(art),
                 action: Action::Play,
-            })
+                note: None,
+                        })
         })
         .collect()
 }

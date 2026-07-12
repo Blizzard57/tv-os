@@ -4,3 +4,8 @@ shell/dist/
 .DS_Store
 dist/
 *.log
+# The mpv/live IPTV disk cache and the whole runtime browser/mpv/torrents
+# profile are machine-local state — never version them (they include multi-GB
+# torrent downloads and browser caches that blow past GitHub's file-size limit).
+.tvos/profile/
+.started

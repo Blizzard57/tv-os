@@ -57,7 +57,8 @@ impl Source for Gog {
                 title: game.title,
                 art: game.art,
                 action,
-            };
+                note: None,
+                        };
             if is_installed {
                 installed.push(item);
             } else {

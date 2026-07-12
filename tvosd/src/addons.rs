@@ -218,7 +218,19 @@ pub const MAX_URL_LEN: usize = 2048;
 /// NB: this is a best-effort check at request time; DNS can still be re-resolved
 /// to a different IP by reqwest (TOCTOU). Combined with the redirect cap it
 /// blocks the common metadata-endpoint / internal-service SSRF vectors.
-fn validate_fetch_url(url: &str) -> Result<(), String> {
+pub(crate) fn validate_fetch_url(url: &str) -> Result<(), String> {
+    validate_outbound_url(url, false)
+}
+
+/// Like [`validate_fetch_url`] but tolerates plain **http** to public hosts —
+/// IPTV playlists and live streams are very often served over http. Private,
+/// loopback and reserved addresses are still refused, so this is not an SSRF
+/// hole to internal services.
+pub(crate) fn validate_stream_url(url: &str) -> Result<(), String> {
+    validate_outbound_url(url, true)
+}
+
+fn validate_outbound_url(url: &str, allow_public_http: bool) -> Result<(), String> {
     if url.len() > MAX_URL_LEN {
         return Err("URL is too long".to_string());
     }
@@ -257,7 +269,7 @@ fn validate_fetch_url(url: &str) -> Result<(), String> {
     let all_loopback = addrs.iter().all(is_loopback);
     let is_dev_localhost = all_loopback && (is_localhost_name || host.parse::<IpAddr>().is_ok());
 
-    if scheme == "http" && !is_dev_localhost {
+    if scheme == "http" && !is_dev_localhost && !allow_public_http {
         return Err("plain http is only allowed for localhost; use https".to_string());
     }
     for ip in &addrs {
@@ -483,5 +495,20 @@ mod tests {
         assert!(validate_fetch_url("ftp://example.com/x").is_err());
         // Plain http to a public host is refused (https required).
         assert!(validate_fetch_url("http://example.com/manifest.json").is_err());
+    }
+
+    #[test]
+    fn stream_url_allows_public_http_still_blocks_private() {
+        // IPTV/live streams: public http is fine (IP literals — no DNS in test).
+        assert!(validate_stream_url("http://1.1.1.1/playlist.m3u8").is_ok());
+        assert!(validate_stream_url("https://1.1.1.1/playlist.m3u8").is_ok());
+        assert!(validate_stream_url("http://127.0.0.1:8000/a.m3u8").is_ok());
+        // But private/reserved ranges are still refused, even over http.
+        assert!(validate_stream_url("http://10.0.0.1/a.m3u8").is_err());
+        assert!(validate_stream_url("http://192.168.0.1/a.m3u8").is_err());
+        assert!(validate_stream_url("http://169.254.169.254/a").is_err());
+        assert!(validate_stream_url("ftp://1.1.1.1/a").is_err());
+        // The stricter fetch guard still rejects public http.
+        assert!(validate_fetch_url("http://1.1.1.1/a.m3u8").is_err());
     }
 }

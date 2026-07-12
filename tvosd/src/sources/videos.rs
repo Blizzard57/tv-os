@@ -39,6 +39,12 @@ impl Source for Videos {
             &target,
             Some(item_id),
             Some(item_id),
+            Some(&launcher::PlayerMeta::new(
+                Path::new(&target)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&target),
+            )),
         )
     }
 }
@@ -85,7 +91,8 @@ fn local_videos() -> Vec<ContentItem> {
                 title,
                 art: None,
                 action: Action::Play,
-            })
+                note: None,
+                        })
         })
         .collect();
     items.sort_by_key(|item| item.title.to_lowercase());

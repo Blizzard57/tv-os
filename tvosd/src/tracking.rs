@@ -69,12 +69,16 @@ fn client() -> Option<reqwest::blocking::Client> {
 // ---- Completion markers → scrobbles ----------------------------------------
 
 fn sweep_markers() {
+    sync_local_play_markers();
     let dir = config_dir().join("positions");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("played") {
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) != Some("done") {
             continue;
         }
@@ -90,8 +94,12 @@ fn sweep_markers() {
         // failure (offline, service 5xx) would otherwise lose the watch
         // forever. On failure, leave it for the next sweep to retry — unless
         // it's unscrobblable (a game/YouTube id), which we clear immediately.
+        let finished = finished_item(item_id);
         match scrobble(item_id) {
             Scrobble::Synced | Scrobble::NotApplicable => {
+                if let Some(item) = finished {
+                    recommend::LOG.record(item);
+                }
                 let _ = std::fs::remove_file(&path);
             }
             Scrobble::Failed => {
@@ -99,6 +107,63 @@ fn sweep_markers() {
             }
         }
     }
+}
+
+/// Fold mpv's local "played" markers into Continue without doing any network
+/// scrobbling. Called by `/api/library` too, so returning from the player can
+/// refresh the home row immediately instead of waiting for the tracker worker.
+pub fn sync_local_play_markers() {
+    let dir = config_dir().join("positions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("played") {
+            sweep_played_marker(&path);
+        }
+    }
+}
+
+/// Remember the shell's rich item metadata next to the resume position. mpv
+/// later writes a `.played` marker using this same content id, so a normal quit
+/// can still update Continue without guessing titles/art from the tracker id.
+pub fn remember_local_play(content_id: &str, item: &ContentItem) {
+    let path = local_item_file(content_id);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(json) = serde_json::to_string(item) else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, json) {
+        log_error!("local play metadata write failed: {e}");
+    }
+}
+
+fn sweep_played_marker(path: &std::path::Path) {
+    let content_id = std::fs::read_to_string(path).unwrap_or_default();
+    let content_id = content_id.trim();
+    if content_id.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Some(item) = local_item(content_id) {
+        recommend::LOG.record(item);
+    } else {
+        log_error!("local play marker without metadata: {content_id}");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+fn local_item(content_id: &str) -> Option<ContentItem> {
+    std::fs::read_to_string(local_item_file(content_id))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn local_item_file(content_id: &str) -> std::path::PathBuf {
+    crate::resume::position_file(content_id).with_extension("item.json")
 }
 
 /// Outcome of a scrobble attempt, deciding whether the marker can be removed.
@@ -171,6 +236,30 @@ fn title_for(item_id: &str) -> Option<String> {
         .into_iter()
         .find(|i| i.id == item_id || item_id.starts_with(&format!("{}:", i.id)))
         .map(|i| i.title)
+}
+
+/// A completed player marker is also a local watch event. That keeps Continue
+/// and the recommender ordered by what actually finished, not only by what was
+/// clicked. Episodes are recorded on their show id so the home row opens the
+/// show detail page and resumes the last episode source.
+fn finished_item(item_id: &str) -> Option<ContentItem> {
+    let watched = parse_watched(item_id)?;
+    let title = watched.title?;
+    let (id, kind) = if watched.episode.is_some() {
+        (format!("strm:series:{}", watched.imdb), Kind::Series)
+    } else if item_id.starts_with("tmdb:movie:") {
+        (item_id.to_string(), Kind::Movie)
+    } else {
+        (format!("strm:movie:{}", watched.imdb), Kind::Movie)
+    };
+    Some(ContentItem {
+        id,
+        kind,
+        title,
+        art: None,
+        action: Action::Play,
+        note: None,
+        })
 }
 
 fn scrobble(item_id: &str) -> Scrobble {
@@ -344,7 +433,8 @@ fn history_seed(entry: &Value) -> Option<ContentItem> {
         title,
         art: None,
         action: Action::Play,
-    })
+        note: None,
+        })
 }
 
 /// Starts the Trakt device flow: returns (user_code, verification_url) for

@@ -78,9 +78,22 @@ config_hdr() {
 }
 
 URL="http://127.0.0.1:8484"
-TVOSD="${TVOSD:-${TVOS_REPO_DIR:-}/tvosd/target/debug/tvosd}"
-[ -x "$TVOSD" ] || TVOSD="${HOME:-}/.local/bin/tvosd"
-[ -x "$TVOSD" ] || TVOSD="$(command -v tvosd || echo "$TVOSD")"
+if [ -z "${TVOSD:-}" ]; then
+  # update.sh/install.sh rebuild the release binary. Prefer that over a stale
+  # repo-local debug binary so launching tvos-app from the repo actually runs
+  # the code that was just installed. Developers can still force debug with:
+  #   TVOSD=/path/to/tvosd/target/debug/tvosd tvos-app
+  for candidate in \
+    "${TVOS_REPO_DIR:-}/tvosd/target/release/tvosd" \
+    "${HOME:-}/.local/bin/tvosd" \
+    "${TVOS_REPO_DIR:-}/tvosd/target/debug/tvosd"; do
+    if [ -x "$candidate" ]; then
+      TVOSD="$candidate"
+      break
+    fi
+  done
+  [ -n "${TVOSD:-}" ] || TVOSD="$(command -v tvosd || true)"
+fi
 if [ ! -x "$TVOSD" ]; then
   echo "TV OS: tvosd binary not found or not executable ($TVOSD)." >&2
   echo "Run ./install.sh, or set TVOSD=/path/to/tvosd." >&2
