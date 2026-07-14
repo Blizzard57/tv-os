@@ -43,7 +43,7 @@
 //!                       (or magnet) streams. This is the default.
 //!
 //! Each source can be individually enabled/disabled, and a reachability test
-//! probes every source and auto-disables the ones that don't answer. All of
+//! probes every source without changing the user's enabled choices. All of
 //! this — the manifest, the per-source enabled flag, and the last probe result
 //! — is persisted to ~/.config/tvos/cloudstream.json so it survives a restart.
 //!
@@ -190,35 +190,40 @@ impl ManifestStore {
             .collect()
     }
 
-    /// Adds (or replaces) a manifest from raw input: either an `http(s)` URL we
-    /// fetch, or the manifest JSON pasted directly (auto-detected by a leading
-    /// `{` / `[`). Existing per-source enable/reachability is preserved on
-    /// replace.
+    /// Adds (or replaces) a manifest from raw input:
+    ///   - a leading `{`/`[` → the manifest JSON pasted directly;
+    ///   - a local path or an `http(s)` URL ending in `.cs3` → a compiled
+    ///     CloudStream plugin, imported as a catalog (a repository-aggregator
+    ///     like MegaProvider expands into every plugin it lists);
+    ///   - any other `http(s)` URL → a manifest / repo JSON we fetch.
+    /// Existing per-source enable/reachability is preserved on replace.
     pub fn install(&self, input: &str) -> Result<Manifest, String> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            return Err("paste a manifest URL or its JSON".to_string());
+            return Err("paste a manifest URL, a .cs3 file path/URL, or its JSON".to_string());
         }
 
-        // A leading '{' or '[' is inline JSON; anything else is a URL to fetch.
-        let (source_url, value) = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let (source_url, manifest) = if trimmed.starts_with('{') || trimmed.starts_with('[') {
             let value: Value = serde_json::from_str(trimmed)
                 .map_err(|e| format!("pasted text is not valid JSON: {e}"))?;
-            (None, value)
+            (None, interpret_manifest(&value)?)
+        } else if is_local_path(trimmed) {
+            // A local .cs3 (or manifest JSON) file on this machine.
+            let bytes = read_local_file(trimmed)?;
+            (None, manifest_from_bytes(&bytes, &path_stem(trimmed))?)
         } else {
             if trimmed.len() > MAX_URL_LEN {
                 return Err("manifest URL is too long".to_string());
             }
-            // SSRF-guarded fetch (public hosts only; localhost for dev).
-            let text = addons::http_get(trimmed)?;
-            let value: Value =
-                serde_json::from_str(&text).map_err(|e| format!("manifest is not JSON: {e}"))?;
-            (Some(trimmed.to_string()), value)
+            // Fetch bytes (SSRF-guarded). A `.cs3`/zip is imported as a plugin
+            // catalog; anything else is treated as manifest/repo JSON.
+            let bytes = addons::http_get_bytes(trimmed, MAX_CS3_BYTES)?;
+            (
+                Some(trimmed.to_string()),
+                manifest_from_bytes(&bytes, &path_stem(trimmed))?,
+            )
         };
 
-        // Turn whatever we got into a source manifest, or explain why we can't
-        // (e.g. it's actually a CloudStream .cs3 plugin repo we can't execute).
-        let manifest = interpret_manifest(&value)?;
         let name = manifest
             .get("name")
             .and_then(|n| n.as_str())
@@ -288,8 +293,9 @@ impl ManifestStore {
     }
 
     /// Probes every source (of `id`, or all manifests when `None`) for
-    /// reachability, records the result + latency, and **auto-disables** the
-    /// ones that don't answer. Returns the refreshed summaries.
+    /// reachability and records the result + latency. It deliberately does not
+    /// disable unreachable sources: a temporary outage should not break a
+    /// previously working setup. Returns the refreshed summaries.
     pub fn test(&self, id: Option<&str>) -> Vec<Manifest> {
         // Collect probe targets (id, source name, probe url) under the lock,
         // then release it before doing any network work.
@@ -325,7 +331,8 @@ impl ManifestStore {
             handles.into_iter().filter_map(|h| h.join().ok()).collect()
         });
 
-        // Apply: record reachability + latency, auto-disable the unreachable.
+        // Apply: record reachability + latency. Do not auto-disable: probing is
+        // informational, and users can explicitly toggle a source off.
         let mut stored = self.stored.lock().unwrap_or_else(|e| e.into_inner());
         for (mid, name, latency) in results {
             if let Some(st) = stored
@@ -336,9 +343,6 @@ impl ManifestStore {
                 let reachable = latency.is_some();
                 st.reachable = Some(reachable);
                 st.latency_ms = latency;
-                if !reachable {
-                    st.enabled = false;
-                }
             }
         }
         let _ = self.persist(&stored);
@@ -639,6 +643,114 @@ fn import_cloudstream_repository(value: &Value) -> Result<Value, String> {
     }))
 }
 
+/// Whether input names a local file rather than a URL.
+fn is_local_path(s: &str) -> bool {
+    s.starts_with('/') || s.starts_with("~/") || s.starts_with("file://")
+}
+
+/// A short display name from a path or URL's final segment (sans `.cs3`).
+fn path_stem(s: &str) -> String {
+    s.trim_end_matches('/')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(s)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(s)
+        .trim_end_matches(".cs3")
+        .to_string()
+}
+
+/// Reads a local `.cs3`/manifest file the user pointed at. The API is
+/// loopback-only and auth-guarded, so a user-chosen local path is fine; the
+/// read is size-bounded.
+fn read_local_file(input: &str) -> Result<Vec<u8>, String> {
+    let raw = input.strip_prefix("file://").unwrap_or(input);
+    let path = match raw.strip_prefix("~/") {
+        Some(rest) => {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest)
+        }
+        None => std::path::PathBuf::from(raw),
+    };
+    let meta = std::fs::metadata(&path).map_err(|_| format!("no such file: {raw}"))?;
+    if !meta.is_file() {
+        return Err(format!("not a file: {raw}"));
+    }
+    if meta.len() > MAX_CS3_BYTES {
+        return Err("file is too large".to_string());
+    }
+    std::fs::read(&path).map_err(|e| format!("could not read {raw}: {e}"))
+}
+
+fn is_zip(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+}
+
+/// Turns fetched/read bytes into a source manifest: a `.cs3` (zip) is imported
+/// as a plugin catalog; anything else is parsed as manifest/repo JSON.
+fn manifest_from_bytes(bytes: &[u8], name_hint: &str) -> Result<Value, String> {
+    if is_zip(bytes) {
+        return import_cs3(bytes, name_hint);
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "this file is neither JSON nor a .cs3 plugin".to_string())?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| format!("not a manifest, repo, or .cs3: {e}"))?;
+    interpret_manifest(&value)
+}
+
+/// The plugin `name` from a `.cs3`'s manifest.json, if present.
+fn read_cs3_name(bytes: &[u8]) -> Option<String> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
+    let mut file = archive.by_name("manifest.json").ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .get("name")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Imports a compiled `.cs3` as a browsable plugin catalog by expanding the
+/// repositories it references. A repository-aggregator plugin (MegaProvider)
+/// expands into every plugin across every repo it lists; a plain stream
+/// provider `.cs3` references only its own site and has nothing to import here.
+fn import_cs3(bytes: &[u8], name_hint: &str) -> Result<Value, String> {
+    let name = read_cs3_name(bytes).unwrap_or_else(|| {
+        if name_hint.is_empty() {
+            "CloudStream plugins".to_string()
+        } else {
+            name_hint.to_string()
+        }
+    });
+    let mut import = CloudstreamImport::default();
+    import.ingest_cs3_bytes(bytes);
+    if import.sources.is_empty() {
+        let detail = import
+            .errors
+            .first()
+            .map(|e| format!(" Last error: {e}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "'{name}' is a compiled CloudStream plugin with no importable catalog.{detail} \
+             Only repository/aggregator plugins (like MegaProvider) expand into a browsable list; \
+             a stream-provider .cs3 is Android bytecode this daemon can't execute for playback."
+        ));
+    }
+    Ok(serde_json::json!({
+        "name": name,
+        "sources": import.sources,
+        "cloudstream": {
+            "repositories": import.repositories,
+            "pluginLists": import.plugin_lists,
+            "cs3Inspected": import.cs3_inspected,
+            "playback": "metadata-only; compiled .cs3 plugins require CloudStream's Android runtime",
+        }
+    }))
+}
+
 impl CloudstreamImport {
     fn collect_value(&mut self, value: &Value) {
         if self.sources.len() >= MAX_CLOUDSTREAM_PLUGINS {
@@ -757,8 +869,16 @@ impl CloudstreamImport {
                 return;
             }
         };
+        self.ingest_cs3_bytes(&bytes);
+    }
+
+    /// Expands a compiled `.cs3`'s bytes: pull the repository/index URLs it
+    /// references (e.g. MegaProvider's `repos-db.json`) and walk them into the
+    /// full plugin catalog. A stream-provider `.cs3` references only its own
+    /// site, so it yields nothing importable here (that's expected).
+    fn ingest_cs3_bytes(&mut self, bytes: &[u8]) {
         self.cs3_inspected += 1;
-        for discovered in extract_urls_from_cs3(&bytes) {
+        for discovered in extract_urls_from_cs3(bytes) {
             if looks_like_cloudstream_index_url(&discovered) {
                 self.collect_json_url(&discovered);
             }
@@ -1222,6 +1342,77 @@ mod tests {
             vec!["https://raw.githubusercontent.com/recloudstream/cs-repos/master/repos-db.json"]
         );
         assert!(looks_like_cloudstream_index_url(&urls[0]));
+    }
+
+    /// Builds a minimal `.cs3` (a zip of manifest.json + a fake classes.dex).
+    fn make_cs3(name: &str, dex: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let manifest = format!(r#"{{"pluginClassName":"x.Y","name":"{name}"}}"#);
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("manifest.json", opts).unwrap();
+            w.write_all(manifest.as_bytes()).unwrap();
+            w.start_file("classes.dex", opts).unwrap();
+            w.write_all(dex).unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn reads_cs3_name_and_detects_zip() {
+        let cs3 = make_cs3("MegaProvider", b"classes.dex payload");
+        assert!(is_zip(&cs3));
+        assert!(!is_zip(b"{\"name\":\"x\"}"));
+        assert_eq!(read_cs3_name(&cs3).as_deref(), Some("MegaProvider"));
+    }
+
+    #[test]
+    fn path_stem_names_the_file() {
+        assert_eq!(
+            path_stem("/home/u/Downloads/MegaProvider.cs3"),
+            "MegaProvider"
+        );
+        assert_eq!(
+            path_stem("https://host/a/Dailymotion.cs3?x=1"),
+            "Dailymotion"
+        );
+        assert_eq!(is_local_path("/home/u/x.cs3"), true);
+        assert_eq!(is_local_path("https://h/x.cs3"), false);
+    }
+
+    #[test]
+    fn provider_cs3_without_a_catalog_is_rejected_clearly() {
+        // A stream-provider .cs3 references only its own site — nothing to import.
+        let cs3 = make_cs3(
+            "SomeProvider",
+            b"classes.dex\0https://provider.site/embed/abc\0",
+        );
+        let err = import_cs3(&cs3, "SomeProvider").unwrap_err();
+        assert!(err.contains("no importable catalog"), "got: {err}");
+        // manifest_from_bytes routes a zip to import_cs3 (same error), and plain
+        // JSON bytes still parse as a manifest.
+        assert!(manifest_from_bytes(&cs3, "x").is_err());
+        let json = br#"{"name":"M","sources":[{"name":"S","movie":"https://h/{imdb}"}]}"#;
+        assert!(manifest_from_bytes(json, "x").is_ok());
+    }
+
+    #[test]
+    #[ignore = "hits the network (expands MegaProvider's repos-db.json catalog)"]
+    fn megaprovider_cs3_expands_into_a_catalog() {
+        let bytes = std::fs::read("/home/blizzard/Downloads/MegaProvider.cs3")
+            .expect("place MegaProvider.cs3 in ~/Downloads");
+        let manifest = import_cs3(&bytes, "MegaProvider").expect("should expand");
+        let defs = parse_sources(&manifest);
+        eprintln!(
+            "MegaProvider expanded to {} plugins across the catalog; e.g. {:?}",
+            defs.len(),
+            defs.iter().take(5).map(|d| &d.name).collect::<Vec<_>>()
+        );
+        assert!(defs.len() > 20, "expected many plugins from 26 repos");
+        assert!(defs.iter().all(|d| d.format == Format::Cs3));
     }
 
     #[test]

@@ -13,12 +13,14 @@ import {
   Episode,
   GameExtras,
   Meta,
+  PlaybackStatus,
   PreferenceAction,
   PreferenceStatus,
   ResumeInfo,
   Stream,
   fetchGameExtras,
   fetchMeta,
+  fetchPlayback,
   fetchPreference,
   fetchResume,
   fetchSimilar,
@@ -245,14 +247,16 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
       if (s.kind === 'external') {
         flash(`Opening ${s.name.split('\n')[0]}…`);
         playStream(s, playbackItem, trackId)
+          .then(waitForPlayback)
           .then(onPlayed)
           .catch((e) => flash(`Could not open: ${e.message}`));
         return;
       }
-      // The play request blocks until playback actually starts (or fails), so
-      // show a loading screen meanwhile — never a frozen-looking blank.
+      // The daemon acknowledges quickly, then reports the real start/fail state
+      // through /api/playback so slow torrents do not hit the shell timeout.
       setLoading({ label: s.name.split('\n')[0] || meta?.title || item.title, kind: 'stream' });
       playStream(s, playbackItem, trackId)
+        .then(waitForPlayback)
         .then(() => {
           setLoading(null);
           onPlayed();
@@ -272,6 +276,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     } else {
       setLoading({ label: item.title, kind: 'app' });
       launch(item)
+        .then(waitForPlayback)
         .then(() => {
           setLoading(null);
           onPlayed();
@@ -836,6 +841,22 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 }
 
 type LoadingKind = 'stream' | 'app';
+
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+async function waitForPlayback(initial: PlaybackStatus): Promise<void> {
+  let status = initial;
+  const deadline = Date.now() + 90_000;
+  while (status.state === 'starting' && Date.now() < deadline) {
+    await sleep(700);
+    status = await fetchPlayback(status.id);
+  }
+  if (status.state === 'started') return;
+  if (status.state === 'failed') {
+    throw new Error(status.message || 'Playback failed');
+  }
+  throw new Error('Playback is still starting. Check the player window or try another source.');
+}
 
 const LOADING_MESSAGES: Record<LoadingKind, string[]> = {
   stream: ['Finding the best source…', 'Connecting to peers…', 'Buffering — almost there…'],

@@ -116,7 +116,6 @@ export default function App() {
 
   const appRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<number>();
-  const didMountTabRefresh = useRef(false);
   // Overlays register their nav handlers here; App forwards input while open.
   const detailsActionRef = useRef<((a: NavAction) => void) | null>(null);
   const settingsActionRef = useRef<((a: NavAction) => void) | null>(null);
@@ -141,13 +140,6 @@ export default function App() {
   }, []);
 
   useEffect(loadLibrary, [loadLibrary]);
-  useEffect(() => {
-    if (!didMountTabRefresh.current) {
-      didMountTabRefresh.current = true;
-      return;
-    }
-    loadLibrary();
-  }, [activeTab, loadLibrary]);
   useEffect(() => applyTheme(theme), [theme]);
   useEffect(() => applyAccent(settings.accent), [settings.accent]);
   useEffect(() => {

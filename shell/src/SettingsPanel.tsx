@@ -740,12 +740,12 @@ function LiveSection({ form, update, reload, submit, openOsk }: SectionProps) {
     next.has(id) ? next.delete(id) : next.add(id);
     const value = [...next].join(', ');
     update({ live_sports: value });
-    submit({ live_sports: value }).catch(() => {});
+    submit({ live_sports: value }).catch((e) => setStatus(`Error: ${(e as Error).message}`));
   };
 
   const changeRegion = (next: string) => {
     update({ live_region: next });
-    submit({ live_region: next }).catch(() => {});
+    submit({ live_region: next }).catch((e) => setStatus(`Error: ${(e as Error).message}`));
   };
 
   const save = async () => {
@@ -1175,9 +1175,15 @@ function AddonSection({
   };
 
   const remove = async (addon: Addon) => {
-    await removeAddon(addon.url).catch(() => {});
-    await refresh();
-    reload();
+    setStatus(`Removing ${addon.name}…`);
+    try {
+      await removeAddon(addon.url);
+      await refresh();
+      reload();
+      setStatus(`Removed ${addon.name}`);
+    } catch (e) {
+      setStatus(`Error: ${(e as Error).message}`);
+    }
   };
 
   return (
@@ -1296,15 +1302,30 @@ function SourceManifestSection({
   };
 
   const remove = async (m: SourceManifest) => {
-    await removeSourceManifest(m.id).catch(() => {});
-    await refresh();
-    reload();
+    setBusy(true);
+    setStatus(`Removing “${m.name}”…`);
+    try {
+      await removeSourceManifest(m.id);
+      await refresh();
+      reload();
+      setStatus(`Removed “${m.name}”`);
+    } catch (e) {
+      setStatus(`Error: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const toggle = async (m: SourceManifest, name: string, enabled: boolean) => {
-    await toggleSource(m.id, name, enabled).catch(() => {});
-    await refresh();
-    reload();
+    setStatus(`${enabled ? 'Enabling' : 'Disabling'} ${name}…`);
+    try {
+      await toggleSource(m.id, name, enabled);
+      await refresh();
+      reload();
+      setStatus(`${enabled ? 'Enabled' : 'Disabled'} ${name}`);
+    } catch (e) {
+      setStatus(`Error: ${(e as Error).message}`);
+    }
   };
 
   const test = async (m?: SourceManifest) => {
@@ -1319,7 +1340,7 @@ function SourceManifestSection({
       const packages = flat.filter((s) => !s.playable && s.kind === 'cs3').length;
       setStatus(
         playable > 0
-          ? `Reachable: ${up} · unreachable (auto-disabled): ${down}`
+          ? `Reachable: ${up} · unreachable: ${down} — no sources were disabled`
           : packages > 0
             ? `Packages reachable: ${up} · unreachable: ${down}`
             : 'No testable CloudStream entries yet.'
@@ -1341,15 +1362,15 @@ function SourceManifestSection({
         Torrentio and WatchHub. CloudStream .cs3 repositories are imported and
         package-tested here; their scraper bytecode still needs a CloudStream runtime.
       </p>
-      <Field label="Manifest URL or JSON">
+      <Field label="Manifest URL, .cs3 file, or JSON">
         <textarea
           className="settings-textarea"
           value={text}
           onChange={(e) => setText(e.target.value)}
           onClick={() =>
-            openOsk('Manifest URL or JSON', text, false, setText)
+            openOsk('Manifest URL, .cs3 file, or JSON', text, false, setText)
           }
-          placeholder="https://…/sources.json  — or paste the manifest JSON"
+          placeholder="https://…/sources.json · a .cs3 URL or /path/to/MegaProvider.cs3 · or paste JSON"
           rows={3}
         />
       </Field>
@@ -1454,11 +1475,15 @@ function DisplaySection({
   const saved = () => setStatus('Saved — applies next time TV OS opens in fullscreen');
   const setResolution = (value: string) => {
     update({ display_resolution: value });
-    submit({ display_resolution: value }).then(saved).catch(() => {});
+    submit({ display_resolution: value })
+      .then(saved)
+      .catch((e) => setStatus(`Error: ${(e as Error).message}`));
   };
   const setHdr = (display_hdr: boolean) => {
     update({ display_hdr });
-    submit({ display_hdr }).then(saved).catch(() => {});
+    submit({ display_hdr })
+      .then(saved)
+      .catch((e) => setStatus(`Error: ${(e as Error).message}`));
   };
 
   return (

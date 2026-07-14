@@ -10,7 +10,7 @@
 //! The details page lists them all and lets the user pick; `play_meta` is the
 //! auto-pick fallback used when something is launched without opening details.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,10 +31,13 @@ const CATALOGS_PER_ADDON: usize = 2;
 /// auto-picker firing right after the UI) doesn't refetch every addon.
 const META_TTL: Duration = Duration::from_secs(300);
 const STREAM_TTL: Duration = Duration::from_secs(60);
+const TORRENT_FAILURE_TTL: Duration = Duration::from_secs(600);
 
 static META_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Option<Meta>)>>> =
     std::sync::LazyLock::new(Mutex::default);
 static STREAM_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Vec<Stream>)>>> =
+    std::sync::LazyLock::new(Mutex::default);
+static FAILED_TORRENTS: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
     std::sync::LazyLock::new(Mutex::default);
 
 /// Well-known, high-population public trackers added to every magnet so peers
@@ -280,14 +283,8 @@ pub fn play_stream(
         meta.source = Some(stream.name.replace('\n', " "));
         meta
     });
-    // Remember the source so Continue / the next episode can reuse it.
-    if let Some(id) = item_id {
-        if stream.kind != StreamKind::External {
-            crate::resume::STORE.remember(id, stream);
-        }
-    }
     let track_id = track_id.or(item_id);
-    match stream.kind {
+    let result = match stream.kind {
         StreamKind::Direct | StreamKind::Youtube => {
             let profile = upscale::resolve(mode, &hint);
             launcher::play_video(
@@ -314,7 +311,19 @@ pub fn play_stream(
                 meta.as_ref(),
             )
         }
+    };
+    match &result {
+        Ok(()) => {
+            if let Some(id) = item_id {
+                if stream.kind != StreamKind::External {
+                    crate::resume::STORE.remember(id, stream);
+                }
+            }
+            clear_failed_torrent(stream);
+        }
+        Err(_) => mark_failed_torrent(stream),
     }
+    result
 }
 
 /// How many sources the auto-picker will try before giving up. Each attempt now
@@ -350,15 +359,16 @@ pub fn play_meta(
     let matches_preferred = |s: &Stream| preferred.as_ref().is_some_and(|p| same_source(p, s));
 
     // Order: remembered source → directly-playable → torrents → externals.
-    let mut order: Vec<&Stream> = found.iter().filter(|s| matches_preferred(s)).collect();
+    let mut order: Vec<&Stream> = found
+        .iter()
+        .filter(|s| matches_preferred(s) && !torrent_recently_failed(s))
+        .collect();
     order.extend(found.iter().filter(|s| {
         !matches_preferred(s) && matches!(s.kind, StreamKind::Direct | StreamKind::Youtube)
     }));
-    order.extend(
-        found
-            .iter()
-            .filter(|s| !matches_preferred(s) && s.kind == StreamKind::Torrent),
-    );
+    order.extend(found.iter().filter(|s| {
+        !matches_preferred(s) && s.kind == StreamKind::Torrent && !torrent_recently_failed(s)
+    }));
     order.extend(found.iter().filter(|s| s.kind == StreamKind::External));
 
     let mut last_error = "No source could be started".to_string();
@@ -377,6 +387,49 @@ pub fn play_meta(
         }
     }
     Err(last_error)
+}
+
+fn torrent_key(stream: &Stream) -> Option<String> {
+    if stream.kind != StreamKind::Torrent {
+        return None;
+    }
+    stream
+        .url
+        .split('&')
+        .find_map(|part| {
+            part.strip_prefix("magnet:?xt=urn:btih:")
+                .or_else(|| part.strip_prefix("xt=urn:btih:"))
+        })
+        .map(|hash| hash.to_ascii_lowercase())
+}
+
+fn mark_failed_torrent(stream: &Stream) {
+    let Some(key) = torrent_key(stream) else {
+        return;
+    };
+    FAILED_TORRENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, Instant::now());
+}
+
+fn clear_failed_torrent(stream: &Stream) {
+    let Some(key) = torrent_key(stream) else {
+        return;
+    };
+    FAILED_TORRENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+}
+
+fn torrent_recently_failed(stream: &Stream) -> bool {
+    let Some(key) = torrent_key(stream) else {
+        return false;
+    };
+    let mut failed = FAILED_TORRENTS.lock().unwrap_or_else(|e| e.into_inner());
+    failed.retain(|_, at| at.elapsed() < TORRENT_FAILURE_TTL);
+    failed.contains_key(&key)
 }
 
 /// Whether two streams are "the same source" — same addon/release/quality,
@@ -488,17 +541,22 @@ fn build_magnet(info_hash: &str, name: &str, sources: Option<&Value>) -> String 
     if !clean_name.is_empty() {
         magnet.push_str(&format!("&dn={}", percent_encode(&clean_name)));
     }
+    let mut seen_trackers = HashSet::new();
     if let Some(list) = sources.and_then(|s| s.as_array()) {
         for tr in list
             .iter()
             .filter_map(|s| s.as_str())
             .filter_map(|s| s.strip_prefix("tracker:"))
         {
-            magnet.push_str(&format!("&tr={}", percent_encode(tr)));
+            if seen_trackers.insert(tr.to_ascii_lowercase()) {
+                magnet.push_str(&format!("&tr={}", percent_encode(tr)));
+            }
         }
     }
     for tr in DEFAULT_TRACKERS {
-        magnet.push_str(&format!("&tr={}", percent_encode(tr)));
+        if seen_trackers.insert(tr.to_ascii_lowercase()) {
+            magnet.push_str(&format!("&tr={}", percent_encode(tr)));
+        }
     }
     magnet
 }
@@ -542,22 +600,63 @@ fn stream_score(s: &Stream) -> f64 {
         StreamKind::External => 400_000_000.0,
         StreamKind::Torrent => {
             let seeders = parse_seeders(&text).unwrap_or(0);
-            // Tier first (viability), then resolution (4K on top), then seeders.
-            let tier = if seeders >= GOOD_SEEDERS {
+            // Tier first (viability), then practical streamability. Seeder
+            // counts are fuzzy and do not guarantee upload speed, so avoid
+            // auto-floating giant/DV 4K remuxes above lean 1080p releases.
+            let tier = if seeders >= GOOD_SEEDERS * 4 {
+                3.0
+            } else if seeders >= GOOD_SEEDERS {
                 2.0
             } else if seeders >= 1 {
                 1.0
             } else {
                 0.0
             };
-            // Tiny tiebreak: among otherwise-equal sources, the smaller file
-            // starts a touch faster (always < 1, so it never beats a seeder).
-            let smaller = parse_size_gb(&text)
-                .map(|gb| gb.min(100.0) / 1000.0)
+            let lower = text.to_lowercase();
+            let resolution = practical_resolution_score(height);
+            let size_penalty = parse_size_gb(&text)
+                .map(|gb| torrent_size_penalty(gb, height))
                 .unwrap_or(0.0);
-            tier * 100_000_000.0 + height * 1_000.0 + (seeders.min(9_999) as f64) - smaller
+            let hdr_penalty = if lower.contains(" dv ") || lower.contains(" dolby vision") {
+                650.0
+            } else if lower.contains("hdr") {
+                250.0
+            } else {
+                0.0
+            };
+            tier * 100_000_000.0 + resolution + (seeders.min(9_999) as f64)
+                - size_penalty
+                - hdr_penalty
         }
     }
+}
+
+fn practical_resolution_score(height: f64) -> f64 {
+    if height >= 2160.0 {
+        2_500.0
+    } else if height >= 1440.0 {
+        3_000.0
+    } else if height >= 1080.0 {
+        5_000.0
+    } else if height >= 720.0 {
+        3_750.0
+    } else if height >= 480.0 {
+        1_750.0
+    } else {
+        2_250.0
+    }
+}
+
+fn torrent_size_penalty(gb: f64, height: f64) -> f64 {
+    let soft_limit = if height >= 2160.0 {
+        18.0
+    } else if height >= 1080.0 {
+        8.0
+    } else {
+        4.0
+    };
+    let over = (gb - soft_limit).max(0.0);
+    over * 160.0 + gb.min(120.0) * 8.0
 }
 
 fn source_strength_bonus(lower_text: &str, lower_url: &str) -> f64 {
@@ -775,7 +874,7 @@ fn parse_catalog(json: &str) -> Vec<ContentItem> {
                 art: Some(art),
                 action: Action::Play,
                 note: None,
-                        })
+            })
         })
         .collect()
 }
@@ -853,7 +952,7 @@ mod tests {
                 "4k weak",
                 "Movie.2160p.REMUX 👤 1 💾 60 GB",
             ),
-            // a well-seeded 1080p
+            // a well-seeded, practical 1080p
             mk(StreamKind::Torrent, "1080p", "Movie.1080p 👤 200 💾 2.4 GB"),
             // a debrid/direct link — always wins
             mk(StreamKind::Direct, "direct", "Movie.1080p"),
@@ -861,16 +960,33 @@ mod tests {
             mk(StreamKind::External, "netflix", "Subscription"),
             // a low-but-ok-seeded 720p
             mk(StreamKind::Torrent, "720p", "Movie.720p 👤 6 💾 1.1 GB"),
-            // a well-seeded 4K — best for a capable system, should top the torrents
+            // a well-seeded but huge 4K release: visible, but not the safest auto-pick
             mk(StreamKind::Torrent, "4k", "Movie.2160p 👤 80 💾 40 GB"),
         ];
         rank(&mut streams);
         let order: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             order,
-            vec!["direct", "netflix", "4k", "1080p", "720p", "4k weak"]
+            vec!["direct", "netflix", "1080p", "4k", "720p", "4k weak"]
         );
         assert_eq!(streams[0].kind, StreamKind::Direct);
+    }
+
+    #[test]
+    fn torrent_failures_are_temporarily_quarantined() {
+        let stream = Stream {
+            kind: StreamKind::Torrent,
+            url: "magnet:?xt=urn:btih:QUARANTINE123&dn=x".into(),
+            name: "Torrentio\n1080p".into(),
+            title: String::new(),
+            file_idx: None,
+        };
+        clear_failed_torrent(&stream);
+        assert!(!torrent_recently_failed(&stream));
+        mark_failed_torrent(&stream);
+        assert!(torrent_recently_failed(&stream));
+        clear_failed_torrent(&stream);
+        assert!(!torrent_recently_failed(&stream));
     }
 
     #[test]

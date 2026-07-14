@@ -98,6 +98,30 @@ pub struct Settings {
     pub mal_token: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct SettingsPatch {
+    pub enhance: Option<EnhanceMode>,
+    pub steam_api_key: Option<String>,
+    pub steam_id: Option<String>,
+    pub tmdb_key: Option<String>,
+    pub accent: Option<String>,
+    pub display_resolution: Option<String>,
+    pub display_hdr: Option<bool>,
+    pub youtube_channels: Option<String>,
+    pub youtube_account: Option<bool>,
+    pub game_region: Option<String>,
+    pub live_region: Option<String>,
+    pub live_sports: Option<String>,
+    pub iptv_playlists: Option<String>,
+    pub epg_urls: Option<String>,
+    pub trakt_client_id: Option<String>,
+    pub trakt_client_secret: Option<String>,
+    pub trakt_token: Option<String>,
+    pub anilist_token: Option<String>,
+    pub mal_client_id: Option<String>,
+    pub mal_token: Option<String>,
+}
+
 impl Settings {
     /// References to the write-only secret fields, in a fixed order shared with
     /// [`Self::secret_fields_mut`] and [`SECRET_FIELD_NAMES`] so the redacted
@@ -152,6 +176,55 @@ impl Settings {
             &mut self.anilist_token,
             &mut self.mal_token,
         ]
+    }
+}
+
+impl SettingsPatch {
+    fn apply_to(self, mut current: Settings) -> Settings {
+        macro_rules! set_plain {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    current.$field = value;
+                }
+            };
+        }
+        macro_rules! set_secret {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    if !value.is_empty() {
+                        current.$field = value;
+                    }
+                }
+            };
+        }
+
+        if let Some(value) = self.enhance {
+            current.enhance = value;
+        }
+        set_secret!(steam_api_key);
+        set_plain!(steam_id);
+        set_secret!(tmdb_key);
+        set_plain!(accent);
+        set_plain!(display_resolution);
+        if let Some(value) = self.display_hdr {
+            current.display_hdr = value;
+        }
+        set_plain!(youtube_channels);
+        if let Some(value) = self.youtube_account {
+            current.youtube_account = value;
+        }
+        set_plain!(game_region);
+        set_plain!(live_region);
+        set_plain!(live_sports);
+        set_plain!(iptv_playlists);
+        set_plain!(epg_urls);
+        set_plain!(trakt_client_id);
+        set_secret!(trakt_client_secret);
+        set_secret!(trakt_token);
+        set_secret!(anilist_token);
+        set_plain!(mal_client_id);
+        set_secret!(mal_token);
+        current
     }
 }
 
@@ -238,6 +311,11 @@ impl SettingsStore {
         write_private(&self.path, json.as_bytes()).map_err(|e| e.to_string())?;
         *self.current.lock().unwrap_or_else(|e| e.into_inner()) = settings;
         Ok(())
+    }
+
+    pub fn patch(&self, patch: SettingsPatch) -> Result<(), String> {
+        let current = self.get();
+        self.set(patch.apply_to(current))
     }
 }
 
@@ -377,5 +455,29 @@ mod tests {
         assert_eq!(v["anilist_token_set"], false);
         // Non-secret fields pass through untouched.
         assert_eq!(v["steam_id"], "76561");
+    }
+
+    #[test]
+    fn patch_only_changes_present_fields() {
+        let current = Settings {
+            enhance: EnhanceMode::Quality,
+            steam_api_key: "SECRET".to_string(),
+            steam_id: "76561".to_string(),
+            live_region: "GB".to_string(),
+            display_hdr: true,
+            ..Default::default()
+        };
+        let patch = SettingsPatch {
+            steam_id: Some("newid".to_string()),
+            steam_api_key: Some(String::new()),
+            display_hdr: Some(false),
+            ..Default::default()
+        };
+        let next = patch.apply_to(current);
+        assert_eq!(next.enhance, EnhanceMode::Quality);
+        assert_eq!(next.steam_api_key, "SECRET");
+        assert_eq!(next.steam_id, "newid");
+        assert_eq!(next.live_region, "GB");
+        assert!(!next.display_hdr);
     }
 }

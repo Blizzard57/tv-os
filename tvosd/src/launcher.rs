@@ -103,12 +103,13 @@ pub fn play_video(
     meta: Option<&PlayerMeta>,
 ) -> Result<(), String> {
     let start = item_id.and_then(crate::resume::position);
-    let home = prepare_mpv_home(profile, mode, hint, start, meta);
+    let home = prepare_mpv_home(profile, mode, hint, start, meta, false);
     let mut player = PLAYER.lock().unwrap_or_else(|e| e.into_inner());
     stop(&mut player);
 
     crate::log_info!("playing [{}] mpv {target}", profile.name);
     let _ = std::fs::remove_file(home.join(".started")); // fresh start signal
+    let _ = std::fs::remove_file(home.join(".health"));
     let _ = std::fs::remove_file(home.join("mpv.log"));
     // In the TV/gamescope session, run mpv through gamescope so it lands in the
     // compositor's fullscreen output like everything else; degrades to a direct
@@ -164,7 +165,7 @@ pub fn play_torrent(
          or configure the addon with a debrid service (e.g. RealDebrid) for direct streams.",
     )?;
     let start = item_id.and_then(crate::resume::position);
-    let home = prepare_mpv_home(profile, mode, hint, start, meta);
+    let home = prepare_mpv_home(profile, mode, hint, start, meta, true);
     let mut player = PLAYER.lock().unwrap_or_else(|e| e.into_inner());
     stop(&mut player);
 
@@ -211,10 +212,15 @@ pub fn play_torrent(
     // old code discarded webtorrent's stdout entirely, which is exactly why
     // failures looked like "nothing happened".
     crate::log_info!(
-        "playing [torrent {}] via {webtorrent}: {magnet}",
-        profile.name
+        "playing [torrent {}] via {webtorrent}: {} file_idx={:?} port={} cache={}",
+        profile.name,
+        magnet_summary(magnet),
+        file_idx,
+        port,
+        cache.display()
     );
     let _ = std::fs::remove_file(home.join(".started")); // fresh start signal
+    let _ = std::fs::remove_file(home.join(".health"));
     let _ = std::fs::remove_file(home.join("mpv.log"));
     cmd.env("MPV_HOME", &home)
         .env("PATH", torrent_child_path(&home))
@@ -230,6 +236,7 @@ pub fn play_torrent(
         cmd.env("TVOS_CONTENT_ID", id);
         cmd.env("TVOS_ITEM_ID", track_id.unwrap_or(id));
     }
+    cmd.env("TVOS_TORRENT_PLAYBACK", "1");
     let child = cmd
         .spawn()
         .map_err(|e| format!("could not start torrent stream: {e}"))?;
@@ -272,7 +279,7 @@ fn confirm_started(
                 || text.contains("Failed to recognize file format")
             {
                 break Err(if torrent {
-                    "Could not open this torrent's file — the source looks broken. Try another source."
+                    "Could not open this torrent's file — the source looks broken or not enough data arrived. Try another source."
                 } else {
                     "Could not open the stream — the source may be down. Try another source."
                 });
@@ -289,7 +296,7 @@ fn confirm_started(
 
         if Instant::now() >= deadline {
             break Err(if torrent {
-                "Torrent stream did not start in time — it may have too few seeders. Pick another quality, or add a debrid service (e.g. RealDebrid) in the addon for instant, reliable streams."
+                "Torrent stream did not start in time. Pick a smaller/better-seeded quality, or use a debrid service for instant streams."
             } else {
                 "Stream didn't start in time — the source may be slow or unavailable. Try another source."
             });
@@ -363,11 +370,12 @@ fn prepare_mpv_home(
     hint: &str,
     start: Option<f64>,
     meta: Option<&PlayerMeta>,
+    torrent: bool,
 ) -> PathBuf {
     let home = mpv_home();
     provision_player(&home);
     write_mpv_wrapper(&home);
-    write_mpv_conf(&home, profile, start, meta);
+    write_mpv_conf(&home, profile, start, meta, torrent);
     write_upscalers(&home, mode, hint);
     write_player_meta(&home, meta);
     home
@@ -377,7 +385,7 @@ fn prepare_mpv_home(
 /// bundled files are rewritten *once*. Otherwise the daemon never touches them
 /// again, so anything you edit under MPV_HOME stays edited (no rebuild needed),
 /// and deleting a file restores its shipped default on the next launch.
-const PLAYER_VERSION: &str = "15";
+const PLAYER_VERSION: &str = "16";
 
 /// Installs the bundled player into MPV_HOME so the TV overlay is always the UI.
 /// The entire player tree (TV overlay, thumbfast, our scripts and config) is
@@ -442,8 +450,29 @@ fn extract_dir(dir: &Dir, dest: &Path, refresh: bool) {
 
 /// Writes the per-playback mpv.conf: base 10-foot settings, the TV overlay,
 /// gamepad input on, a real log file, and the resolved Enhance shader chain.
-fn write_mpv_conf(home: &Path, profile: &Profile, start: Option<f64>, meta: Option<&PlayerMeta>) {
+fn write_mpv_conf(
+    home: &Path,
+    profile: &Profile,
+    start: Option<f64>,
+    meta: Option<&PlayerMeta>,
+    torrent: bool,
+) {
     let mut conf = String::from(BASE_MPV_CONF);
+    if torrent {
+        conf.push_str(
+            "\
+# Torrent playback needs a larger reservoir than ordinary HTTP streams. Start
+# and rebuffer more deeply on underrun without delaying launch acknowledgement.
+cache-pause=yes
+cache-pause-wait=8
+cache-secs=180
+demuxer-max-bytes=768MiB
+demuxer-max-back-bytes=128MiB
+demuxer-readahead-secs=90
+stream-buffer-size=4MiB
+",
+        );
+    }
     conf.push_str("osc=no\n"); // TV OS draws its own remote-first overlay
     conf.push_str("osd-bar=no\n");
     conf.push_str("load-scripts=no\n");
@@ -554,6 +583,22 @@ fn write_mpv_wrapper(home: &Path) {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn magnet_summary(magnet: &str) -> String {
+    let hash = magnet
+        .split('&')
+        .find_map(|part| {
+            part.strip_prefix("magnet:?xt=urn:btih:")
+                .or_else(|| part.strip_prefix("xt=urn:btih:"))
+        })
+        .unwrap_or("unknown");
+    let dn = magnet
+        .split('&')
+        .find_map(|part| part.strip_prefix("dn="))
+        .unwrap_or("torrent");
+    let trackers = magnet.matches("&tr=").count();
+    format!("btih={hash} dn={dn} trackers={trackers}")
 }
 
 /// One validated `key` / `key="value"` config line, or None if the key or value
@@ -706,6 +751,21 @@ fn resolve_mpv_absolute() -> String {
     find_on_path(&resolved).unwrap_or(resolved)
 }
 
+pub fn helper_status() -> serde_json::Value {
+    let mpv = resolve_mpv_absolute();
+    let webtorrent = resolve_webtorrent();
+    serde_json::json!({
+        "mpv": {
+            "available": std::path::Path::new(&mpv).is_absolute() || command_exists(&mpv),
+            "path": mpv,
+        },
+        "webtorrent": {
+            "available": webtorrent.is_some(),
+            "path": webtorrent,
+        },
+    })
+}
+
 fn find_on_path(program: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -848,6 +908,7 @@ mod tests {
             "Movie.1080p.mkv",
             None,
             Some(&PlayerMeta::new("Movie \"Night\"\nFinale")),
+            false,
         );
 
         let conf = std::fs::read_to_string(dir.join("mpv.conf")).unwrap();

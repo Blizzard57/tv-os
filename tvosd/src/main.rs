@@ -16,7 +16,7 @@
 //!   POST /api/source-manifests → {"text": url-or-json} add (URL or pasted JSON)
 //!   POST /api/source-manifests/remove → {"id": …} uninstall
 //!   POST /api/source-manifests/toggle → {"id","name","enabled"} enable a source
-//!   POST /api/source-manifests/test → {"id"?} probe + auto-disable unreachable
+//!   POST /api/source-manifests/test → {"id"?} probe reachability
 
 mod addons;
 mod embed;
@@ -36,7 +36,9 @@ mod tracking;
 mod upscale;
 mod util;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,7 +46,7 @@ use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::services::{ServeDir, ServeFile};
 
 /// Default listen address; `TVOS_LISTEN` overrides it (dev/test instances).
@@ -116,12 +118,119 @@ async fn require_auth(
 struct App {
     sources: sources::Registry,
     installs: install::InstallManager,
+    started_at: Instant,
+    playback: PlaybackStore,
     /// Recent snapshot of the source rows, so search-as-you-type doesn't
     /// re-shell out to store CLIs on every keystroke.
     library_cache: Mutex<Option<(Instant, Vec<model::Row>)>>,
 }
 
 const LIBRARY_CACHE_TTL: Duration = Duration::from_secs(120);
+const PLAYBACK_HISTORY_LIMIT: usize = 20;
+
+#[derive(Default)]
+struct PlaybackStore {
+    next_id: AtomicU64,
+    jobs: Mutex<HashMap<String, PlaybackStatus>>,
+}
+
+#[derive(Serialize, Clone)]
+struct PlaybackStatus {
+    id: String,
+    state: PlaybackState,
+    label: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    elapsed_ms: u128,
+}
+
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum PlaybackState {
+    Starting,
+    Started,
+    Failed,
+}
+
+struct PlaybackJob {
+    id: String,
+    started_at: Instant,
+}
+
+impl PlaybackStore {
+    fn start(&self, kind: &str, label: impl Into<String>) -> (PlaybackJob, PlaybackStatus) {
+        let id = format!("pb-{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let now = Instant::now();
+        let status = PlaybackStatus {
+            id: id.clone(),
+            state: PlaybackState::Starting,
+            label: label.into(),
+            kind: kind.to_string(),
+            message: None,
+            elapsed_ms: 0,
+        };
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), status.clone());
+        (
+            PlaybackJob {
+                id,
+                started_at: now,
+            },
+            status,
+        )
+    }
+
+    fn finish(&self, job: PlaybackJob, result: Result<(), String>) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = jobs.get_mut(&job.id) {
+            status.state = if result.is_ok() {
+                PlaybackState::Started
+            } else {
+                PlaybackState::Failed
+            };
+            status.elapsed_ms = job.started_at.elapsed().as_millis();
+            status.message = result.err().map(|e| util::scrub_secrets(&e));
+        }
+        prune_playback_jobs(&mut jobs);
+    }
+
+    fn get(&self, id: &str) -> Option<PlaybackStatus> {
+        let mut status = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()?;
+        if status.state == PlaybackState::Starting {
+            status.elapsed_ms = 0;
+        }
+        Some(status)
+    }
+
+    fn recent_failures(&self) -> Vec<PlaybackStatus> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|s| s.state == PlaybackState::Failed)
+            .cloned()
+            .collect()
+    }
+}
+
+fn prune_playback_jobs(jobs: &mut HashMap<String, PlaybackStatus>) {
+    if jobs.len() <= PLAYBACK_HISTORY_LIMIT {
+        return;
+    }
+    let mut ids: Vec<String> = jobs.keys().cloned().collect();
+    ids.sort();
+    for id in ids.into_iter().take(jobs.len() - PLAYBACK_HISTORY_LIMIT) {
+        jobs.remove(&id);
+    }
+}
 
 impl App {
     /// Fresh source rows; also refreshes the search cache.
@@ -154,6 +263,8 @@ async fn main() {
     let app = Arc::new(App {
         sources: sources::Registry::detect(),
         installs: install::InstallManager::default(),
+        started_at: Instant::now(),
+        playback: PlaybackStore::default(),
         library_cache: Mutex::new(None),
     });
     // Warm the library cache so the first search/home-load doesn't wait on
@@ -174,6 +285,7 @@ async fn main() {
 
     let router = Router::new()
         .route("/api/library", get(get_library))
+        .route("/api/health", get(get_health))
         .route("/api/sources", get(get_sources))
         .route("/api/launch", post(post_launch))
         .route("/api/install", post(post_install))
@@ -214,6 +326,7 @@ async fn main() {
         .route("/api/mal/callback", get(get_mal_callback))
         .route("/api/resume", get(get_resume))
         .route("/api/play", post(post_play))
+        .route("/api/playback", get(get_playback))
         .route("/api/open", post(post_open))
         .route("/api/version", get(get_version))
         .fallback_service(serve_ui)
@@ -502,6 +615,23 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
     Json(rows)
 }
 
+async fn get_health(State(app): State<Shared>) -> Json<serde_json::Value> {
+    let library_cache_age_ms = app
+        .library_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(at, _)| at.elapsed().as_millis());
+    Json(serde_json::json!({
+        "ready": true,
+        "uptime_ms": app.started_at.elapsed().as_millis(),
+        "library_cache_age_ms": library_cache_age_ms,
+        "sources": app.sources.sources(),
+        "helpers": launcher::helper_status(),
+        "recent_playback_failures": app.playback.recent_failures(),
+    }))
+}
+
 #[derive(Deserialize)]
 struct PreferenceRequest {
     action: String,
@@ -535,7 +665,7 @@ async fn post_preference(
             art: req.item.art,
             action: req.item.action.unwrap_or(model::Action::Play),
             note: None,
-                },
+        },
         action,
     );
     Ok(Json(status))
@@ -574,12 +704,12 @@ async fn get_settings() -> Json<serde_json::Value> {
 }
 
 async fn put_settings(
-    Json(new): Json<settings::Settings>,
+    Json(patch): Json<settings::SettingsPatch>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     settings::STORE
-        .set(new)
+        .patch(patch)
         .map(|()| StatusCode::NO_CONTENT)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, util::scrub_secrets(&e)))
 }
 
 /// Tests the saved Steam credentials; runs on a blocking thread (network).
@@ -686,7 +816,7 @@ struct SourceTest {
     id: Option<String>,
 }
 
-/// Probes each source for reachability and auto-disables the unreachable ones —
+/// Probes each source for reachability without changing enabled choices —
 /// network work, so it runs on a blocking thread.
 async fn post_source_manifest_test(
     Json(req): Json<SourceTest>,
@@ -711,33 +841,31 @@ struct ItemRequest {
 async fn post_launch(
     State(app): State<Shared>,
     Json(req): Json<ItemRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<(StatusCode, Json<PlaybackStatus>), (StatusCode, String)> {
     let id = req.id.clone();
-    let result = tokio::task::spawn_blocking(move || app.sources.launch(&id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if let Err(e) = &result {
-        log_error!(
-            "launch '{}' failed: {}",
-            req.id,
-            util::scrub_secrets(&e.to_string())
-        );
-    }
-    if result.is_ok() {
-        if let (Some(title), Some(kind)) = (req.title, req.kind) {
-            recommend::LOG.record(model::ContentItem {
-                id: req.id,
-                kind,
-                title,
-                art: req.art,
-                action: model::Action::Play,
-                note: None,
-                        });
+    let label = req.title.clone().unwrap_or_else(|| id.clone());
+    let (job, status) = app.playback.start("launch", label);
+    let worker_app = app.clone();
+    std::thread::spawn(move || {
+        let result = worker_app.sources.launch(&id);
+        if let Err(e) = &result {
+            log_error!("launch '{}' failed: {}", id, util::scrub_secrets(e));
         }
-    }
-    result
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+        if result.is_ok() {
+            if let (Some(title), Some(kind)) = (req.title, req.kind) {
+                recommend::LOG.record(model::ContentItem {
+                    id: req.id,
+                    kind,
+                    title,
+                    art: req.art,
+                    action: model::Action::Play,
+                    note: None,
+                });
+            }
+        }
+        worker_app.playback.finish(job, result);
+    });
+    Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
 async fn post_install(
@@ -1102,7 +1230,10 @@ struct ItemMeta {
 }
 
 /// Plays a stream the user picked on the details page.
-async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCode, String)> {
+async fn post_play(
+    State(app): State<Shared>,
+    Json(req): Json<PlayRequest>,
+) -> Result<(StatusCode, Json<PlaybackStatus>), (StatusCode, String)> {
     if req.stream.url.len() > MAX_URL_LEN {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1113,62 +1244,92 @@ async fn post_play(Json(req): Json<PlayRequest>) -> Result<StatusCode, (StatusCo
     let item_id = req.item.as_ref().map(|i| i.id.clone());
     let display_title = req.item.as_ref().map(|i| i.title.clone());
     let track_id = req.track_id.clone();
-    if let (Some(item), Some(content_id)) = (req.item.as_ref(), item_id.as_deref()) {
-        tracking::remember_local_play(
-            content_id,
-            &model::ContentItem {
-                id: item.id.clone(),
-                kind: item.kind,
-                title: item.title.clone(),
-                art: item.art.clone(),
-                action: model::Action::Play,
-                note: None,
-                        },
-        );
-    }
-    let result = tokio::task::spawn_blocking(move || {
-        let first = sources::stremio::play_stream(
+    let label = display_title
+        .clone()
+        .or_else(|| req.item.as_ref().map(|i| i.title.clone()))
+        .unwrap_or_else(|| stream.name.replace('\n', " "));
+    let (job, status) = app.playback.start("stream", label);
+    let worker_app = app.clone();
+    std::thread::spawn(move || {
+        let result = sources::stremio::play_stream(
             &stream,
             item_id.as_deref(),
             track_id.as_deref(),
             display_title.as_deref(),
         );
-        if first.is_ok() || stream.kind == media::StreamKind::External {
-            return first;
-        }
-        let Some(item_id) = item_id.as_deref() else {
-            return first;
+        let result = if result.is_ok() || stream.kind == media::StreamKind::External {
+            result
+        } else if let Some(item_id) = item_id.as_deref() {
+            match sources::resolve_video(item_id) {
+                Ok((kind, sid)) => {
+                    if let Err(e) = &result {
+                        log_warn!(
+                            "selected/resume source failed, refreshing sources for {}: {}",
+                            item_id,
+                            util::scrub_secrets(e)
+                        );
+                    }
+                    sources::stremio::play_meta(
+                        &kind,
+                        &sid,
+                        Some(item_id),
+                        display_title.as_deref(),
+                    )
+                    .or(result)
+                }
+                Err(_) => result,
+            }
+        } else {
+            result
         };
-        let Ok((kind, sid)) = sources::resolve_video(item_id) else {
-            return first;
-        };
-        log_warn!(
-            "selected/resume source failed, refreshing sources for {}: {}",
-            item_id,
-            util::scrub_secrets(first.as_ref().err().unwrap())
-        );
-        sources::stremio::play_meta(&kind, &sid, Some(item_id), display_title.as_deref()).or(first)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if let Err(e) = &result {
-        log_error!("play failed: {}", util::scrub_secrets(&e.to_string()));
-    }
-    if result.is_ok() {
-        if let Some(item) = req.item {
-            recommend::LOG.record(model::ContentItem {
-                id: item.id,
-                kind: item.kind,
-                title: item.title,
-                art: item.art,
-                action: model::Action::Play,
-                note: None,
-                        });
+        if let Err(e) = &result {
+            log_error!("play failed: {}", util::scrub_secrets(e));
         }
-    }
-    result
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+        if result.is_ok() {
+            if let (Some(item), Some(content_id)) = (req.item.as_ref(), item_id.as_deref()) {
+                tracking::remember_local_play(
+                    content_id,
+                    &model::ContentItem {
+                        id: item.id.clone(),
+                        kind: item.kind,
+                        title: item.title.clone(),
+                        art: item.art.clone(),
+                        action: model::Action::Play,
+                        note: None,
+                    },
+                );
+            }
+        }
+        if result.is_ok() {
+            if let Some(item) = req.item {
+                recommend::LOG.record(model::ContentItem {
+                    id: item.id,
+                    kind: item.kind,
+                    title: item.title,
+                    art: item.art,
+                    action: model::Action::Play,
+                    note: None,
+                });
+            }
+        }
+        worker_app.playback.finish(job, result);
+    });
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+#[derive(Deserialize)]
+struct PlaybackQuery {
+    id: String,
+}
+
+async fn get_playback(
+    State(app): State<Shared>,
+    Query(q): Query<PlaybackQuery>,
+) -> Result<Json<PlaybackStatus>, (StatusCode, String)> {
+    app.playback
+        .get(&q.id)
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "no such playback".to_string()))
 }
 
 /// Opens a URL with the system handler — an addon's /configure page, etc.
@@ -1201,4 +1362,43 @@ fn validate_web_url(url: &str) -> Result<(), (StatusCode, String)> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_store_tracks_started_and_failed_jobs() {
+        let store = PlaybackStore::default();
+        let (job, status) = store.start("stream", "Movie");
+        assert_eq!(status.state, PlaybackState::Starting);
+        assert_eq!(
+            store.get(&status.id).unwrap().state,
+            PlaybackState::Starting
+        );
+
+        store.finish(job, Ok(()));
+        let done = store.get(&status.id).unwrap();
+        assert_eq!(done.state, PlaybackState::Started);
+        assert!(done.message.is_none());
+
+        let (job, failed) = store.start("launch", "Game");
+        store.finish(job, Err("bad token=secret".to_string()));
+        let failed = store.get(&failed.id).unwrap();
+        assert_eq!(failed.state, PlaybackState::Failed);
+        assert!(failed.message.unwrap().contains("token=<redacted>"));
+        assert_eq!(store.recent_failures().len(), 1);
+    }
+
+    #[test]
+    fn validate_web_url_only_accepts_http_urls() {
+        assert!(validate_web_url("https://example.com/configure").is_ok());
+        assert!(validate_web_url("http://example.com").is_ok());
+        assert!(validate_web_url("file:///etc/passwd").is_err());
+        assert!(validate_web_url("steam://run/620").is_err());
+        assert!(
+            validate_web_url(&format!("https://example.com/{}", "x".repeat(MAX_URL_LEN))).is_err()
+        );
+    }
 }

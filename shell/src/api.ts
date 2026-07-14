@@ -15,16 +15,23 @@ export class ApiError extends Error {
   }
 }
 
-const REQUEST_TIMEOUT_MS = 9000;
+const SHORT_TIMEOUT_MS = 5000;
+const DEFAULT_TIMEOUT_MS = 9000;
+const MEDIUM_TIMEOUT_MS = 15000;
+const LONG_TIMEOUT_MS = 45000;
 
 /** fetch with an AbortSignal.timeout() and typed errors. Callers get an
  *  {@link ApiError} on timeout/offline/network trouble instead of a raw
  *  DOMException, so the UI can show couch-friendly copy. */
-async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+async function apiFetch(
+  input: string,
+  init?: RequestInit,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<Response> {
   try {
     return await fetch(input, {
       ...init,
-      signal: init?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: init?.signal ?? AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
@@ -108,6 +115,27 @@ export interface InstallJob {
   detail: string;
 }
 
+export interface PlaybackStatus {
+  id: string;
+  state: 'starting' | 'started' | 'failed';
+  label: string;
+  kind: string;
+  message?: string;
+  elapsed_ms: number;
+}
+
+export interface HealthStatus {
+  ready: boolean;
+  uptime_ms: number;
+  library_cache_age_ms?: number | null;
+  sources: SourceStatus[];
+  helpers: {
+    mpv?: { available: boolean; path?: string };
+    webtorrent?: { available: boolean; path?: string | null };
+  };
+  recent_playback_failures: PlaybackStatus[];
+}
+
 // Video upscaling preference — mirrors tvosd/src/settings.rs.
 export type EnhanceMode = 'auto' | 'quality' | 'performance' | 'off';
 
@@ -175,7 +203,7 @@ export interface GameExtras {
 }
 
 export async function fetchGameExtras(id: string): Promise<GameExtras> {
-  const res = await apiFetch(`/api/game?id=${encodeURIComponent(id)}`);
+  const res = await apiFetch(`/api/game?id=${encodeURIComponent(id)}`, undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) return {};
   return res.json();
 }
@@ -190,14 +218,14 @@ export interface TrackingStatus {
 }
 
 export async function fetchTrackingStatus(): Promise<TrackingStatus> {
-  const res = await apiFetch('/api/tracking/status');
+  const res = await apiFetch('/api/tracking/status', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`tracking status failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
 /** Starts the Trakt device flow → show the code, the daemon polls. */
 export async function traktConnect(): Promise<{ user_code: string; url: string }> {
-  const res = await apiFetch('/api/trakt/connect', { method: 'POST' });
+  const res = await apiFetch('/api/trakt/connect', { method: 'POST' }, MEDIUM_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
   return res.json();
 }
@@ -209,7 +237,7 @@ export interface YouTubeStatus {
 
 /** Whether the signed-in YouTube feeds are reachable (cookie check). */
 export async function fetchYouTubeStatus(): Promise<YouTubeStatus> {
-  const res = await apiFetch('/api/youtube/status');
+  const res = await apiFetch('/api/youtube/status', undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`youtube status failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
@@ -222,7 +250,7 @@ export interface LiveStatus {
 
 /** Live-tab state: region, EPG guide load + resolved matches (for the panel). */
 export async function fetchLiveStatus(): Promise<LiveStatus> {
-  const res = await apiFetch('/api/live/status');
+  const res = await apiFetch('/api/live/status', undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`live status failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
@@ -246,13 +274,13 @@ export interface Addon {
 
 /** Daemon version — the quick "am I on the latest build?" check. */
 export async function fetchVersion(): Promise<string> {
-  const res = await apiFetch('/api/version');
+  const res = await apiFetch('/api/version', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`version request failed: ${res.status}`, 'http', res.status);
   return (await res.json()).version as string;
 }
 
 export async function fetchSettings(): Promise<Settings> {
-  const res = await apiFetch('/api/settings');
+  const res = await apiFetch('/api/settings', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`settings request failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
@@ -265,7 +293,7 @@ export async function saveSettings(settings: Partial<Settings>): Promise<void> {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(settings),
-  });
+  }, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
 }
 
@@ -276,7 +304,7 @@ export async function fetchLibrary(): Promise<Row[]> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
-      const res = await apiFetch('/api/library');
+      const res = await apiFetch('/api/library', undefined, LONG_TIMEOUT_MS);
       if (!res.ok) throw new ApiError(`library request failed: ${res.status}`, 'http', res.status);
       return res.json();
     } catch (e) {
@@ -292,8 +320,14 @@ export async function fetchLibrary(): Promise<Row[]> {
 }
 
 export async function fetchInstalls(): Promise<InstallJob[]> {
-  const res = await apiFetch('/api/installs');
+  const res = await apiFetch('/api/installs', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`installs request failed: ${res.status}`, 'http', res.status);
+  return res.json();
+}
+
+export async function fetchHealth(): Promise<HealthStatus> {
+  const res = await apiFetch('/api/health', undefined, SHORT_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`health request failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
@@ -302,14 +336,24 @@ async function post(path: string, body: unknown): Promise<void> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  }, DEFAULT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+}
+
+async function postJson<T>(path: string, body: unknown, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+  const res = await apiFetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+  return res.json();
 }
 
 // Launch sends the whole item so the daemon can record it for the
 // recommender's Continue / Recommended rows.
-export const launch = (item: ContentItem) =>
-  post('/api/launch', { id: item.id, title: item.title, kind: item.kind, art: item.art });
+export const launch = (item: ContentItem): Promise<PlaybackStatus> =>
+  postJson('/api/launch', { id: item.id, title: item.title, kind: item.kind, art: item.art }, SHORT_TIMEOUT_MS);
 export const startInstall = (id: string) => post('/api/install', { id });
 
 export interface SourceStatus {
@@ -318,19 +362,19 @@ export interface SourceStatus {
 }
 
 export async function fetchSources(): Promise<SourceStatus[]> {
-  const res = await apiFetch('/api/sources');
+  const res = await apiFetch('/api/sources', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`sources request failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
 export async function fetchSteamStatus(): Promise<SteamStatus> {
-  const res = await apiFetch('/api/steam/status');
+  const res = await apiFetch('/api/steam/status', undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`steam status failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
 export async function fetchAddons(): Promise<Addon[]> {
-  const res = await apiFetch('/api/addons');
+  const res = await apiFetch('/api/addons', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`addons request failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
@@ -360,7 +404,7 @@ export interface SourceManifest {
 }
 
 export async function fetchSourceManifests(): Promise<SourceManifest[]> {
-  const res = await apiFetch('/api/source-manifests');
+  const res = await apiFetch('/api/source-manifests', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok)
     throw new ApiError(`source manifests request failed: ${res.status}`, 'http', res.status);
   return res.json();
@@ -373,7 +417,7 @@ export async function addSourceManifest(text: string): Promise<SourceManifest> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }),
-  });
+  }, LONG_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
   return res.json();
 }
@@ -384,32 +428,32 @@ export const removeSourceManifest = (id: string) =>
 export const toggleSource = (id: string, name: string, enabled: boolean) =>
   post('/api/source-manifests/toggle', { id, name, enabled });
 
-// Probes each source for reachability, auto-disabling the unreachable ones.
+// Probes each source for reachability without changing enabled choices.
 // Returns the refreshed summaries (all manifests when `id` is omitted).
 export async function testSourceManifests(id?: string): Promise<SourceManifest[]> {
   const res = await apiFetch('/api/source-manifests/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(id ? { id } : {}),
-  });
+  }, LONG_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
   return res.json();
 }
 
 export async function fetchMeta(id: string, signal?: AbortSignal): Promise<Meta> {
-  const res = await apiFetch(`/api/meta?id=${encodeURIComponent(id)}`, { signal });
+  const res = await apiFetch(`/api/meta?id=${encodeURIComponent(id)}`, { signal }, MEDIUM_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`meta request failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
 export async function fetchStreams(id: string): Promise<Stream[]> {
-  const res = await apiFetch(`/api/streams?id=${encodeURIComponent(id)}`);
+  const res = await apiFetch(`/api/streams?id=${encodeURIComponent(id)}`, undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`streams request failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
 export async function searchCatalog(query: string): Promise<ContentItem[]> {
-  const res = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`);
+  const res = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`, undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`search failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
@@ -417,14 +461,14 @@ export async function searchCatalog(query: string): Promise<ContentItem[]> {
 /** Deep search over the entire space — titles, actors, plot keywords, genre/
  *  region idioms ("k drama"), library, addons — as titled sections. */
 export async function searchDeep(query: string): Promise<Row[]> {
-  const res = await apiFetch(`/api/search/deep?q=${encodeURIComponent(query)}`);
+  const res = await apiFetch(`/api/search/deep?q=${encodeURIComponent(query)}`, undefined, LONG_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`deep search failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
 /** "More like this" for a details page item (empty when nothing is known). */
 export async function fetchSimilar(id: string): Promise<ContentItem[]> {
-  const res = await apiFetch(`/api/similar?id=${encodeURIComponent(id)}`);
+  const res = await apiFetch(`/api/similar?id=${encodeURIComponent(id)}`, undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) return [];
   return res.json();
 }
@@ -439,7 +483,7 @@ export interface PreferenceStatus {
 export type PreferenceAction = 'watchlist' | 'watched' | 'like' | 'dislike';
 
 export async function fetchPreference(id: string): Promise<PreferenceStatus> {
-  const res = await apiFetch(`/api/preference?id=${encodeURIComponent(id)}`);
+  const res = await apiFetch(`/api/preference?id=${encodeURIComponent(id)}`, undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) return { watchlist: false, watched: false, liked: false, disliked: false };
   return res.json();
 }
@@ -455,7 +499,7 @@ export async function setPreference(
       action,
       item: { id: item.id, title: item.title, kind: item.kind, art: item.art, action: item.action },
     }),
-  });
+  }, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
   return res.json();
 }
@@ -467,7 +511,7 @@ export interface ResumeInfo {
 
 /** The source + position to continue an item from, or null if none saved. */
 export async function fetchResume(id: string): Promise<ResumeInfo | null> {
-  const res = await apiFetch(`/api/resume?id=${encodeURIComponent(id)}`);
+  const res = await apiFetch(`/api/resume?id=${encodeURIComponent(id)}`, undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) return null;
   return res.json();
 }
@@ -476,9 +520,15 @@ export async function fetchResume(id: string): Promise<ResumeInfo | null> {
 // recommender (with the title/art shown on the details page). `trackId` is the
 // precise watched id — for an episode it carries season:episode so Trakt/
 // AniList scrobble the exact episode, while `item` (the show) drives Continue.
-export const playStream = (stream: Stream, item: ContentItem, trackId?: string) =>
-  post('/api/play', {
+export const playStream = (stream: Stream, item: ContentItem, trackId?: string): Promise<PlaybackStatus> =>
+  postJson('/api/play', {
     stream,
     item: { id: item.id, title: item.title, kind: item.kind, art: item.art },
     track_id: trackId ?? item.id,
-  });
+  }, SHORT_TIMEOUT_MS);
+
+export async function fetchPlayback(id: string): Promise<PlaybackStatus> {
+  const res = await apiFetch(`/api/playback?id=${encodeURIComponent(id)}`, undefined, SHORT_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`playback status failed: ${res.status}`, 'http', res.status);
+  return res.json();
+}
