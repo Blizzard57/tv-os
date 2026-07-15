@@ -10,7 +10,7 @@
 
 import { ContentItem, Kind, Row } from './api';
 
-export type TabId = 'foryou' | 'live' | 'movies' | 'shows' | 'library';
+export type TabId = 'foryou' | 'live' | 'movies' | 'shows' | 'creators' | 'games' | 'library';
 
 export interface TabDef {
   id: TabId;
@@ -22,6 +22,8 @@ export const TABS: TabDef[] = [
   { id: 'live', label: 'Live' },
   { id: 'movies', label: 'Movies' },
   { id: 'shows', label: 'Shows' },
+  { id: 'creators', label: 'Creators' },
+  { id: 'games', label: 'Games' },
   { id: 'library', label: 'Library' },
 ];
 
@@ -32,10 +34,11 @@ const LIBRARY_ROW = /^(continue|ready to|watchlist|my )/i;
 
 // Which item kinds belong under each simple content tab. "Library" is
 // special-cased in rowsForTab.
-const TAB_KINDS: Record<'live' | 'movies' | 'shows', Kind[]> = {
+const TAB_KINDS: Record<'live' | 'movies' | 'shows' | 'games', Kind[]> = {
   live: ['live'],
   movies: ['movie'],
   shows: ['series'],
+  games: ['game'],
 };
 
 /** The rows to show for a tab. "For you" is every row as-is. Movies/Shows
@@ -43,8 +46,12 @@ const TAB_KINDS: Record<'live' | 'movies' | 'shows', Kind[]> = {
  *  gathers your Continue/owned rows plus every game row. Item order is always
  *  preserved. */
 export function rowsForTab(tab: TabId, rows: Row[]): Row[] {
-  if (tab === 'foryou') return rows;
+  if (tab === 'foryou') return rows.filter((row) => row.purpose !== 'creators');
   if (tab === 'library') return libraryRows(rows);
+  if (tab === 'creators') {
+    return rows.map((row) => ({ ...row, items: row.items.filter((i) => i.domain === 'youtube' || i.domain === 'twitch' || i.id.startsWith('yt:') || i.id.startsWith('twitch:')) }))
+      .filter((row) => row.items.length > 0);
+  }
   const kinds = TAB_KINDS[tab];
   const out: Row[] = [];
   for (const row of rows) {

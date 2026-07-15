@@ -31,7 +31,7 @@ const HISTORY_TTL: Duration = Duration::from_secs(600);
 static TRAKT_PENDING: Mutex<Option<String>> = Mutex::new(None); // user_code shown in UI
 /// MAL PKCE verifier for the in-flight login (single user, single flow).
 static MAL_VERIFIER: Mutex<Option<String>> = Mutex::new(None);
-/// Cached Trakt watch history (seeds for recommendations), refetched lazily.
+/// Cached Trakt + AniList watch history (seeds for recommendations).
 static HISTORY_CACHE: LazyLock<Mutex<Option<(Instant, Vec<ContentItem>)>>> =
     LazyLock::new(|| Mutex::new(None));
 
@@ -259,7 +259,7 @@ fn finished_item(item_id: &str) -> Option<ContentItem> {
         art: None,
         action: Action::Play,
         note: None,
-        })
+    })
 }
 
 fn scrobble(item_id: &str) -> Scrobble {
@@ -342,16 +342,13 @@ fn trakt_history(client_id: &str, token: &str, w: &Watched) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
-/// Your recent Trakt watch history as recommendation seeds — so the "For You"
+/// Recent Trakt and AniList history as recommendation seeds — so the "For You"
 /// row is personal to what you've *actually watched anywhere*, not just what
 /// you played on this box. Episodes seed on their show (recommendations are
 /// per-title). Trakt hands us TMDB ids, so the recommender resolves these with
 /// no extra lookups. Empty (and free) when Trakt isn't connected. Cached.
 pub fn watched_history(limit: usize) -> Vec<ContentItem> {
     let s = settings::STORE.get();
-    if s.trakt_token.is_empty() || s.trakt_client_id.is_empty() {
-        return Vec::new();
-    }
     if let Some((at, items)) = HISTORY_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -361,18 +358,118 @@ pub fn watched_history(limit: usize) -> Vec<ContentItem> {
             return items.clone();
         }
     }
-    let items = match fetch_trakt_history(&s.trakt_client_id, &s.trakt_token, limit) {
-        Ok(items) => items,
-        Err(e) => {
-            log_error!("trakt history fetch failed: {e}");
-            Vec::new()
+    let mut items = Vec::new();
+    if !s.trakt_token.is_empty() && !s.trakt_client_id.is_empty() {
+        match fetch_trakt_history(&s.trakt_client_id, &s.trakt_token, limit) {
+            Ok(found) => items.extend(found),
+            Err(e) => log_error!("trakt history fetch failed: {e}"),
         }
-    };
+    }
+    if !s.anilist_token.is_empty() {
+        match fetch_anilist_history(&s.anilist_token, limit) {
+            Ok(found) => items.extend(found),
+            Err(e) => log_error!("anilist history fetch failed: {e}"),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|item| seen.insert(item.id.clone()));
+    items.truncate(limit);
     if !items.is_empty() {
         *HISTORY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((Instant::now(), items.clone()));
     }
     items
+}
+
+fn fetch_anilist_history(token: &str, limit: usize) -> Result<Vec<ContentItem>, String> {
+    let http = client().ok_or("no http client")?;
+    let viewer: Value = http
+        .post("https://graphql.anilist.co")
+        .bearer_auth(token)
+        .json(&json!({"query": "query { Viewer { id } }"}))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let user_id = viewer
+        .pointer("/data/Viewer/id")
+        .and_then(Value::as_i64)
+        .ok_or("AniList viewer id missing")?;
+    let query = r#"
+      query ($userId: Int) {
+        MediaListCollection(userId: $userId, type: ANIME,
+          status_in: [CURRENT, COMPLETED, REPEATING]) {
+          lists { entries { progress score repeat updatedAt status
+            media { id title { english romaji } coverImage { extraLarge } }
+          } }
+        }
+      }"#;
+    let value: Value = http
+        .post("https://graphql.anilist.co")
+        .bearer_auth(token)
+        .json(&json!({"query": query, "variables": {"userId": user_id}}))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let mut entries: Vec<&Value> = value
+        .pointer("/data/MediaListCollection/lists")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|l| {
+            l.get("entries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .collect();
+    entries.sort_by_key(|e| {
+        std::cmp::Reverse(e.get("updatedAt").and_then(Value::as_i64).unwrap_or(0))
+    });
+    Ok(entries
+        .into_iter()
+        .take(limit)
+        .filter_map(|entry| {
+            let media = entry.get("media")?;
+            let id = media.get("id")?.as_i64()?;
+            let title = media
+                .pointer("/title/english")
+                .or_else(|| media.pointer("/title/romaji"))?
+                .as_str()?;
+            let item = ContentItem {
+                id: format!("anilist:{id}"),
+                kind: Kind::Series,
+                title: title.to_string(),
+                art: media
+                    .pointer("/coverImage/extraLarge")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                action: Action::None,
+                note: Some(format!(
+                    "AniList · {} episodes",
+                    entry.get("progress").and_then(Value::as_i64).unwrap_or(0)
+                )),
+            };
+            let status = entry
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|s| s.to_ascii_lowercase());
+            crate::profile::STORE.import_history(
+                "anilist",
+                &id.to_string(),
+                &item,
+                entry.get("progress").and_then(Value::as_f64),
+                entry.get("score").and_then(Value::as_f64),
+                status.as_deref(),
+                entry.get("updatedAt").and_then(Value::as_i64),
+                entry,
+            );
+            Some(item)
+        })
+        .collect())
 }
 
 fn fetch_trakt_history(
@@ -397,6 +494,16 @@ fn fetch_trakt_history(
     for entry in entries {
         if let Some(item) = history_seed(entry) {
             if seen.insert(item.id.clone()) {
+                crate::profile::STORE.import_history(
+                    "trakt",
+                    &item.id,
+                    &item,
+                    None,
+                    entry.get("rating").and_then(Value::as_f64),
+                    Some("completed"),
+                    None,
+                    entry,
+                );
                 items.push(item);
             }
         }
@@ -434,7 +541,7 @@ fn history_seed(entry: &Value) -> Option<ContentItem> {
         art: None,
         action: Action::Play,
         note: None,
-        })
+    })
 }
 
 /// Starts the Trakt device flow: returns (user_code, verification_url) for

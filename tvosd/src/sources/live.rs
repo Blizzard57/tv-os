@@ -50,7 +50,7 @@ const TSDB_KEY: &str = "123";
 /// status field doesn't say (cricket runs long).
 const LIVE_WINDOW_SECS: i64 = 6 * 3600;
 /// Only surface fixtures starting within this horizon.
-const UPCOMING_HORIZON_SECS: i64 = 48 * 3600;
+const UPCOMING_HORIZON_SECS: i64 = 7 * 24 * 3600;
 
 // ---- curated seed ----
 
@@ -131,7 +131,6 @@ enum PlayTarget {
 #[derive(Clone)]
 struct MatchInfo {
     target: PlayTarget,
-    channel: String, // carrier's display name, for the card's "On …" note
 }
 
 /// One XMLTV programme, times as epoch seconds.
@@ -178,8 +177,8 @@ impl Source for Live {
             HashMap::new()
         };
 
-        // Provider 2: IPTV — public catalog (sport-classified) + the user's own
-        // playlists (shown in full).
+        // Provider 2: user-owned IPTV/EPG. The broad public catalog is opt-in
+        // for development only; the default product never guesses at rights.
         let iptv = collect_iptv(&cfg);
 
         // The fixture→channel resolver (carriers = the channels we just gathered
@@ -217,7 +216,11 @@ pub fn status() -> serde_json::Value {
     } else {
         cfg.live_region.trim().to_ascii_uppercase()
     };
-    let count = |s: &str| s.split([',', '\n', ' ']).filter(|x| !x.trim().is_empty()).count();
+    let count = |s: &str| {
+        s.split([',', '\n', ' '])
+            .filter(|x| !x.trim().is_empty())
+            .count()
+    };
     let epg_srcs: Vec<String> = cfg
         .epg_urls
         .split([',', '\n', ' '])
@@ -235,11 +238,13 @@ pub fn status() -> serde_json::Value {
             loaded += 1;
         }
     }
-    let matches = MATCH_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let matches = MATCH_REGISTRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
 
     let detail = if epg_srcs.is_empty() {
-        "No program guide set — add an XMLTV EPG URL to make live matches playable"
-            .to_string()
+        "No program guide set — add an XMLTV EPG URL to make live matches playable".to_string()
     } else if programmes > 0 {
         format!("Guide loaded — {programmes} programmes, {matches} live matches resolved")
     } else {
@@ -258,8 +263,8 @@ pub fn status() -> serde_json::Value {
     })
 }
 
-/// The sports to show, in order: the user's followed list (matched against seed
-/// ids/labels) or, when empty, every seeded sport.
+/// The sports to show, in order. An empty selection intentionally produces an
+/// empty guide: Live is personal, never a dump of every available channel.
 fn followed_sports(raw: &str) -> Vec<SportSeed> {
     let wanted: Vec<String> = raw
         .split([',', ' ', '\n'])
@@ -267,7 +272,7 @@ fn followed_sports(raw: &str) -> Vec<SportSeed> {
         .filter(|s| !s.is_empty())
         .collect();
     if wanted.is_empty() {
-        return SEED.clone();
+        return Vec::new();
     }
     SEED.iter()
         .filter(|s| {
@@ -294,9 +299,7 @@ fn probe_youtube_live(sports: &[SportSeed]) -> HashMap<String, Vec<ContentItem>>
                     .map(move |handle| (sport.id.clone(), handle.clone()))
             })
             .take(MAX_YT_PROBES)
-            .map(|(sport_id, handle)| {
-                scope.spawn(move || (sport_id, probe_handle(&handle)))
-            })
+            .map(|(sport_id, handle)| scope.spawn(move || (sport_id, probe_handle(&handle))))
             .collect();
         let mut out: HashMap<String, Vec<ContentItem>> = HashMap::new();
         for job in jobs {
@@ -354,7 +357,7 @@ fn fetch_live(handle: &str) -> Option<ContentItem> {
         art: Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")),
         action: Action::Play,
         note: None,
-        })
+    })
 }
 
 fn launch_youtube(video: &str) -> Result<(), String> {
@@ -502,7 +505,10 @@ fn collect_api_channels(region_cc: &str) -> Vec<Channel> {
     for st in api_json::<ApiStream>("streams.json") {
         let Some(cid) = st.channel else { continue };
         let Some(c) = meta.get(&cid) else { continue };
-        let is_sports = c.categories.iter().any(|k| k.eq_ignore_ascii_case("sports"));
+        let is_sports = c
+            .categories
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case("sports"));
         let in_region = c.country.as_deref() == Some(region_cc);
         if !is_sports && !in_region {
             continue;
@@ -540,7 +546,12 @@ fn disk_cache_path(region_cc: &str) -> std::path::PathBuf {
 
 fn read_disk_cache(region_cc: &str) -> Option<Vec<Channel>> {
     let path = disk_cache_path(region_cc);
-    let age = std::fs::metadata(&path).ok()?.modified().ok()?.elapsed().ok()?;
+    let age = std::fs::metadata(&path)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()?;
     if age > IPTV_TTL {
         return None;
     }
@@ -588,7 +599,8 @@ impl Acc {
         if is_dead_stream(&ch.url) || !self.seen_urls.insert(ch.url.clone()) {
             return;
         }
-        let bucket = classify_sport(&ch).or_else(|| is_sports_channel(&ch).then(|| "general".to_string()));
+        let bucket =
+            classify_sport(&ch).or_else(|| is_sports_channel(&ch).then(|| "general".to_string()));
         if let Some(sport) = bucket {
             let row = self.by_sport.entry(sport).or_default();
             if self.sport_total < MAX_IPTV_TOTAL && row.len() < MAX_ITEMS_PER_ROW {
@@ -631,10 +643,14 @@ fn collect_iptv(cfg: &settings::Settings) -> IptvContent {
             acc.add(ch, true);
         }
     }
-    // Then the iptv-org catalog: world sports + the region's live TV.
-    for ch in collect_api_channels(&region) {
-        let groupable = ch.region;
-        acc.add(ch, groupable);
+    // The old broad public catalog is deliberately off by default. It can be
+    // enabled for development/testing, but production resolves only official
+    // creator streams and providers the user explicitly configured.
+    if matches!(std::env::var("TVOS_ENABLE_PUBLIC_IPTV").as_deref(), Ok("1")) {
+        for ch in collect_api_channels(&region) {
+            let groupable = ch.region;
+            acc.add(ch, groupable);
+        }
     }
 
     // Region channels first within each sport.
@@ -668,7 +684,9 @@ fn group_label(ch: &Channel) -> String {
 }
 
 fn is_sports_channel(ch: &Channel) -> bool {
-    ch.categories.iter().any(|c| c.eq_ignore_ascii_case("sports"))
+    ch.categories
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("sports"))
         || contains_word(&ch.group.to_lowercase(), "sport")
         || contains_word(&ch.group.to_lowercase(), "sports")
 }
@@ -737,7 +755,10 @@ fn decode_body(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
         use std::io::Read;
         let mut out = String::new();
-        if flate2::read::GzDecoder::new(bytes).read_to_string(&mut out).is_ok() {
+        if flate2::read::GzDecoder::new(bytes)
+            .read_to_string(&mut out)
+            .is_ok()
+        {
             return out;
         }
     }
@@ -759,7 +780,11 @@ fn parse_m3u(text: &str) -> Vec<Channel> {
     for line in text.lines() {
         let line = line.trim();
         if let Some(info) = line.strip_prefix("#EXTINF:") {
-            name = info.rsplit_once(',').map(|(_, n)| n.trim()).unwrap_or("").to_string();
+            name = info
+                .rsplit_once(',')
+                .map(|(_, n)| n.trim())
+                .unwrap_or("")
+                .to_string();
             group = attr(info, "group-title").unwrap_or_default();
             logo = attr(info, "tvg-logo").filter(|s| s.starts_with("http"));
             // Feed suffixes ("Foo.us@SD") aren't in XMLTV — strip to the base id.
@@ -815,14 +840,21 @@ fn clean_name(name: &str) -> String {
         let trimmed = t
             .strip_suffix(')')
             .and_then(|_| t.rfind('(').map(|i| &t[..i]))
-            .or_else(|| t.strip_suffix(']').and_then(|_| t.rfind('[').map(|i| &t[..i])));
+            .or_else(|| {
+                t.strip_suffix(']')
+                    .and_then(|_| t.rfind('[').map(|i| &t[..i]))
+            });
         match trimmed {
             Some(shorter) if shorter.trim() != s => s = shorter.trim(),
             _ => break,
         }
     }
     let out = s.trim();
-    if out.is_empty() { name.trim().to_string() } else { out.to_string() }
+    if out.is_empty() {
+        name.trim().to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 /// Whole-word substring test: `kw` must sit on non-alphanumeric boundaries, so
@@ -854,7 +886,11 @@ fn classify_sport(ch: &Channel) -> Option<String> {
     let hay = format!("{} {}", clean_name(&ch.name), ch.group).to_lowercase();
     SEED.iter()
         .filter(|s| s.id != "general" && s.id != "news")
-        .find(|s| s.keywords.iter().any(|k| contains_word(&hay, &k.to_lowercase())))
+        .find(|s| {
+            s.keywords
+                .iter()
+                .any(|k| contains_word(&hay, &k.to_lowercase()))
+        })
         .map(|s| s.id.clone())
 }
 
@@ -965,17 +1001,6 @@ fn register_stream(ch: &Channel) {
         );
 }
 
-fn iptv_item(ch: &Channel) -> ContentItem {
-    ContentItem {
-        id: format!("live:iptv:{}", stream_key(&ch.url)),
-        kind: Kind::Live,
-        title: clean_name(&ch.name),
-        art: ch.logo.clone(),
-        action: Action::Play,
-        note: None,
-    }
-}
-
 /// Plays the channel we resolved for a fixture (`live:match:<eventId>`).
 fn launch_match(event_id: &str) -> Result<(), String> {
     let info = MATCH_REGISTRY
@@ -985,7 +1010,12 @@ fn launch_match(event_id: &str) -> Result<(), String> {
         .cloned()
         .ok_or("this match isn't on a channel we can play right now")?;
     match info.target {
-        PlayTarget::Iptv(key) => launch_iptv(&key),
+        PlayTarget::Iptv(key) => {
+            let reachable = IPTV_STREAMS.lock().unwrap_or_else(|e| e.into_inner())
+                .get(&key).map(|s| stream_reachable(&s.url)).unwrap_or(false);
+            if !reachable { return Err("The mapped channel is currently offline; try again shortly.".into()); }
+            launch_iptv(&key)
+        }
         PlayTarget::Yt(video) => launch_youtube(&video),
     }
 }
@@ -1007,7 +1037,15 @@ fn launch_iptv(key: &str) -> Result<(), String> {
     .live();
     meta.referrer = info.referrer.clone();
     meta.user_agent = info.user_agent.clone();
-    launcher::play_video(&info.url, &profile, mode, "live-tv", None, None, Some(&meta))
+    launcher::play_video(
+        &info.url,
+        &profile,
+        mode,
+        "live-tv",
+        None,
+        None,
+        Some(&meta),
+    )
 }
 
 // ---- fixture → stream matching ----
@@ -1037,7 +1075,11 @@ struct Resolved {
 }
 
 impl Matcher {
-    fn build(cfg: &settings::Settings, iptv: &IptvContent, yt: &HashMap<String, Vec<ContentItem>>) -> Self {
+    fn build(
+        cfg: &settings::Settings,
+        iptv: &IptvContent,
+        yt: &HashMap<String, Vec<ContentItem>>,
+    ) -> Self {
         let mut channels = Vec::new();
         let mut push_ch = |ch: &Channel| {
             channels.push(MatchChannel {
@@ -1085,14 +1127,20 @@ impl Matcher {
     /// Best carrier for a fixture, if we can resolve one confidently.
     fn resolve(&self, ev: &Value, start: i64, now: i64) -> Option<Resolved> {
         let s = |k: &str| ev.get(k).and_then(|v| v.as_str()).unwrap_or("");
-        let (home, away, league, event) =
-            (s("strHomeTeam"), s("strAwayTeam"), s("strLeague"), s("strEvent"));
+        let (home, away, league, event) = (
+            s("strHomeTeam"),
+            s("strAwayTeam"),
+            s("strLeague"),
+            s("strEvent"),
+        );
 
         // Layer 1 — EPG: a channel whose programme at kickoff names the fixture.
         let mut best: Option<(i32, &MatchChannel, bool)> = None;
         for ch in &self.channels {
             let Some(id) = &ch.tvg_id else { continue };
-            let Some(progs) = self.epg.get(id) else { continue };
+            let Some(progs) = self.epg.get(id) else {
+                continue;
+            };
             let prog = progs
                 .iter()
                 .find(|p| p.start <= start && start < p.stop)
@@ -1118,7 +1166,11 @@ impl Matcher {
         // Layer 2 — the fixture's own broadcaster field → a channel by name.
         let station = s("strTVStation");
         if !station.is_empty() {
-            for st in station.split([',', '/']).map(str::trim).filter(|s| s.len() >= 3) {
+            for st in station
+                .split([',', '/'])
+                .map(str::trim)
+                .filter(|s| s.len() >= 3)
+            {
                 if let Some(ch) = self
                     .channels
                     .iter()
@@ -1225,7 +1277,9 @@ fn parse_xmltv(xml: &str, now: i64) -> HashMap<String, Vec<Programme>> {
     let (lo, hi) = (now - 12 * 3600, now + 36 * 3600);
     let mut map: HashMap<String, Vec<Programme>> = HashMap::new();
     for chunk in xml.split("<programme").skip(1) {
-        let Some(head_end) = chunk.find('>') else { continue };
+        let Some(head_end) = chunk.find('>') else {
+            continue;
+        };
         let head = &chunk[..head_end];
         let (Some(channel), Some(start), Some(stop)) = (
             attr(head, "channel"),
@@ -1238,8 +1292,12 @@ fn parse_xmltv(xml: &str, now: i64) -> HashMap<String, Vec<Programme>> {
             continue;
         }
         let body = &chunk[head_end..];
-        let Some(title) = tag_text(body, "title") else { continue };
-        map.entry(channel).or_default().push(Programme { start, stop, title });
+        let Some(title) = tag_text(body, "title") else {
+            continue;
+        };
+        map.entry(channel)
+            .or_default()
+            .push(Programme { start, stop, title });
     }
     map
 }
@@ -1346,28 +1404,43 @@ fn utc_date_offset(days: i64) -> String {
 }
 
 const FINISHED_STATUSES: &[&str] = &[
-    "FT", "AET", "AOT", "AP", "Match Finished", "Finished", "Cancelled", "CANC",
-    "Postponed", "PPD", "Abandoned", "Abd", "AWD", "WO",
+    "FT",
+    "AET",
+    "AOT",
+    "AP",
+    "Match Finished",
+    "Finished",
+    "Cancelled",
+    "CANC",
+    "Postponed",
+    "PPD",
+    "Abandoned",
+    "Abd",
+    "AWD",
+    "WO",
 ];
 
 fn is_finished(status: &str) -> bool {
     let s = status.trim();
-    FINISHED_STATUSES
-        .iter()
-        .any(|f| s.eq_ignore_ascii_case(f))
+    FINISHED_STATUSES.iter().any(|f| s.eq_ignore_ascii_case(f))
 }
 
 /// Fetches today + tomorrow's fixtures for each followed sport that maps to a
 /// TheSportsDB sport, classified into live/upcoming schedule cards.
-fn collect_schedule(followed: &[SportSeed], matcher: &Matcher) -> HashMap<String, Vec<ContentItem>> {
+fn collect_schedule(
+    followed: &[SportSeed],
+    matcher: &Matcher,
+) -> HashMap<String, Vec<ContentItem>> {
     let now = now_epoch();
+    let provider = TheSportsDb;
     std::thread::scope(|scope| {
         let jobs: Vec<_> = followed
             .iter()
             .filter_map(|s| s.tsdb.as_ref().map(|t| (s.id.clone(), t.clone())))
             .take(MAX_SCHED_SPORTS)
             .map(|(sport_id, tsdb)| {
-                scope.spawn(move || (sport_id, schedule_items(&tsdb, now, matcher)))
+                let provider = &provider;
+                scope.spawn(move || (sport_id, schedule_items(provider, &tsdb, now, matcher)))
             })
             .collect();
         let mut out = HashMap::new();
@@ -1382,9 +1455,19 @@ fn collect_schedule(followed: &[SportSeed], matcher: &Matcher) -> HashMap<String
     })
 }
 
-fn schedule_items(tsdb_sport: &str, now: i64, matcher: &Matcher) -> Vec<ContentItem> {
+trait ScheduleProvider: Sync {
+    fn events(&self, sport: &str) -> Vec<Value>;
+}
+
+struct TheSportsDb;
+
+impl ScheduleProvider for TheSportsDb {
+    fn events(&self, sport: &str) -> Vec<Value> { fetch_events(sport) }
+}
+
+fn schedule_items(provider: &dyn ScheduleProvider, tsdb_sport: &str, now: i64, matcher: &Matcher) -> Vec<ContentItem> {
     let mut items: Vec<(i64, bool, ContentItem)> = Vec::new();
-    for ev in fetch_events(tsdb_sport) {
+    for ev in provider.events(tsdb_sport) {
         if let Some(item) = event_item(&ev, now, matcher) {
             items.push(item);
         }
@@ -1406,7 +1489,7 @@ fn fetch_events(tsdb_sport: &str) -> Vec<Value> {
         }
     }
     let mut all = Vec::new();
-    for day in 0..2 {
+    for day in 0..7 {
         let url = format!(
             "https://www.thesportsdb.com/api/v1/json/{TSDB_KEY}/eventsday.php?d={}&s={}",
             utc_date_offset(day),
@@ -1438,24 +1521,27 @@ fn event_item(ev: &Value, now: i64, matcher: &Matcher) -> Option<(i64, bool, Con
     if is_finished(status) {
         return None;
     }
-    let start = s("strTimestamp")
-        .and_then(parse_iso_utc)
-        .or_else(|| match (s("dateEvent"), s("strTime")) {
+    if !matches_interests(ev) {
+        return None;
+    }
+    let start = s("strTimestamp").and_then(parse_iso_utc).or_else(|| {
+        match (s("dateEvent"), s("strTime")) {
             (Some(d), Some(t)) => parse_iso_utc(&format!("{d}T{t}")),
             (Some(d), None) => parse_iso_utc(&format!("{d}T00:00:00")),
             _ => None,
-        })?;
+        }
+    })?;
     let diff = start - now;
     let live = diff <= 0 && diff > -LIVE_WINDOW_SECS;
     if !live && !(diff > 0 && diff < UPCOMING_HORIZON_SECS) {
         return None;
     }
-    let title = s("strEvent")
-        .map(str::to_string)
-        .or_else(|| match (s("strHomeTeam"), s("strAwayTeam")) {
+    let title = s("strEvent").map(str::to_string).or_else(|| {
+        match (s("strHomeTeam"), s("strAwayTeam")) {
             (Some(h), Some(a)) => Some(format!("{h} vs {a}")),
             _ => None,
-        })?;
+        }
+    })?;
     let event_id = s("idEvent").unwrap_or("0").to_string();
     let art = s("strThumb").or_else(|| s("strPoster")).map(str::to_string);
     let matched = matcher.resolve(ev, start, now);
@@ -1464,13 +1550,15 @@ fn event_item(ev: &Value, now: i64, matcher: &Matcher) -> Option<(i64, bool, Con
     // its programme is airing right now).
     if let Some(m) = &matched {
         if live || m.epg_now {
-            MATCH_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                event_id.clone(),
-                MatchInfo {
-                    target: m.target.clone(),
-                    channel: m.channel.clone(),
-                },
-            );
+            MATCH_REGISTRY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    event_id.clone(),
+                    MatchInfo {
+                        target: m.target.clone(),
+                    },
+                );
             return Some((
                 start,
                 true, // playable now → sorts to the front of its row
@@ -1505,63 +1593,108 @@ fn event_item(ev: &Value, now: i64, matcher: &Matcher) -> Option<(i64, bool, Con
     ))
 }
 
+fn matches_interests(ev: &Value) -> bool {
+    let cfg = settings::STORE.get();
+    let leagues = split_interests(&cfg.live_leagues);
+    let teams = split_interests(&cfg.live_teams);
+    if leagues.is_empty() && teams.is_empty() {
+        return true;
+    }
+    let field = |name: &str| normalize_interest(ev.get(name).and_then(Value::as_str).unwrap_or(""));
+    let league = field("strLeague");
+    let home = field("strHomeTeam");
+    let away = field("strAwayTeam");
+    leagues.iter().any(|v| fuzzy_interest(&league, v))
+        || teams
+            .iter()
+            .any(|v| fuzzy_interest(&home, v) || fuzzy_interest(&away, v))
+}
+
+fn split_interests(raw: &str) -> Vec<String> {
+    raw.split([',', '\n'])
+        .map(normalize_interest)
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn normalize_interest(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+fn fuzzy_interest(actual: &str, wanted: &str) -> bool {
+    !actual.is_empty() && !wanted.is_empty() && (actual.contains(wanted) || wanted.contains(actual))
+}
+
 // ---- rows ----
 
 fn build_rows(
     followed: &[SportSeed],
-    mut yt_by_sport: HashMap<String, Vec<ContentItem>>,
-    iptv: IptvContent,
+    _yt_by_sport: HashMap<String, Vec<ContentItem>>,
+    _iptv: IptvContent,
     mut sched_by_sport: HashMap<String, Vec<ContentItem>>,
 ) -> Vec<Row> {
-    let IptvContent {
-        mut by_sport,
-        groups,
-    } = iptv;
-    let iptv_by_sport = &mut by_sport;
-    let mut rows = Vec::new();
+    let now = now_epoch();
+    let mut live_now = Vec::new();
+    let mut starting = Vec::new();
+    let mut today = Vec::new();
+    let mut tomorrow = Vec::new();
+    let mut later: Vec<(String, Vec<ContentItem>)> = Vec::new();
 
-    // "Live now": every currently-live YouTube broadcast across sports.
-    let mut live_now: Vec<ContentItem> = followed
-        .iter()
-        .flat_map(|s| yt_by_sport.get(&s.id).cloned().unwrap_or_default())
-        .collect();
-    live_now.truncate(MAX_ITEMS_PER_ROW);
-    if !live_now.is_empty() {
-        rows.push(Row {
-            title: "Live now".to_string(),
-            items: live_now,
-        });
+    for sport in followed {
+        let mut sport_later = Vec::new();
+        for item in sched_by_sport.remove(&sport.id).unwrap_or_default() {
+            if item.action == Action::Play || item.id.contains(":sched:live:") {
+                live_now.push(item);
+                continue;
+            }
+            let start = schedule_start(&item.id).unwrap_or(now + UPCOMING_HORIZON_SECS);
+            let delta = start - now;
+            if delta <= 2 * 3600 {
+                starting.push(item);
+            } else if delta < 24 * 3600 {
+                today.push(item);
+            } else if delta < 48 * 3600 {
+                tomorrow.push(item);
+            } else {
+                sport_later.push(item);
+            }
+        }
+        if !sport_later.is_empty() {
+            later.push((sport.label.clone(), sport_later));
+        }
     }
 
-    // One row per followed sport: playable streams first (its live YouTube
-    // broadcasts, then its channels), then the schedule — live fixtures we
-    // hold no stream for, then what's coming up.
-    for sport in followed {
-        let mut items: Vec<ContentItem> = yt_by_sport.remove(&sport.id).unwrap_or_default();
-        for ch in iptv_by_sport.remove(&sport.id).unwrap_or_default() {
-            items.push(iptv_item(&ch));
-        }
-        for sched in sched_by_sport.remove(&sport.id).unwrap_or_default() {
-            items.push(sched);
-        }
+    let mut rows = Vec::new();
+    let mut push = |title: &str, mut items: Vec<ContentItem>| {
         items.truncate(MAX_ITEMS_PER_ROW);
         if !items.is_empty() {
             rows.push(Row {
-                title: sport.label.clone(),
+                title: title.into(),
                 items,
             });
         }
-    }
-
-    // Region + user live TV, in full, grouped by category. Rows whose title
-    // matches a sport row above merge into it (Registry merges by title).
-    for (group, channels) in groups {
-        let items: Vec<ContentItem> = channels.iter().map(iptv_item).collect();
-        if !items.is_empty() {
-            rows.push(Row { title: group, items });
-        }
+    };
+    push("Live now", live_now);
+    push("Starting soon", starting);
+    push("Today", today);
+    push("Tomorrow", tomorrow);
+    for (title, items) in later {
+        push(&title, items);
     }
     rows
+}
+
+fn schedule_start(id: &str) -> Option<i64> {
+    let mut parts = id.split(':');
+    if parts.next()? != "live" || parts.next()? != "sched" {
+        return None;
+    }
+    let _state = parts.next()?;
+    parts.next()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -1642,11 +1775,21 @@ mod tests {
         };
         let by_sport = collect_iptv(&cfg).by_sport;
         let total: usize = by_sport.values().map(|v| v.len()).sum();
-        eprintln!("classified {total} channels across {} sports:", by_sport.len());
+        eprintln!(
+            "classified {total} channels across {} sports:",
+            by_sport.len()
+        );
         for (id, list) in &by_sport {
-            eprintln!("  {id}: {} (e.g. {:?})", list.len(), list.first().map(|c| &c.name));
+            eprintln!(
+                "  {id}: {} (e.g. {:?})",
+                list.len(),
+                list.first().map(|c| &c.name)
+            );
         }
-        assert!(total > 0, "expected the public catalog to yield sports channels");
+        assert!(
+            total > 0,
+            "expected the public catalog to yield sports channels"
+        );
         // Every classified channel must be registered for playback.
         let reg = IPTV_STREAMS.lock().unwrap();
         for list in by_sport.values() {
@@ -1676,7 +1819,10 @@ mod tests {
     #[test]
     fn group_label_is_title_cased() {
         assert_eq!(group_label(&chan("X", "news", "u")), "News");
-        assert_eq!(group_label(&chan("X", "entertainment", "u")), "Entertainment");
+        assert_eq!(
+            group_label(&chan("X", "entertainment", "u")),
+            "Entertainment"
+        );
         assert_eq!(group_label(&chan("X", "", "u")), "Live TV");
     }
 
@@ -1698,7 +1844,10 @@ mod tests {
     }
 
     fn empty_matcher() -> Matcher {
-        Matcher { channels: Vec::new(), epg: HashMap::new() }
+        Matcher {
+            channels: Vec::new(),
+            epg: HashMap::new(),
+        }
     }
 
     #[test]
@@ -1719,8 +1868,9 @@ mod tests {
         assert!(live.1 && live.2.id.starts_with("live:sched:live:"));
         // finished → skipped
         assert!(event_item(&ev(now - 1800, "FT"), now, &m).is_none());
-        // far future → skipped
-        assert!(event_item(&ev(now + 5 * 86400, "NS"), now, &m).is_none());
+        // The rolling guide covers seven days, but not events beyond it.
+        assert!(event_item(&ev(now + 5 * 86400, "NS"), now, &m).is_some());
+        assert!(event_item(&ev(now + 8 * 86400, "NS"), now, &m).is_none());
     }
 
     #[test]
@@ -1785,11 +1935,19 @@ mod tests {
     #[test]
     fn fixture_programme_matching_is_strict() {
         // both teams present → match
-        assert!(fixture_programme_match("cricket: india vs australia", "India", "Australia", "", "") >= 4);
+        assert!(
+            fixture_programme_match("cricket: india vs australia", "India", "Australia", "", "")
+                >= 4
+        );
         // only one team → no match
-        assert_eq!(fixture_programme_match("india news tonight", "India", "Australia", "", ""), 0);
+        assert_eq!(
+            fixture_programme_match("india news tonight", "India", "Australia", "", ""),
+            0
+        );
         // exact event name → match
-        assert!(fixture_programme_match("the ashes 1st test", "", "", "", "The Ashes 1st Test") >= 5);
+        assert!(
+            fixture_programme_match("the ashes 1st test", "", "", "", "The Ashes 1st Test") >= 5
+        );
     }
 
     #[test]
@@ -1830,9 +1988,18 @@ mod tests {
 
     #[test]
     fn station_matching_and_name_hit() {
-        assert!(station_matches("Sky Sports Cricket HD", "Sky Sports Cricket"));
-        assert!(!station_matches("Random Movie Channel", "Sky Sports Cricket"));
-        assert!(name_hit("los angeles lakers vs celtics", "Los Angeles Lakers"));
+        assert!(station_matches(
+            "Sky Sports Cricket HD",
+            "Sky Sports Cricket"
+        ));
+        assert!(!station_matches(
+            "Random Movie Channel",
+            "Sky Sports Cricket"
+        ));
+        assert!(name_hit(
+            "los angeles lakers vs celtics",
+            "Los Angeles Lakers"
+        ));
         assert!(!name_hit("celtics tonight", "Los Angeles Lakers"));
     }
 
@@ -1853,7 +2020,12 @@ mod tests {
             let y = if m <= 2 { y + 1 } else { y };
             format!("{y:04}-{m:02}-{d:02}")
         };
-        format!("{date}T{:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
+        format!(
+            "{date}T{:02}:{:02}:{:02}",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        )
     }
 
     #[test]
@@ -1861,17 +2033,27 @@ mod tests {
     fn user_playlist_channels_all_show_grouped() {
         let cfg = settings::Settings {
             live_region: "IN".to_string(),
-            iptv_playlists:
-                "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8".to_string(),
+            iptv_playlists: "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8"
+                .to_string(),
             ..Default::default()
         };
         let content = collect_iptv(&cfg);
         let total: usize = content.groups.iter().map(|(_, v)| v.len()).sum();
-        eprintln!("user playlist → {} groups, {total} channels:", content.groups.len());
+        eprintln!(
+            "user playlist → {} groups, {total} channels:",
+            content.groups.len()
+        );
         for (g, v) in content.groups.iter().take(10) {
-            eprintln!("  {g}: {} (e.g. {:?})", v.len(), v.first().map(|c| clean_name(&c.name)));
+            eprintln!(
+                "  {g}: {} (e.g. {:?})",
+                v.len(),
+                v.first().map(|c| clean_name(&c.name))
+            );
         }
-        assert!(total > 0, "a pasted playlist's channels must all show, sports or not");
+        assert!(
+            total > 0,
+            "a pasted playlist's channels must all show, sports or not"
+        );
     }
 
     #[test]
@@ -1881,21 +2063,28 @@ mod tests {
         let m = empty_matcher();
         let mut any = 0;
         for sport in ["Cricket", "Soccer", "Motorsport", "Tennis"] {
-            let items = schedule_items(sport, now, &m);
+            let items = schedule_items(&TheSportsDb, sport, now, &m);
             eprintln!("{sport}: {} fixtures", items.len());
             for it in items.iter().take(3) {
-                eprintln!("   [{}] {}", it.id.split(':').nth(2).unwrap_or("?"), it.title);
+                eprintln!(
+                    "   [{}] {}",
+                    it.id.split(':').nth(2).unwrap_or("?"),
+                    it.title
+                );
                 assert!(it.id.starts_with("live:sched:") || it.id.starts_with("live:match:"));
                 assert_eq!(it.kind, Kind::Live);
             }
             any += items.len();
         }
-        assert!(any > 0, "expected at least one fixture across four sports today/tomorrow");
+        assert!(
+            any > 0,
+            "expected at least one fixture across four sports today/tomorrow"
+        );
     }
 
     #[test]
-    fn followed_defaults_to_all_then_filters() {
-        assert_eq!(followed_sports("").len(), SEED.len());
+    fn followed_requires_selection_then_filters() {
+        assert!(followed_sports("").is_empty());
         let only = followed_sports("cricket, f1");
         let ids: Vec<&str> = only.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"cricket"));

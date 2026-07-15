@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::fuzzy;
 use crate::model::{ContentItem, Kind, Row};
-use crate::sources::{stremio, tmdb, youtube};
+use crate::sources::{stremio, tmdb, twitch, youtube};
 
 const RESULT_LIMIT: usize = 48;
 const SECTION_LIMIT: usize = 20;
@@ -156,7 +156,8 @@ pub fn deep(query: &str, library: Vec<Row>) -> Vec<Row> {
         )
     });
     let (tmdb_titles, people_rows) = titles_and_people;
-    let (discover_rows, yt_items) = discover_rows;
+    let (discover_rows, mut yt_items) = discover_rows;
+    yt_items.extend(twitch::search(&query));
 
     // Local library, fuzzy-matched.
     let mut local: Vec<(i32, ContentItem)> = library
@@ -210,7 +211,7 @@ pub fn deep(query: &str, library: Vec<Row>) -> Vec<Row> {
     );
     // A different medium for the same query — always last, never competing
     // with the catalog sections above.
-    push("YouTube".into(), yt_items, &mut rows);
+    push("Creators".into(), yt_items, &mut rows);
 
     let mut cache = DEEP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() > 32 {
@@ -602,7 +603,7 @@ mod tests {
             art: None,
             action: crate::model::Action::Play,
             note: None,
-                };
+        };
         let mut b = a.clone();
         b.id = "strm:movie:tt1160419".into();
         assert!(d.insert(&a));

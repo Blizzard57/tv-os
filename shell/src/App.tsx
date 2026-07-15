@@ -10,6 +10,7 @@ import {
   fetchInstalls,
   fetchLibrary,
   fetchMeta,
+  recordInteraction,
   fetchSettings,
   saveSettings,
 } from './api';
@@ -45,12 +46,16 @@ const BLANK_SETTINGS: Settings = {
   game_region: '',
   live_region: '',
   live_sports: '',
+  live_leagues: '',
+  live_teams: '',
   iptv_playlists: '',
   epg_urls: '',
   trakt_client_id: '',
   trakt_client_secret: '',
   trakt_token: '',
   anilist_token: '',
+  twitch_client_id: '',
+  twitch_token: '',
   mal_client_id: '',
   mal_token: '',
 };
@@ -79,6 +84,8 @@ const EMPTY_TAB_COPY: Record<TabId, string> = {
   live: 'Nothing live right now — follow sports channels and set your region in Settings, then check back around game time.',
   movies: 'No movies yet — add a TMDB key in Settings to fill this tab.',
   shows: 'No shows yet — add a TMDB key in Settings to fill this tab.',
+  creators: 'Connect YouTube or Twitch in Settings to see creators you follow.',
+  games: 'Connect a game library to see installed and recommended games.',
   library: 'Your library is empty — connect Steam, Epic or GOG, or start watching to fill it.',
 };
 
@@ -100,12 +107,26 @@ export default function App() {
   // with B, one page at a time, all the way home.
   const [detailsStack, setDetailsStack] = useState<ContentItem[]>([]);
   const detailsItem = detailsStack.length > 0 ? detailsStack[detailsStack.length - 1] : null;
+  const overlayOpen = detailsItem !== null || settingsOpen || searchOpen;
   const pushDetails = useCallback((item: ContentItem) => setDetailsStack((s) => [...s, item]), []);
   const popDetails = useCallback(() => setDetailsStack((s) => s.slice(0, -1)), []);
   const { jobs, refresh: refreshJobs } = useInstallJobs(() => loadLibrary());
 
   // The shelves visible under the active tab: the tab's kind-filtered rows.
   const shelves = useMemo<Row[]>(() => rowsForTab(activeTab, rows ?? []), [activeTab, rows]);
+  const featured = useMemo(() => {
+    const preferred = shelves.find((r) => r.purpose === 'top_picks') || shelves.find((r) => r.purpose === 'live_now') || shelves[0];
+    return preferred?.items.slice(0, 6) ?? [];
+  }, [shelves]);
+  const [featuredIndex, setFeaturedIndex] = useState(0);
+  useEffect(() => setFeaturedIndex(0), [activeTab]);
+  useEffect(() => {
+    if (featured.length < 2 || overlayOpen) return;
+    const timer = window.setInterval(() => setFeaturedIndex((i) => (i + 1) % featured.length), 12_000);
+    return () => window.clearInterval(timer);
+  }, [featured.length, overlayOpen]);
+  const featuredItem = featured[featuredIndex] || heroItem;
+  const featuredRow = shelves.find((r) => r.items.some((i) => i.id === featuredItem?.id));
 
   // Which tabs currently have anything to show (dims empty tabs in the bar).
   const enabledTabs = useMemo(() => {
@@ -123,7 +144,6 @@ export default function App() {
   // The last home control that held focus, restored when an overlay closes.
   const lastHomeFocus = useRef<HTMLElement | null>(null);
   // Mirrors read inside event handlers (avoid stale closures).
-  const overlayOpen = detailsItem !== null || settingsOpen || searchOpen;
   const overlayOpenRef = useRef(overlayOpen);
   overlayOpenRef.current = overlayOpen;
   const activeTabRef = useRef(activeTab);
@@ -199,7 +219,7 @@ export default function App() {
 
   // ---- Home focus helpers (DOM focus, geometry nav) ----
   const rowsRoot = useCallback(
-    () => appRef.current?.querySelector<HTMLElement>('.home-rows, .screen-message') ?? null,
+    () => appRef.current?.querySelector<HTMLElement>('.home-content, .screen-message') ?? null,
     [],
   );
   const topbarRoot = useCallback(
@@ -208,7 +228,7 @@ export default function App() {
   );
   const focusFirstCard = useCallback(() => {
     const target = rowsRoot()?.querySelector<HTMLElement>(
-      '.card, .tv-retry, button, [tabindex]:not([tabindex="-1"])',
+      '.hero-primary, .card, .tv-retry, button, [tabindex]:not([tabindex="-1"])',
     );
     target?.focus();
   }, [rowsRoot]);
@@ -220,9 +240,9 @@ export default function App() {
   // Report focus from home controls: keeps the hero in sync and remembers the
   // spot so returning from an overlay lands where you left.
   const onCardFocus = useCallback((item: ContentItem, el: HTMLElement) => {
-    setHeroItem(item);
     setZone('rows');
     lastHomeFocus.current = el;
+    recordInteraction({ item_id: item.id, kind: 'focus', context: activeTabRef.current }).catch(() => {});
   }, []);
   const firstItemOfTab = useCallback(
     (id: TabId) => rowsForTab(id, rows ?? [])[0]?.items[0],
@@ -353,8 +373,7 @@ export default function App() {
     }
   }, [shelves, zone, focusFirstCard]);
 
-  const preview = useHeroPreview(heroItem);
-  const inRows = zone === 'rows';
+  const preview = useHeroPreview(featuredItem);
 
   let body: React.ReactNode;
   if (error) {
@@ -378,7 +397,8 @@ export default function App() {
   } else {
     body = (
       <>
-        <Hero item={heroItem} preview={preview} onRows={inRows} />
+        <div className="home-content">
+        <Hero item={featuredItem} preview={preview} explanation={featuredRow?.explanation} onOpen={activateItem} onFocus={(el) => onCardFocus(featuredItem!, el)} />
         <main className="home-rows">
           {shelves.length === 0 ? (
             <div className="screen-message">{EMPTY_TAB_COPY[activeTab] || 'Nothing here yet.'}</div>
@@ -387,6 +407,9 @@ export default function App() {
               <Shelf
                 key={`${activeTab}-${i}-${shelf.title}`}
                 title={shelf.title}
+                rowId={shelf.id}
+                layout={shelf.layout}
+                explanation={shelf.explanation}
                 items={shelf.items}
                 onPick={activateItem}
                 onFocusItem={onCardFocus}
@@ -395,6 +418,7 @@ export default function App() {
             ))
           )}
         </main>
+        </div>
       </>
     );
   }

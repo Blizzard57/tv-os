@@ -27,6 +27,8 @@ import {
   fetchStreams,
   launch,
   playStream,
+  recordInteraction,
+  resolveLive,
   setPreference,
   startInstall,
 } from './api';
@@ -244,6 +246,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
         art: meta?.poster || meta?.background || item.art,
       };
       // External links just open elsewhere — no loading screen needed.
+      recordInteraction({ item_id: trackId, kind: 'play', context: 'details' }).catch(() => {});
       if (s.kind === 'external') {
         flash(`Opening ${s.name.split('\n')[0]}…`);
         playStream(s, playbackItem, trackId)
@@ -269,11 +272,25 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     [item, episode, onPlayed, flash, meta, trackId],
   );
 
-  const runAction = useCallback(() => {
+  const runAction = useCallback(async () => {
     if (item.action === 'install') {
       flash(`Downloading ${item.title}…`);
       startInstall(item.id).then(onPlayed).catch((e) => flash(`Could not install: ${e.message}`));
+    } else if (item.id.startsWith('live:sched:')) {
+      setLoading({ label: 'Checking verified broadcasts…', kind: 'stream' });
+      try {
+        const result = await resolveLive(item.id);
+        setLoading(null);
+        if (!result.resolved || !result.item) { flash(result.reason || 'No verified broadcast is available yet.'); return; }
+        recordInteraction({ item_id: result.item.id, kind: 'play', context: 'live_guide' }).catch(() => {});
+        setLoading({ label: result.item.title, kind: 'stream' });
+        await launch(result.item).then(waitForPlayback);
+        setLoading(null); onPlayed();
+      } catch (e) { setLoading(null); flash(`Could not resolve broadcast: ${(e as Error).message}`); }
+    } else if (item.action === 'none') {
+      flash('This event is not available to play yet.');
     } else {
+      recordInteraction({ item_id: item.id, kind: 'play', context: 'details' }).catch(() => {});
       setLoading({ label: item.title, kind: 'app' });
       launch(item)
         .then(waitForPlayback)
@@ -297,6 +314,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
       };
       setPreference(action, preferenceItem)
         .then((next) => {
+          recordInteraction({ item_id: item.id, kind: action === 'watched' ? 'complete' : action, context: 'details' }).catch(() => {});
           setPref(next);
           const label =
             action === 'watchlist'
@@ -524,6 +542,12 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
             )}
 
             <div className="details-quick-actions">
+              {!!meta?.trailers?.length && (
+                <button type="button" className={`details-round-action ${on('trailer:0')}`} {...nav('trailer:0')}
+                  onClick={() => playChosen({ kind: 'youtube', url: meta.trailers![0], name: 'Trailer', title: meta.title })}>
+                  <span className="round-action-icon">▶</span><span>Trailer</span>
+                </button>
+              )}
               {prefButtons.map((button, i) => (
                 <button
                   key={button.action}
@@ -553,7 +577,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
               {...nav('action')}
               onClick={runAction}
             >
-              {item.action === 'install' ? 'Install' : 'Play'}
+              {item.action === 'install' ? 'Install' : item.id.startsWith('live:sched:') ? 'Check broadcast' : item.action === 'none' ? 'Coming soon' : 'Play'}
             </div>
           </div>
         )}
@@ -734,6 +758,13 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
               </section>
             )}
           </div>
+        )}
+
+        {!!meta?.cast?.length && (
+          <section className="details-cast">
+            <div className="shots-head">Cast &amp; creators</div>
+            <div className="cast-strip">{meta.cast.map((name) => <span key={name} className="cast-chip">{name}</span>)}</div>
+          </section>
         )}
 
         {!!meta?.screenshots?.length && (

@@ -14,6 +14,7 @@ import {
   fetchLiveStatus,
   fetchSteamStatus,
   fetchTrackingStatus,
+  fetchTwitchStatus,
   fetchVersion,
   fetchYouTubeStatus,
   testSourceManifests,
@@ -55,12 +56,16 @@ const BLANK: Settings = {
   game_region: '',
   live_region: '',
   live_sports: '',
+  live_leagues: '',
+  live_teams: '',
   iptv_playlists: '',
   epg_urls: '',
   trakt_client_id: '',
   trakt_client_secret: '',
   trakt_token: '',
   anilist_token: '',
+  twitch_client_id: '',
+  twitch_token: '',
   mal_client_id: '',
   mal_token: '',
 };
@@ -88,6 +93,7 @@ const SECRET_FIELDS = [
   'trakt_client_secret',
   'trakt_token',
   'anilist_token',
+  'twitch_token',
   'mal_token',
 ] as const;
 type SecretField = (typeof SECRET_FIELDS)[number];
@@ -99,7 +105,7 @@ type SettingsResponse = Settings & Record<string, unknown>;
 const isSecret = (key: string): key is SecretField =>
   (SECRET_FIELDS as readonly string[]).includes(key);
 
-type SettingsCategory = 'accounts' | 'games' | 'sources' | 'display' | 'appearance';
+type SettingsCategory = 'profile' | 'accounts' | 'recommendations' | 'live' | 'creators' | 'playback' | 'sources' | 'display' | 'system';
 
 const SETTINGS_CATEGORIES: {
   id: SettingsCategory;
@@ -107,11 +113,15 @@ const SETTINGS_CATEGORIES: {
   detail: string;
   icon: string;
 }[] = [
-  { id: 'accounts', label: 'Accounts & services', detail: 'Steam, TMDB, YouTube, tracking', icon: 'person' },
-  { id: 'games', label: 'Games & libraries', detail: 'Stores and price region', icon: 'apps' },
-  { id: 'sources', label: 'Streaming sources', detail: 'Torrentio, WatchHub, CloudStream', icon: 'wifi' },
+  { id: 'profile', label: 'Profile', detail: 'Your TV OS experience', icon: 'person' },
+  { id: 'accounts', label: 'Accounts', detail: 'Libraries and watch tracking', icon: 'apps' },
+  { id: 'recommendations', label: 'Recommendations', detail: 'Private personalization', icon: 'spark' },
+  { id: 'live', label: 'Live sports', detail: 'Sports, leagues and teams', icon: 'live' },
+  { id: 'creators', label: 'Creators', detail: 'YouTube and Twitch', icon: 'video' },
+  { id: 'playback', label: 'Playback', detail: 'Player and enhancement', icon: 'play' },
+  { id: 'sources', label: 'Sources', detail: 'Streaming addons and providers', icon: 'wifi' },
   { id: 'display', label: 'Display & sound', detail: 'Resolution and HDR', icon: 'tv' },
-  { id: 'appearance', label: 'System', detail: 'Theme, accent, enhancement', icon: 'gear' },
+  { id: 'system', label: 'System', detail: 'Theme, accent and diagnostics', icon: 'gear' },
 ];
 
 export function SettingsPanel({
@@ -127,7 +137,7 @@ export function SettingsPanel({
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [version, setVersion] = useState<string | null>(null);
-  const [activeCategory, setActiveCategory] = useState<SettingsCategory>('sources');
+  const [activeCategory, setActiveCategory] = useState<SettingsCategory>('profile');
   // Which secret fields already have a stored value on the daemon (their value
   // arrives blanked). Drives the "configured/•••" display.
   const [configured, setConfigured] = useState<Record<string, boolean>>({});
@@ -404,7 +414,7 @@ export function SettingsPanel({
             <aside className="settings-nav-pane">
               <div className="settings-brand">
                 <div>
-                  <span className="settings-kicker">Google TV</span>
+                  <span className="settings-kicker">TV OS</span>
                   <h1>Settings</h1>
                 </div>
                 <button className="settings-gear-button" onClick={onClose} aria-label="Close settings">
@@ -449,20 +459,26 @@ export function SettingsPanel({
                 <h2>{activeInfo.label}</h2>
               </div>
               <div className="settings-detail-scroll">
+                {activeCategory === 'profile' && <ProfileSection />}
                 {activeCategory === 'accounts' && (
                   <>
                     <SteamSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
                     <TmdbSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-                    <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
                     <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+                    <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />
                   </>
                 )}
-                {activeCategory === 'games' && (
-                  <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />
+                {activeCategory === 'recommendations' && (
+                  <RecommendationSection />
                 )}
+                {activeCategory === 'live' && <LiveSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
+                {activeCategory === 'creators' && <>
+                  <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+                  <TwitchSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
+                </>}
+                {activeCategory === 'playback' && <PlaybackSection form={form} update={update} submit={submit} />}
                 {activeCategory === 'sources' && (
                   <>
-                    <LiveSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
                     <SourceHealthPanel
                       addons={addons}
                       manifests={manifests}
@@ -477,7 +493,7 @@ export function SettingsPanel({
                 {activeCategory === 'display' && (
                   <DisplaySection form={form} update={update} submit={submit} />
                 )}
-                {activeCategory === 'appearance' && (
+                {activeCategory === 'system' && (
                   <AppearanceSection
                     form={form}
                     update={update}
@@ -523,6 +539,52 @@ type SectionProps = {
   /** Open the on-screen keyboard to edit a field with a controller/remote. */
   openOsk: (label: string, value: string, masked: boolean, commit: (v: string) => void) => void;
 };
+
+function ProfileSection() {
+  return (
+    <section className="settings-section profile-settings-card">
+      <div className="profile-settings-avatar">K</div>
+      <div><h2>Your profile</h2><p className="settings-muted">Recommendations, sports interests, creator follows and playback progress are private to this profile and stored on this device.</p></div>
+    </section>
+  );
+}
+
+function RecommendationSection() {
+  const [status, setStatus] = useState('Ready');
+  const sync = async () => {
+    setStatus('Syncing Trakt and AniList…');
+    try {
+      const res = await fetch('/api/tracking/sync', { method: 'POST' });
+      if (!res.ok) throw new Error(await res.text());
+      setStatus('History synced — recommendations will refresh on Home');
+    } catch (e) { setStatus(`Sync failed: ${(e as Error).message}`); }
+  };
+  return (
+    <section className="settings-section">
+      <h2>Private recommendations</h2>
+      <p className="settings-muted">TV OS combines local plays, progress, likes, skips, Trakt history and AniList history with on-device embeddings. Nothing is sent to a recommendation cloud.</p>
+      <div className="recommendation-signal-grid">
+        <span>✓ Viewing progress</span><span>✓ Likes and dislikes</span><span>✓ Time of day</span>
+        <span>✓ Trakt history</span><span>✓ AniList anime</span><span>✓ Diverse discovery</span>
+      </div>
+      <div className="settings-actions"><button className="btn btn-primary" onClick={sync}>Sync history now</button><span className="settings-status">{status}</span></div>
+    </section>
+  );
+}
+
+function PlaybackSection({ form, update, submit }: Pick<SectionProps, 'form' | 'update' | 'submit'>) {
+  const save = (enhance: EnhanceMode) => { update({ enhance }); submit({ enhance }).catch(() => {}); };
+  return (
+    <section className="settings-section">
+      <h2>Player</h2>
+      <p className="settings-muted">The same D-pad-first mpv player is used for movies, episodes, live sports, YouTube and Twitch.</p>
+      <Field label="Enhance"><div className="settings-chips">{ENHANCE_OPTIONS.map((mode) => (
+        <button key={mode} className={`settings-chip${form.enhance === mode ? ' active' : ''}`} onClick={() => save(mode)}>{mode[0].toUpperCase() + mode.slice(1)}</button>
+      ))}</div></Field>
+      <p className="settings-muted">Auto chooses the content-aware shader chain. Subtitle, audio, speed, quality and Enhance controls remain available in the player sheet.</p>
+    </section>
+  );
+}
 
 function SteamSection({ form, update, reload, submit, configured, openOsk }: SectionProps) {
   const [status, setStatus] = useState<string | null>(null);
@@ -700,6 +762,26 @@ function YouTubeSection({ form, update, reload, submit, openOsk }: SectionProps)
   );
 }
 
+function TwitchSection({ form, update, reload, submit, configured, openOsk }: SectionProps) {
+  const [status, setStatus] = useState<string | null>(null);
+  const save = async () => {
+    try { await submit(); setStatus((await fetchTwitchStatus()).detail); reload(); }
+    catch (e) { setStatus(`Error: ${(e as Error).message}`); }
+  };
+  return (
+    <section className="settings-section">
+      <h2>Twitch</h2>
+      <p className="settings-muted">Connect a Twitch application and user token with <code>user:read:follows</code> to show followed live creators. Public channel playback opens through mpv and yt-dlp.</p>
+      <LockedField label="Twitch client id" value={form.twitch_client_id} openOsk={openOsk}
+        onChange={(v) => update({ twitch_client_id: v })} placeholder="Twitch developer application client id" />
+      <LockedField label="Twitch user access token" masked value={form.twitch_token}
+        configured={configured.twitch_token} openOsk={openOsk}
+        onChange={(v) => update({ twitch_token: v })} placeholder="OAuth user token" />
+      <div className="settings-actions"><button className="btn btn-primary" onClick={save}>Save &amp; check</button>{status && <span className="settings-status">{status}</span>}</div>
+    </section>
+  );
+}
+
 /// Live tab: which sports to follow, the region whose free-to-air channels to
 /// surface first, and any personal IPTV playlists to fold in. The public
 /// iptv-org catalog + curated official YouTube-live channels are built in.
@@ -770,12 +852,7 @@ function LiveSection({ form, update, reload, submit, openOsk }: SectionProps) {
   return (
     <section className="settings-section">
       <h2>Live</h2>
-      <p className="settings-muted">
-        The Live tab gathers what’s broadcasting right now: currently-live official YouTube
-        channels and free-to-air sports/news channels for your region (via the built-in public
-        catalog), grouped by sport. Add your own IPTV playlists to fold in a provider you
-        subscribe to. Live streams play in the same upscaled player.
-      </p>
+      <p className="settings-muted">Live is an event guide, not a channel list. It shows only fixtures from sports you follow, prioritizes chosen competitions and teams, then maps them to verified official/free streams or your own IPTV/EPG provider.</p>
       <Field label="Region (which country’s free-to-air channels come first)">
         <select value={region} onChange={(e) => changeRegion(e.target.value)}>
           {regionOptions.map((r) => (
@@ -785,7 +862,7 @@ function LiveSection({ form, update, reload, submit, openOsk }: SectionProps) {
           ))}
         </select>
       </Field>
-      <Field label="Sports you follow (none selected = all)">
+      <Field label="Sports you follow">
         <div className="settings-chips">
           {LIVE_SPORTS.map((s) => (
             <button
@@ -798,6 +875,10 @@ function LiveSection({ form, update, reload, submit, openOsk }: SectionProps) {
           ))}
         </div>
       </Field>
+      <LockedField label="Leagues and tournaments" value={form.live_leagues} openOsk={openOsk}
+        onChange={(v) => update({ live_leagues: v })} placeholder="Premier League, IPL, Formula 1" />
+      <LockedField label="Teams" value={form.live_teams} openOsk={openOsk}
+        onChange={(v) => update({ live_teams: v })} placeholder="India, Arsenal, Ferrari" />
       <LockedField
         label="Your IPTV playlists (M3U/M3U8 URLs)"
         value={form.iptv_playlists}

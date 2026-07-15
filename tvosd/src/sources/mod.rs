@@ -17,6 +17,7 @@ pub mod retro;
 pub mod steam;
 pub mod stremio;
 pub mod tmdb;
+pub mod twitch;
 pub mod videos;
 pub mod youtube;
 
@@ -85,6 +86,7 @@ impl Registry {
                 Box::new(stremio::Stremio::default()),
                 Box::new(tmdb::Tmdb::default()),
                 Box::new(youtube::YouTube::detect()),
+                Box::new(twitch::Twitch),
                 Box::new(live::Live::detect()),
                 Box::new(gamehub::GameShop),
             ],

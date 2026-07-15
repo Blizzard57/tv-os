@@ -26,6 +26,7 @@ mod launcher;
 mod logging;
 mod media;
 mod model;
+mod profile;
 mod recommend;
 mod resume;
 mod search;
@@ -285,6 +286,10 @@ async fn main() {
 
     let router = Router::new()
         .route("/api/library", get(get_library))
+        .route("/api/home", get(get_home))
+        .route("/api/creators", get(get_creators))
+        .route("/api/interactions", post(post_interaction))
+        .route("/api/interests", get(get_interests).put(put_interests))
         .route("/api/health", get(get_health))
         .route("/api/sources", get(get_sources))
         .route("/api/launch", post(post_launch))
@@ -318,9 +323,13 @@ async fn main() {
         .route("/api/search/deep", get(get_search_deep))
         .route("/api/similar", get(get_similar))
         .route("/api/youtube/status", get(get_youtube_status))
+        .route("/api/twitch/status", get(get_twitch_status))
         .route("/api/live/status", get(get_live_status))
+        .route("/api/live/guide", get(get_live_guide))
+        .route("/api/live/resolve", post(post_live_resolve))
         .route("/api/game", get(get_game))
         .route("/api/tracking/status", get(get_tracking_status))
+        .route("/api/tracking/sync", post(post_tracking_sync))
         .route("/api/trakt/connect", post(post_trakt_connect))
         .route("/api/mal/login", get(get_mal_login))
         .route("/api/mal/callback", get(get_mal_callback))
@@ -532,6 +541,7 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             });
 
             r.extend(bcw);
+            r.extend(sources::tmdb::indian_spotlight(&recent));
 
             // Your installed/owned games → the "Games" row. Non-game library
             // rows are kept ONLY when personal (your watchlist / owned rows);
@@ -542,15 +552,19 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             // Live rows (the Live tab) are kept whole, like games — the tab is a
             // client-side filter over this feed, so the data must reach it.
             let mut live_rows: Vec<model::Row> = Vec::new();
+            let mut creator_rows: Vec<model::Row> = Vec::new();
             for mut row in library {
                 let all_games =
                     !row.items.is_empty() && row.items.iter().all(|i| i.kind == model::Kind::Game);
                 let all_live =
                     !row.items.is_empty() && row.items.iter().all(|i| i.kind == model::Kind::Live);
+                let all_creators = !row.items.is_empty() && row.items.iter().all(is_creator);
                 if all_games {
                     owned_games.append(&mut row.items);
                 } else if all_live {
                     live_rows.push(row);
+                } else if all_creators {
+                    creator_rows.push(row);
                 } else if is_personal_row(&row.title) {
                     personal.push(row);
                 }
@@ -592,6 +606,7 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             // Live rows last, in their curated order (Live now → sports → what's
             // coming up), untouched by the taste shuffle above.
             r.extend(live_rows);
+            r.extend(creator_rows);
             if !disliked.is_empty() {
                 for row in &mut r {
                     row.items.retain(|i| !disliked.contains(&i.id));
@@ -613,6 +628,142 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
     }
     rows.retain(|row| !row.items.is_empty());
     Json(rows)
+}
+
+#[derive(Deserialize)]
+struct HomeQuery {
+    #[serde(default = "default_home_tab")]
+    tab: String,
+}
+
+fn default_home_tab() -> String {
+    "foryou".into()
+}
+
+/// Typed tab feed. `/api/library` remains the compatibility endpoint while new
+/// shells can request only the rows they intend to render.
+async fn get_home(State(app): State<Shared>, Query(q): Query<HomeQuery>) -> Json<Vec<model::Row>> {
+    let mut rows = get_library(State(app)).await.0;
+    match q.tab.as_str() {
+        "live" => filter_rows(&mut rows, |i| i.kind == model::Kind::Live),
+        "movies" => filter_rows(&mut rows, |i| i.kind == model::Kind::Movie),
+        "shows" => filter_rows(&mut rows, |i| i.kind == model::Kind::Series),
+        "games" => filter_rows(&mut rows, |i| i.kind == model::Kind::Game),
+        "creators" => filter_rows(&mut rows, is_creator),
+        "library" => rows.retain(|r| {
+            matches!(
+                r.purpose(),
+                model::RowPurpose::ContinueWatching
+                    | model::RowPurpose::Library
+                    | model::RowPurpose::Games
+            )
+        }),
+        _ => rows.retain(|r| !matches!(r.purpose(), model::RowPurpose::Creators)),
+    }
+    Json(rows)
+}
+
+fn filter_rows(rows: &mut Vec<model::Row>, keep: impl Fn(&model::ContentItem) -> bool + Copy) {
+    for row in rows.iter_mut() {
+        row.items.retain(keep);
+    }
+    rows.retain(|r| !r.items.is_empty());
+}
+
+fn is_creator(item: &model::ContentItem) -> bool {
+    item.id.starts_with("yt:") || item.id.starts_with("twitch:")
+}
+
+async fn get_creators(State(app): State<Shared>) -> Json<Vec<model::Row>> {
+    let mut rows = join_or_default(
+        "creators",
+        tokio::task::spawn_blocking(move || app.refresh_library()).await,
+    );
+    filter_rows(&mut rows, is_creator);
+    Json(rows)
+}
+
+async fn post_interaction(
+    Json(event): Json<profile::InteractionEvent>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    profile::STORE
+        .record(&event)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+async fn get_interests() -> Json<serde_json::Value> {
+    let s = settings::STORE.get();
+    Json(
+        serde_json::json!({ "sports": s.live_sports, "leagues": s.live_leagues, "teams": s.live_teams }),
+    )
+}
+
+#[derive(Deserialize)]
+struct InterestsRequest {
+    #[serde(default)]
+    sports: String,
+    #[serde(default)]
+    leagues: String,
+    #[serde(default)]
+    teams: String,
+}
+
+async fn put_interests(
+    Json(req): Json<InterestsRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    settings::STORE
+        .patch(settings::SettingsPatch {
+            live_sports: Some(req.sports),
+            live_leagues: Some(req.leagues),
+            live_teams: Some(req.teams),
+            ..Default::default()
+        })
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn get_live_guide(State(app): State<Shared>) -> Json<Vec<model::Row>> {
+    let mut rows = join_or_default(
+        "live guide",
+        tokio::task::spawn_blocking(move || app.refresh_library()).await,
+    );
+    filter_rows(&mut rows, |i| {
+        i.kind == model::Kind::Live && (i.id.contains(":match:") || i.id.contains(":sched:"))
+    });
+    Json(rows)
+}
+
+#[derive(Deserialize)]
+struct ResolveLiveRequest {
+    id: String,
+}
+
+async fn post_live_resolve(
+    State(app): State<Shared>,
+    Json(req): Json<ResolveLiveRequest>,
+) -> Json<serde_json::Value> {
+    let requested = req.id;
+    let event_id = requested
+        .split(':')
+        .next_back()
+        .unwrap_or_default()
+        .to_string();
+    let rows = join_or_default(
+        "live resolve",
+        tokio::task::spawn_blocking(move || app.refresh_library()).await,
+    );
+    let found = rows.into_iter().flat_map(|r| r.items).find(|i| {
+        i.id == requested || (i.id.starts_with("live:match:") && i.id.ends_with(&event_id))
+    });
+    Json(match found {
+        Some(item) => {
+            serde_json::json!({"resolved": item.action == model::Action::Play, "item": item})
+        }
+        None => {
+            serde_json::json!({"resolved": false, "reason": "No verified broadcast is available yet"})
+        }
+    })
 }
 
 async fn get_health(State(app): State<Shared>) -> Json<serde_json::Value> {
@@ -935,6 +1086,12 @@ fn meta_for(id: &str, title: Option<&str>) -> media::Meta {
             kind: "video".to_string(),
             ..Default::default()
         }),
+        "twitch" => sources::twitch::video_meta(id).unwrap_or(media::Meta {
+            id: id.to_string(),
+            kind: "video".to_string(),
+            title: title.unwrap_or_default().to_string(),
+            ..Default::default()
+        }),
         // Live streams/fixtures: a light stub (title from the library) — never a
         // Steam game lookup like the fallback below would do.
         "live" => media::Meta {
@@ -1075,7 +1232,16 @@ async fn get_game(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
 }
 
 async fn get_tracking_status() -> Json<serde_json::Value> {
-    Json(tracking::status())
+    let mut value = tracking::status();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("personalization".into(), profile::STORE.status());
+    }
+    Json(value)
+}
+
+async fn post_tracking_sync() -> Json<serde_json::Value> {
+    tracking::sync_local_play_markers();
+    get_tracking_status().await
 }
 
 /// Kicks off the Trakt device-code flow; the panel shows the code, a
@@ -1127,6 +1293,14 @@ async fn get_youtube_status() -> Json<serde_json::Value> {
             (false, "status check failed".to_string())
         });
     Json(serde_json::json!({ "connected": connected, "detail": detail }))
+}
+
+async fn get_twitch_status() -> Json<serde_json::Value> {
+    Json(
+        tokio::task::spawn_blocking(sources::twitch::status)
+            .await
+            .unwrap_or_else(|e| serde_json::json!({"connected": false, "detail": e.to_string()})),
+    )
 }
 
 async fn get_live_status() -> Json<serde_json::Value> {

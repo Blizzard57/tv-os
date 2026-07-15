@@ -5,12 +5,34 @@
 -- updated, and zero it when the title finishes so a watched item doesn't resume.
 
 local mp = require 'mp'
+local utils = require 'mp.utils'
 
 local path = os.getenv('TVOS_POSITION_FILE')
 if not path or path == '' then return end
 
 local content_id = os.getenv('TVOS_CONTENT_ID')
 if not content_id or content_id == '' then content_id = os.getenv('TVOS_ITEM_ID') end
+
+local function json_escape(s)
+  return tostring(s or ''):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
+end
+
+-- Report richer lifecycle signals to the local personalization store. This is
+-- best-effort and never blocks playback; completion markers remain the durable
+-- tracker fallback when curl or the daemon is temporarily unavailable.
+local function report(kind)
+  if not content_id or content_id == '' then return end
+  local pos = mp.get_property_number('time-pos') or 0
+  local dur = mp.get_property_number('duration') or 0
+  local body = string.format('{"item_id":"%s","kind":"%s","position":%.3f,"duration":%.3f,"context":"mpv"}',
+    json_escape(content_id), kind, pos, dur)
+  mp.command_native_async({
+    name = 'subprocess', playback_only = false,
+    args = { 'curl', '--silent', '--max-time', '1', '-X', 'POST',
+      '-H', 'Content-Type: application/json', '--data', body,
+      'http://127.0.0.1:8484/api/interactions' }
+  }, function() end)
+end
 
 local function save(seconds)
   local file = io.open(path, 'w')
@@ -33,11 +55,14 @@ local function mark_played()
 end
 
 -- Persist roughly every 5s during playback.
+local ticks = 0
 mp.add_periodic_timer(5, function()
   local t = mp.get_property_number('time-pos')
   if t and t > 0 then
     save(t)
     mark_played()
+    ticks = ticks + 1
+    if ticks % 6 == 0 then report('progress') end
   end
 end)
 
@@ -61,12 +86,16 @@ mp.register_event('end-file', function(event)
     save(0)
     mark_played()
     mark_watched()
+    report('complete')
   else
     local t = mp.get_property_number('time-pos')
     if t and t > 0 then
       save(t)
       mark_played()
     end
-    if percent >= 90 then mark_watched() end
+    if percent >= 90 then mark_watched(); report('complete') else report('abandon') end
   end
 end)
+
+mp.register_event('file-loaded', function() report('play') end)
+mp.observe_property('pause', 'bool', function(_, paused) if paused then report('pause') end end)

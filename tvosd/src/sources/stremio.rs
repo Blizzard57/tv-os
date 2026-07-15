@@ -775,6 +775,15 @@ fn parse_meta(json: &str) -> Option<Meta> {
         .unwrap_or_default();
     episodes.sort_by_key(|e| (e.season, e.episode));
 
+    let cast = m.get("cast").and_then(|v| v.as_array()).map(|values| {
+        values.iter().filter_map(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str)))
+            .take(12).map(str::to_owned).collect()
+    }).unwrap_or_default();
+    let trailers = m.get("trailers").and_then(|v| v.as_array()).into_iter().flatten()
+        .filter_map(|v| v.as_str().or_else(|| v.get("source").and_then(Value::as_str)))
+        .map(|value| if value.starts_with("http") { value.to_string() } else { format!("https://www.youtube.com/watch?v={value}") })
+        .take(4).collect();
+
     let id = str_of("id").unwrap_or_default();
     // The stylized title logo is what the details/hero panels want, but Cinemeta
     // (and many meta addons) omit the `logo` field. Stremio itself falls back to
@@ -798,6 +807,8 @@ fn parse_meta(json: &str) -> Option<Meta> {
         rating: str_of("imdbRating"),
         runtime: str_of("runtime"),
         genres,
+        cast,
+        trailers,
         episodes,
         ..Default::default()
     })

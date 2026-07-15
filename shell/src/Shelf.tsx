@@ -1,9 +1,13 @@
 import { useState } from 'react';
-import { ContentItem, InstallJob } from './api';
+import { useEffect } from 'react';
+import { ContentItem, InstallJob, Row, recordInteraction } from './api';
 import { cardSubtitle, isLiveChannelLogo, landscapeArtSources, stateBadge, tileTint } from './cards';
 
 interface Props {
   title: string;
+  rowId?: string;
+  layout?: Row['layout'];
+  explanation?: string;
   items: ContentItem[];
   jobs: InstallJob[];
   onPick: (item: ContentItem) => void;
@@ -17,10 +21,15 @@ interface Props {
  *  (scroll-into-view and the `:focus` highlight follow real DOM focus). Every
  *  content row uses the same landscape card so the home reads as one consistent
  *  grid (see cards.ts). */
-export function Shelf({ title, items, jobs, onPick, onFocusItem }: Props) {
+export function Shelf({ title, rowId, layout = 'landscape', explanation, items, jobs, onPick, onFocusItem }: Props) {
+  useEffect(() => {
+    for (const item of items.slice(0, 12)) {
+      recordInteraction({ item_id: item.id, kind: 'impression', context: rowId || title }).catch(() => {});
+    }
+  }, [rowId, title, items]);
   return (
-    <section className="shelf">
-      <h2 className="shelf-title">{title}</h2>
+    <section className={`shelf shelf--${layout}`}>
+      <div className="shelf-heading"><h2 className="shelf-title">{title}</h2>{explanation && <span>{explanation}</span>}</div>
       <div className="shelf-strip">
         {items.map((item) => (
           <Card

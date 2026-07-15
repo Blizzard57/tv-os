@@ -69,6 +69,8 @@ local BUTTONS = {
   { id = 'rewind',  kind = 'seek', delta = -10 },
   { id = 'play',    kind = 'pause' },
   { id = 'forward', kind = 'seek', delta = 10 },
+  { id = 'skip_intro', kind = 'command', command = 'no-osd add chapter 1' },
+  { id = 'next', kind = 'command', command = 'playlist-next force' },
   { id = 'subs',    kind = 'menu', menu = 'subs' },
   { id = 'audio',   kind = 'menu', menu = 'audio' },
   { id = 'speed',   kind = 'menu', menu = 'speed' },
@@ -379,6 +381,9 @@ local function activate()
     mp.commandv('cycle', 'pause')
   elseif b.kind == 'menu' then
     open_menu(b.menu)
+  elseif b.kind == 'command' then
+    mp.command(b.command)
+    mp.osd_message(b.id == 'skip_intro' and 'Skipped chapter' or 'Next episode', 1.2)
   end
 end
 
@@ -639,7 +644,10 @@ local function render_controls(a, L)
     local focused = state.row == 2 and state.col == i
     if focused then disc(a, COLORS.white, 0, b.x, b.y, b.ring) end
     local glyph_col = focused and COLORS.black or COLORS.text
-    if b.id == 'speed' then
+    if b.id == 'skip_intro' or b.id == 'next' then
+      text(a, b.x, b.y, 5, math.floor(b.glyph * 0.9), glyph_col, 0, true,
+        b.id == 'skip_intro' and 'SKIP' or 'NEXT')
+    elseif b.id == 'speed' then
       -- Show the live speed (like YouTube) rather than a gauge glyph — clearer
       -- at a glance and doubles as the current value.
       local spd = mp.get_property_number('speed') or 1

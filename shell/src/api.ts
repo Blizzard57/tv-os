@@ -60,10 +60,23 @@ export interface ContentItem {
   action: Action;
   /** Optional subtitle override (e.g. a live fixture's carrier channel). */
   note?: string;
+  source?: string;
+  domain?: 'games' | 'sports' | 'movies' | 'shows' | 'youtube' | 'twitch' | 'video';
+  availability?: 'available' | 'installable' | 'upcoming';
+  external_ids?: Record<string, string>;
+  images?: { landscape?: string; portrait?: string; background?: string; logo?: string };
+  progress?: number;
+  badge?: string;
+  release_time?: number;
 }
 
 export interface Row {
+  id?: string;
   title: string;
+  purpose?: 'continue_watching' | 'top_picks' | 'because_you_watched' | 'indian_spotlight' |
+    'live_now' | 'starting_soon' | 'schedule' | 'creators' | 'games' | 'library' | 'discovery';
+  layout?: 'landscape' | 'portrait' | 'progress' | 'circle' | 'live_event' | 'game';
+  explanation?: string;
   items: ContentItem[];
 }
 
@@ -94,6 +107,8 @@ export interface Meta {
   genres: string[];
   tags?: string[];
   screenshots?: string[];
+  cast?: string[];
+  trailers?: string[];
   episodes: Episode[];
 }
 
@@ -160,6 +175,9 @@ export interface Settings {
   live_region: string;
   /** Sports followed on the Live tab, comma/space separated ("" = all). */
   live_sports: string;
+  /** Optional followed competitions and teams, comma-separated. */
+  live_leagues: string;
+  live_teams: string;
   /** Extra IPTV playlists (M3U/M3U8 URLs) folded into the Live tab. */
   iptv_playlists: string;
   /** XMLTV EPG URLs used to match live fixtures to the channel carrying them. */
@@ -170,6 +188,8 @@ export interface Settings {
   trakt_token: string;
   /** AniList access token (implicit grant from your own API client). */
   anilist_token: string;
+  twitch_client_id: string;
+  twitch_token: string;
   /** MyAnimeList client id + token saved by the PKCE callback. */
   mal_client_id: string;
   mal_token: string;
@@ -184,7 +204,56 @@ export interface Settings {
   trakt_client_secret_set?: boolean;
   trakt_token_set?: boolean;
   anilist_token_set?: boolean;
+  twitch_token_set?: boolean;
   mal_token_set?: boolean;
+}
+
+export type InteractionKind = 'impression' | 'focus' | 'play' | 'pause' | 'progress' |
+  'complete' | 'abandon' | 'search' | 'like' | 'dislike' | 'watchlist';
+
+export interface InteractionEvent {
+  item_id: string;
+  kind: InteractionKind;
+  position?: number;
+  duration?: number;
+  context?: string;
+  ts?: number;
+}
+
+export async function recordInteraction(event: InteractionEvent): Promise<void> {
+  const res = await apiFetch('/api/interactions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event),
+  }, SHORT_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`interaction failed: ${res.status}`, 'http', res.status);
+}
+
+export async function fetchHome(tab = 'foryou'): Promise<Row[]> {
+  const res = await apiFetch(`/api/home?tab=${encodeURIComponent(tab)}`, undefined, LONG_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`home failed: ${res.status}`, 'http', res.status);
+  return res.json();
+}
+
+export async function fetchCreators(): Promise<Row[]> {
+  const res = await apiFetch('/api/creators', undefined, LONG_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`creators failed: ${res.status}`, 'http', res.status);
+  return res.json();
+}
+
+export interface SportsInterests { sports: string; leagues: string; teams: string }
+
+export async function saveSportsInterests(interests: SportsInterests): Promise<void> {
+  const res = await apiFetch('/api/interests', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(interests),
+  });
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+}
+
+export async function resolveLive(id: string): Promise<{ resolved: boolean; item?: ContentItem; reason?: string }> {
+  const res = await apiFetch('/api/live/resolve', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
+  }, LONG_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+  return res.json();
 }
 
 // ---- Game page extras (playtime, HLTB, achievements) ----
@@ -233,6 +302,12 @@ export async function traktConnect(): Promise<{ user_code: string; url: string }
 export interface YouTubeStatus {
   connected: boolean;
   detail: string;
+}
+
+export async function fetchTwitchStatus(): Promise<YouTubeStatus> {
+  const res = await apiFetch('/api/twitch/status', undefined, MEDIUM_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`twitch status failed: ${res.status}`, 'http', res.status);
+  return res.json();
 }
 
 /** Whether the signed-in YouTube feeds are reachable (cookie check). */

@@ -70,6 +70,13 @@ pub struct Settings {
     /// orders the Live tab's per-sport rows.
     #[serde(default)]
     pub live_sports: String,
+    /// Optional comma-separated competition ids/names within followed sports.
+    #[serde(default)]
+    pub live_leagues: String,
+    /// Optional comma-separated team ids/names. Matching is normalized by the
+    /// live guide so renames and punctuation do not break a follow.
+    #[serde(default)]
+    pub live_teams: String,
     /// Extra IPTV playlists to fold into the Live tab: M3U/M3U8 URLs,
     /// comma/newline separated. Each channel becomes a live card. The built-in
     /// public catalog (iptv-org) is always included on top of these.
@@ -91,6 +98,12 @@ pub struct Settings {
     /// AniList access token (implicit grant from your own AniList API client).
     #[serde(default)]
     pub anilist_token: String,
+    /// Twitch Helix application credentials and user token. The token is
+    /// write-only and grants read access to followed channels/streams.
+    #[serde(default)]
+    pub twitch_client_id: String,
+    #[serde(default)]
+    pub twitch_token: String,
     /// MyAnimeList API client id (PKCE flow; token saved by the callback).
     #[serde(default)]
     pub mal_client_id: String,
@@ -112,12 +125,16 @@ pub struct SettingsPatch {
     pub game_region: Option<String>,
     pub live_region: Option<String>,
     pub live_sports: Option<String>,
+    pub live_leagues: Option<String>,
+    pub live_teams: Option<String>,
     pub iptv_playlists: Option<String>,
     pub epg_urls: Option<String>,
     pub trakt_client_id: Option<String>,
     pub trakt_client_secret: Option<String>,
     pub trakt_token: Option<String>,
     pub anilist_token: Option<String>,
+    pub twitch_client_id: Option<String>,
+    pub twitch_token: Option<String>,
     pub mal_client_id: Option<String>,
     pub mal_token: Option<String>,
 }
@@ -126,13 +143,14 @@ impl Settings {
     /// References to the write-only secret fields, in a fixed order shared with
     /// [`Self::secret_fields_mut`] and [`SECRET_FIELD_NAMES`] so the redacted
     /// read view and the "empty means unchanged" merge stay in sync.
-    fn secret_fields(&self) -> [&String; 6] {
+    fn secret_fields(&self) -> [&String; 7] {
         [
             &self.steam_api_key,
             &self.tmdb_key,
             &self.trakt_client_secret,
             &self.trakt_token,
             &self.anilist_token,
+            &self.twitch_token,
             &self.mal_token,
         ]
     }
@@ -167,13 +185,14 @@ impl Settings {
         }
     }
 
-    fn secret_fields_mut(&mut self) -> [&mut String; 6] {
+    fn secret_fields_mut(&mut self) -> [&mut String; 7] {
         [
             &mut self.steam_api_key,
             &mut self.tmdb_key,
             &mut self.trakt_client_secret,
             &mut self.trakt_token,
             &mut self.anilist_token,
+            &mut self.twitch_token,
             &mut self.mal_token,
         ]
     }
@@ -216,12 +235,16 @@ impl SettingsPatch {
         set_plain!(game_region);
         set_plain!(live_region);
         set_plain!(live_sports);
+        set_plain!(live_leagues);
+        set_plain!(live_teams);
         set_plain!(iptv_playlists);
         set_plain!(epg_urls);
         set_plain!(trakt_client_id);
         set_secret!(trakt_client_secret);
         set_secret!(trakt_token);
         set_secret!(anilist_token);
+        set_plain!(twitch_client_id);
+        set_secret!(twitch_token);
         set_plain!(mal_client_id);
         set_secret!(mal_token);
         current
@@ -229,12 +252,13 @@ impl SettingsPatch {
 }
 
 /// Names of the write-only secret fields (must match `secret_fields`).
-const SECRET_FIELD_NAMES: [&str; 6] = [
+const SECRET_FIELD_NAMES: [&str; 7] = [
     "steam_api_key",
     "tmdb_key",
     "trakt_client_secret",
     "trakt_token",
     "anilist_token",
+    "twitch_token",
     "mal_token",
 ];
 

@@ -10,6 +10,11 @@ const KB_ROWS = ['abcdefghi', 'jklmnopqr', 'stuvwxyz0', '123456789'];
 const SPECIAL_ROW = 4;
 const SPECIALS = ['Space', '⌫ Delete', 'Clear', '🔍 Search all'] as const;
 const SEARCH_ALL_KEY = 3;
+const FILTERS = [
+  ['all', 'All'], ['movie', 'Movies'], ['series', 'Shows'], ['creators', 'Creators'],
+  ['live', 'Sports'], ['game', 'Games'],
+] as const;
+type SearchFilter = typeof FILTERS[number][0];
 
 /** Map a column between two rows of differing length by relative position, so
  *  moving up/down between rows lands under (roughly) the same spot instead of
@@ -82,6 +87,11 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
   // Deep search: sections replace the keyboard + quick grid until dismissed.
   const [deepRows, setDeepRows] = useState<Row[] | null>(null);
   const [deepBusy, setDeepBusy] = useState(false);
+  const [filter, setFilter] = useState<SearchFilter>('all');
+  const [recent, setRecent] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('tvos.recentSearches') || '[]').slice(0, 6); }
+    catch { return []; }
+  });
   const inputRef = useRef<HTMLInputElement>(null);
   // The whole overlay; spatial nav (moveFocus) walks its focusable controls.
   const rootRef = useRef<HTMLDivElement>(null);
@@ -128,6 +138,9 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
     if (q.length < 2 || deepBusy) return;
     inputRef.current?.blur();
     setDeepBusy(true);
+    const nextRecent = [q, ...recent.filter((v) => v.toLowerCase() !== q.toLowerCase())].slice(0, 6);
+    setRecent(nextRecent);
+    localStorage.setItem('tvos.recentSearches', JSON.stringify(nextRecent));
     const token = ++deepToken.current;
     searchDeep(q)
       .then((rows) => {
@@ -143,7 +156,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
       .finally(() => {
         if (token === deepToken.current) setDeepBusy(false);
       });
-  }, [query, deepBusy]);
+  }, [query, deepBusy, recent]);
 
   const exitDeep = useCallback(() => {
     setDeepRows(null);
@@ -187,7 +200,7 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
         // Down to whichever key sits under its centre (a right-ish letter).
         // Anchor Down from the query line to the first control below it instead.
         if (action === 'down' && document.activeElement === inputRef.current) {
-          const first = rootRef.current?.querySelector<HTMLElement>('.osk-key, .search-card');
+          const first = rootRef.current?.querySelector<HTMLElement>('.search-filter, .osk-key, .search-card');
           if (first) {
             first.focus();
             return;
@@ -268,6 +281,13 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
   );
 
   const deepView = deepRows !== null;
+  const matchesFilter = useCallback((item: ContentItem) => {
+    if (filter === 'all') return true;
+    if (filter === 'creators') return item.domain === 'youtube' || item.domain === 'twitch' || item.id.startsWith('yt:') || item.id.startsWith('twitch:');
+    return item.kind === filter;
+  }, [filter]);
+  const visibleResults = results.filter(matchesFilter);
+  const visibleDeepRows = deepRows?.map((row) => ({ ...row, items: row.items.filter(matchesFilter) })).filter((row) => row.items.length > 0) ?? null;
 
   return (
     <div className="search-scrim" onClick={onClose}>
@@ -279,6 +299,16 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
           placeholder="Search anything — a title, an actor, “k drama”, “time travel”…"
           onChange={(e) => setQuery(e.target.value)}
         />
+        <div className="search-filters" aria-label="Search filters">
+          {FILTERS.map(([id, label]) => (
+            <button key={id} className={`search-filter ${filter === id ? 'active' : ''}`} onClick={() => setFilter(id)}>{label}</button>
+          ))}
+        </div>
+        {!query && recent.length > 0 && (
+          <div className="recent-searches"><span>Recent</span>{recent.map((value) => (
+            <button key={value} onClick={() => setQuery(value)}>↺ {value}</button>
+          ))}</div>
+        )}
 
         {deepBusy && (
           <div className="search-busy">
@@ -292,13 +322,13 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
         {/* Deep sections take over the whole overlay below the query line. */}
         {deepView && !deepBusy && (
           <div className="search-sections">
-            {deepRows.length === 0 && (
+            {visibleDeepRows?.length === 0 && (
               <div className="search-hint">
                 Nothing found for “{query.trim()}”. Try an actor's name, a genre, or an idea
                 like “korean drama” or “time travel”.
               </div>
             )}
-            {deepRows.map((row, r) => (
+            {visibleDeepRows?.map((row, r) => (
               <section key={`${r}:${row.title}`} className="search-section">
                 <h2 className="search-section-head">
                   {row.title}
@@ -350,9 +380,9 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
                   “romcom”).
                 </div>
               ) : (
-                results.length > 0 && (
+                visibleResults.length > 0 && (
                   <div className="search-hint">
-                    {results.length} title match{results.length === 1 ? '' : 'es'} ·{' '}
+                    {visibleResults.length} title match{visibleResults.length === 1 ? '' : 'es'} ·{' '}
                     <span className="key">Enter</span> searches everything — actors, themes,
                     genres
                   </div>
@@ -361,8 +391,8 @@ export function SearchOverlay({ onClose, onPick, actionRef }: Props) {
             </div>
 
             <div className="search-grid">
-              {results.map((item) => renderCard(item))}
-              {query.trim().length >= 2 && results.length === 0 && (
+              {visibleResults.map((item) => renderCard(item))}
+              {query.trim().length >= 2 && visibleResults.length === 0 && (
                 <div className="details-hint">No title matches — press Enter to search deeper.</div>
               )}
             </div>

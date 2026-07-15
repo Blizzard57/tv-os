@@ -36,6 +36,12 @@ pub struct Meta {
     /// Screenshot/preview image URLs — the gallery on the details page.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub screenshots: Vec<String>,
+    /// Principal cast/creators supplied by metadata providers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cast: Vec<String>,
+    /// Playable trailer URLs (normally YouTube).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trailers: Vec<String>,
     /// Episodes for a series; empty for movies and games.
     pub episodes: Vec<Episode>,
 }

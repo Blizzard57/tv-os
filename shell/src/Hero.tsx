@@ -5,15 +5,16 @@ import { gameLogo } from './cards';
 interface Props {
   item: ContentItem | undefined;
   preview: Meta | null;
-  /** True while focus is on a card (shows the "open" affordance). */
-  onRows: boolean;
+  explanation?: string;
+  onOpen: (item: ContentItem) => void;
+  onFocus: (el: HTMLElement) => void;
 }
 
 /** The spotlight at the top of every tab: the focused title's backdrop washed
  *  behind a left-anchored block of logo/title, meta line and synopsis — the
  *  Google-TV "featured" panel. Games show Steam's stylized logo the way movies
  *  show their title treatment. */
-export function Hero({ item, preview, onRows }: Props) {
+export function Hero({ item, preview, explanation, onOpen, onFocus }: Props) {
   const [failedLogos, setFailedLogos] = useState<Set<string>>(() => new Set());
   if (!item) return <div className="hero hero-empty" />;
 
@@ -38,7 +39,7 @@ export function Hero({ item, preview, onRows }: Props) {
       {bg && <div key={bg} className="hero-bg" style={{ backgroundImage: `url(${bg})` }} />}
       <div className="hero-scrim" />
       <div className="hero-content">
-        {!isSys && <div className="hero-kind">{(preview?.kind ?? item.kind).toUpperCase()}</div>}
+        {!isSys && <div className="hero-kind">{explanation || `${(preview?.kind ?? item.kind).toUpperCase()} · Featured for you`}</div>}
         {logo && !isSys ? (
           <img
             key={logo}
@@ -52,11 +53,15 @@ export function Hero({ item, preview, onRows }: Props) {
         )}
         {sub && <div className="hero-sub">{sub}</div>}
         {preview?.description && <p className="hero-desc">{preview.description}</p>}
-        {onRows && (
-          <div className="hero-hint">
-            Press <span className="key">A</span> / <span className="key">Enter</span> to open
-          </div>
-        )}
+        <div className="hero-actions">
+          <button className="hero-primary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
+            <span className="material-icon" aria-hidden>▶</span>
+            {item.action === 'install' ? 'Install' : item.action === 'none' ? 'View details' : 'Watch now'}
+          </button>
+          <button className="hero-secondary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
+            <span className="material-icon" aria-hidden>ⓘ</span> Details
+          </button>
+        </div>
       </div>
     </div>
   );

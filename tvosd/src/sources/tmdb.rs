@@ -293,7 +293,9 @@ fn for_you_embeddings(key: &str, recent: &[ContentItem]) -> Vec<Row> {
         .filter(|(item, _)| !watched.contains(item.id.as_str()))
         .filter_map(|(item, _)| {
             let vec = cache.get(&item.id)?;
-            Some((crate::embed::cosine(&profile, vec), item.clone()))
+            let impressions = crate::profile::STORE.impression_count(&item.id) as f32;
+            let fatigue = impressions.ln_1p() * 0.06;
+            Some((crate::embed::cosine(&profile, vec) - fatigue, item.clone()))
         })
         .collect();
     drop(cache);
@@ -301,10 +303,50 @@ fn for_you_embeddings(key: &str, recent: &[ContentItem]) -> Vec<Row> {
         return Vec::new();
     }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let ranked: Vec<ContentItem> = scored.into_iter().map(|(_, item)| item).collect();
     vec![Row {
         title: "Top picks for you".to_string(),
-        items: scored.into_iter().take(25).map(|(_, item)| item).collect(),
+        items: diversify(ranked, 25),
     }]
+}
+
+/// Greedy diversity pass: similarity still leads, but no more than three
+/// consecutive results share a media type and obvious same-title franchises
+/// are separated. This prevents one binge from fossilizing the whole shelf.
+fn diversify(mut ranked: Vec<ContentItem>, limit: usize) -> Vec<ContentItem> {
+    let mut out: Vec<ContentItem> = Vec::new();
+    while !ranked.is_empty() && out.len() < limit {
+        let recent_kind = out.last().map(|i| i.kind);
+        let same_run = recent_kind
+            .map(|kind| out.iter().rev().take_while(|i| i.kind == kind).count())
+            .unwrap_or(0);
+        let used_roots: std::collections::HashSet<String> = out
+            .iter()
+            .map(|i| {
+                i.title
+                    .split([':', '-', '–'])
+                    .next()
+                    .unwrap_or(&i.title)
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let pick = ranked
+            .iter()
+            .position(|i| {
+                let root = i
+                    .title
+                    .split([':', '-', '–'])
+                    .next()
+                    .unwrap_or(&i.title)
+                    .trim()
+                    .to_ascii_lowercase();
+                (same_run < 3 || Some(i.kind) != recent_kind) && !used_roots.contains(&root)
+            })
+            .unwrap_or(0);
+        out.push(ranked.remove(pick));
+    }
+    out
 }
 
 /// Recency-weighted mean of the recent watches' embeddings = the taste vector.
@@ -486,7 +528,7 @@ fn parse_rich(
                 art: Some(art),
                 action: Action::Play,
                 note: None,
-                        };
+            };
             Some((item, format!("{title}. {genre_names}. {overview}")))
         })
         .collect()
@@ -587,6 +629,42 @@ pub fn because_you_watched(recent: &[ContentItem], max: usize) -> Vec<Row> {
             });
         }
     }
+    rows
+}
+
+/// A guaranteed but taste-ordered discovery floor for Indian cinema and
+/// series. TMDB accepts pipe-separated original-language filters, covering
+/// Hindi, Tamil, Telugu, Malayalam, Bengali, Punjabi, Marathi and Kannada.
+pub fn indian_spotlight(recent: &[ContentItem]) -> Vec<Row> {
+    let languages = "hi|ta|te|ml|bn|pa|mr|kn";
+    let (movies, shows) = std::thread::scope(|s| {
+        let movies = s.spawn(|| discover("movie", &[], &[], Some(languages), &[], 25));
+        let shows = s.spawn(|| discover("tv", &[], &[], Some(languages), &[], 10));
+        (
+            movies.join().unwrap_or_default(),
+            shows.join().unwrap_or_default(),
+        )
+    });
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    let max = movies.len().max(shows.len());
+    for i in 0..max {
+        if let Some(item) = movies.get(i).cloned().filter(|v| seen.insert(v.id.clone())) {
+            items.push(item);
+        }
+        if let Some(item) = shows.get(i).cloned().filter(|v| seen.insert(v.id.clone())) {
+            items.push(item);
+        }
+    }
+    items.truncate(25);
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![Row {
+        title: "Indian Spotlight".into(),
+        items,
+    }];
+    personalize(&mut rows, recent);
     rows
 }
 
@@ -706,7 +784,7 @@ fn parse_search(json: &str) -> (Vec<ContentItem>, Vec<Person>) {
                 art: Some(art),
                 action: Action::Play,
                 note: None,
-                        })
+            })
         })
         .take(ROW_LIMIT * 2)
         .collect();
@@ -793,7 +871,7 @@ pub fn person_credits(person_id: i64) -> Vec<ContentItem> {
                     art: Some(art),
                     action: Action::Play,
                     note: None,
-                                },
+                },
             ))
         })
         .collect();
@@ -1050,7 +1128,7 @@ fn parse_trending(json: &str, media: &str) -> Vec<ContentItem> {
                 art: Some(art),
                 action: Action::Play,
                 note: None,
-                        })
+            })
         })
         .collect()
 }
