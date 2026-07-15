@@ -68,10 +68,13 @@ export interface ContentItem {
   progress?: number;
   badge?: string;
   release_time?: number;
+  creator_type?: 'video' | 'vod' | 'live_stream' | 'channel' | 'category';
+  creator_name?: string;
 }
 
 export interface Row {
   id?: string;
+  destination?: 'home' | 'live' | 'movies' | 'shows' | 'creators' | 'games' | 'library';
   title: string;
   purpose?: 'continue_watching' | 'top_picks' | 'because_you_watched' | 'indian_spotlight' |
     'live_now' | 'starting_soon' | 'schedule' | 'creators' | 'games' | 'library' | 'discovery';
@@ -225,6 +228,23 @@ export async function recordInteraction(event: InteractionEvent): Promise<void> 
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event),
   }, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`interaction failed: ${res.status}`, 'http', res.status);
+}
+
+let interactionQueue: InteractionEvent[] = [];
+let interactionFlush: number | undefined;
+
+/** Queue low-priority personalization telemetry so focus never waits on I/O. */
+export function queueInteractions(events: InteractionEvent[]): void {
+  interactionQueue.push(...events);
+  if (interactionFlush !== undefined) return;
+  interactionFlush = window.setTimeout(() => {
+    interactionFlush = undefined;
+    const batch = interactionQueue.splice(0, interactionQueue.length);
+    if (!batch.length) return;
+    apiFetch('/api/interactions/batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(batch),
+    }, SHORT_TIMEOUT_MS).catch(() => {});
+  }, 750);
 }
 
 export async function fetchHome(tab = 'foryou'): Promise<Row[]> {

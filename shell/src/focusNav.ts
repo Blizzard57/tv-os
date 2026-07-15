@@ -3,13 +3,54 @@
 // directions use on-screen geometry, so moving right from the category rail
 // enters the detail pane instead of walking down the DOM-order category list.
 
+interface FocusCache {
+  elements: HTMLElement[];
+  rects: Map<HTMLElement, DOMRect>;
+  dirty: boolean;
+  observer: MutationObserver;
+  resize: ResizeObserver;
+}
+
+const focusCache = new WeakMap<HTMLElement, FocusCache>();
+
+function cachedLayout(root: HTMLElement): FocusCache {
+  let cached = focusCache.get(root);
+  if (!cached) {
+    cached = {
+      elements: [],
+      rects: new Map(),
+      dirty: true,
+      observer: new MutationObserver(() => {
+        const value = focusCache.get(root);
+        if (value) value.dirty = true;
+      }),
+      resize: new ResizeObserver(() => {
+        const value = focusCache.get(root);
+        if (value) value.dirty = true;
+      }),
+    };
+    cached.observer.observe(root, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'disabled', 'tabindex'],
+    });
+    cached.resize.observe(root);
+    focusCache.set(root, cached);
+  }
+  if (cached.dirty) {
+    cached.elements = Array.from(
+      root.querySelectorAll<HTMLElement>('button, input, select, textarea, [tabindex]:not([tabindex="-1"])'),
+    ).filter((el) => el.offsetParent !== null && !el.hasAttribute('disabled'));
+    cached.rects = new Map(cached.elements.map((el) => [el, el.getBoundingClientRect()]));
+    cached.dirty = false;
+  }
+  return cached;
+}
+
 /** Focusable controls inside `root`, in document order, visible only. */
 export function focusables(root: HTMLElement): HTMLElement[] {
-  return Array.from(
-    root.querySelectorAll<HTMLElement>(
-      'button, input, select, [tabindex]:not([tabindex="-1"])',
-    ),
-  ).filter((el) => el.offsetParent !== null && !el.hasAttribute('disabled'));
+  return cachedLayout(root).elements;
 }
 
 /** Moves focus within `root` in the given direction; focuses the first
@@ -19,9 +60,10 @@ export function focusables(root: HTMLElement): HTMLElement[] {
 export function moveFocus(
   root: HTMLElement,
   dir: 'up' | 'down' | 'left' | 'right',
-  smooth = true,
+  smooth = false,
 ): boolean {
-  const els = focusables(root);
+  const layout = cachedLayout(root);
+  const els = layout.elements;
   if (els.length === 0) return false;
   const active = document.activeElement as HTMLElement | null;
   const current = active && els.indexOf(active);
@@ -30,11 +72,11 @@ export function moveFocus(
   if (current === null || current === -1) {
     next = els[0];
   } else {
-    const rect = els[current].getBoundingClientRect();
+    const rect = layout.rects.get(els[current]) ?? els[current].getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
     const candidates = els
-      .map((el) => ({ el, r: el.getBoundingClientRect() }))
+      .map((el) => ({ el, r: layout.rects.get(el) ?? el.getBoundingClientRect() }))
       .filter(({ el, r }) => {
         if (el === active) return false;
         if (dir === 'down') return r.top >= rect.bottom - 1;

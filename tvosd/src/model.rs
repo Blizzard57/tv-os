@@ -83,6 +83,20 @@ impl Serialize for ContentItem {
         if !external_ids.is_empty() {
             map.serialize_entry("external_ids", &external_ids)?;
         }
+        if self.id.starts_with("yt:") {
+            map.serialize_entry("creator_type", "video")?;
+        } else if let Some(rest) = self.id.strip_prefix("twitch:") {
+            let kind = rest.split(':').next().unwrap_or("live");
+            map.serialize_entry(
+                "creator_type",
+                match kind {
+                    "vod" => "vod",
+                    "channel" => "channel",
+                    "category" => "category",
+                    _ => "live_stream",
+                },
+            )?;
+        }
         map.end()
     }
 }
@@ -151,6 +165,7 @@ pub enum CardLayout {
     Landscape,
     Portrait,
     Progress,
+    #[allow(dead_code)]
     Circle,
     LiveEvent,
     Game,
@@ -194,7 +209,9 @@ impl Row {
             RowPurpose::LiveNow | RowPurpose::StartingSoon | RowPurpose::Schedule => {
                 CardLayout::LiveEvent
             }
-            RowPurpose::Creators => CardLayout::Circle,
+            // Creator *videos* and live streams use their native 16:9 art.
+            // Circular cards are reserved for an explicit channel directory.
+            RowPurpose::Creators => CardLayout::Landscape,
             RowPurpose::Games => CardLayout::Game,
             RowPurpose::IndianSpotlight => CardLayout::Portrait,
             _ => CardLayout::Landscape,
@@ -222,8 +239,18 @@ impl Serialize for Row {
     {
         use serde::ser::SerializeStruct;
         let purpose = self.purpose();
-        let mut row = serializer.serialize_struct("Row", 6)?;
+        let mut row = serializer.serialize_struct("Row", 7)?;
         row.serialize_field("id", &self.stable_id())?;
+        row.serialize_field(
+            "destination",
+            match purpose {
+                RowPurpose::LiveNow | RowPurpose::StartingSoon | RowPurpose::Schedule => "live",
+                RowPurpose::Creators => "creators",
+                RowPurpose::Games => "games",
+                RowPurpose::Library => "library",
+                _ => "home",
+            },
+        )?;
         row.serialize_field("title", &self.title)?;
         row.serialize_field("purpose", &purpose)?;
         row.serialize_field("layout", &self.layout())?;
@@ -236,5 +263,29 @@ impl Serialize for Row {
         row.serialize_field("explanation", &explanation)?;
         row.serialize_field("items", &self.items)?;
         row.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creator_streams_use_landscape_semantics() {
+        let row = Row {
+            title: "Twitch · Followed live".into(),
+            items: vec![ContentItem {
+                id: "twitch:live:creator".into(),
+                kind: Kind::Video,
+                title: "Live stream".into(),
+                art: Some("thumb".into()),
+                action: Action::Play,
+                note: None,
+            }],
+        };
+        let value = serde_json::to_value(row).unwrap();
+        assert_eq!(value["destination"], "creators");
+        assert_eq!(value["layout"], "landscape");
+        assert_eq!(value["items"][0]["creator_type"], "live_stream");
     }
 }

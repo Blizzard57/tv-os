@@ -1,6 +1,5 @@
-import { useState } from 'react';
-import { useEffect } from 'react';
-import { ContentItem, InstallJob, Row, recordInteraction } from './api';
+import { memo, useEffect, useMemo, useState } from 'react';
+import { ContentItem, InstallJob, Row, queueInteractions } from './api';
 import { cardSubtitle, isLiveChannelLogo, landscapeArtSources, stateBadge, tileTint } from './cards';
 
 interface Props {
@@ -13,6 +12,7 @@ interface Props {
   onPick: (item: ContentItem) => void;
   /** Focus reached a card — App syncs the hero and remembers the spot. */
   onFocusItem: (item: ContentItem, el: HTMLElement) => void;
+  shelfIndex: number;
 }
 
 /** One home shelf: a title and a horizontally-scrolling strip of Google-TV
@@ -21,40 +21,53 @@ interface Props {
  *  (scroll-into-view and the `:focus` highlight follow real DOM focus). Every
  *  content row uses the same landscape card so the home reads as one consistent
  *  grid (see cards.ts). */
-export function Shelf({ title, rowId, layout = 'landscape', explanation, items, jobs, onPick, onFocusItem }: Props) {
+export const Shelf = memo(function Shelf({ title, rowId, layout = 'landscape', explanation, items, jobs, onPick, onFocusItem, shelfIndex }: Props) {
+  const jobsById = useMemo(
+    () => new Map(jobs.filter((job) => job.status === 'running').map((job) => [job.id, job])),
+    [jobs],
+  );
   useEffect(() => {
-    for (const item of items.slice(0, 12)) {
-      recordInteraction({ item_id: item.id, kind: 'impression', context: rowId || title }).catch(() => {});
-    }
+    queueInteractions(items.slice(0, 12).map((item) => ({
+      item_id: item.id, kind: 'impression', context: rowId || title,
+    })));
   }, [rowId, title, items]);
   return (
-    <section className={`shelf shelf--${layout}`}>
+    <section className={`shelf shelf--${layout}`} data-destination={items[0]?.domain === 'youtube' || items[0]?.domain === 'twitch' ? 'creators' : undefined}>
       <div className="shelf-heading"><h2 className="shelf-title">{title}</h2>{explanation && <span>{explanation}</span>}</div>
       <div className="shelf-strip">
-        {items.map((item) => (
+        {items.map((item, itemIndex) => (
           <Card
             key={item.id}
             item={item}
-            job={jobs.find((j) => j.id === item.id && j.status === 'running')}
+            job={jobsById.get(item.id)}
             onClick={() => onPick(item)}
             onFocus={(el) => onFocusItem(item, el)}
+            shelfIndex={shelfIndex}
+            itemIndex={itemIndex}
+            focusKey={`card:${rowId || title}:${item.id}`}
           />
         ))}
       </div>
     </section>
   );
-}
+});
 
 function Card({
   item,
   job,
   onClick,
   onFocus,
+  shelfIndex,
+  itemIndex,
+  focusKey,
 }: {
   item: ContentItem;
   job?: InstallJob;
   onClick: () => void;
   onFocus: (el: HTMLElement) => void;
+  shelfIndex: number;
+  itemIndex: number;
+  focusKey: string;
 }) {
   const [artStep, setArtStep] = useState(0);
   const sources = landscapeArtSources(item);
@@ -70,10 +83,14 @@ function Card({
     <div
       className="card"
       tabIndex={0}
+      data-shelf-index={shelfIndex}
+      data-item-index={itemIndex}
+      data-focus-key={focusKey}
+      data-creator-type={item.creator_type}
       onClick={onClick}
       onFocus={(e) => {
         onFocus(e.currentTarget);
-        e.currentTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+        e.currentTarget.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
       }}
     >
       <div

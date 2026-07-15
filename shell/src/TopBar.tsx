@@ -43,6 +43,7 @@ export function TopBar({
       </div>
 
       <button
+        data-focus-key="chrome:search"
         className="top-pill top-search"
         onClick={onSearch}
         onFocus={(e) => onFocusChrome(e.currentTarget)}
@@ -59,6 +60,7 @@ export function TopBar({
             <button
               key={t.id}
               data-tab={t.id}
+              data-focus-key={`tab:${t.id}`}
               className={`top-tab ${t.id === activeTab ? 'top-tab-active' : ''} ${dim ? 'top-tab-dim' : ''}`}
               onClick={() => onSelectTab(t.id)}
               onFocus={(e) => onFocusTab(t.id, e.currentTarget)}
@@ -72,6 +74,7 @@ export function TopBar({
       <div className="top-right">
         <Clock />
         <button
+          data-focus-key="chrome:settings"
           className="top-icon"
           onClick={onSettings}
           onFocus={(e) => onFocusChrome(e.currentTarget)}
@@ -80,6 +83,7 @@ export function TopBar({
           <span className="top-icon-glyph">⚙</span>
         </button>
         <button
+          data-focus-key="chrome:theme"
           className="top-icon"
           onClick={onToggleTheme}
           onFocus={(e) => onFocusChrome(e.currentTarget)}

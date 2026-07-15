@@ -632,38 +632,46 @@ pub fn because_you_watched(recent: &[ContentItem], max: usize) -> Vec<Row> {
     rows
 }
 
-/// A guaranteed but taste-ordered discovery floor for Indian cinema and
-/// series. TMDB accepts pipe-separated original-language filters, covering
-/// Hindi, Tamil, Telugu, Malayalam, Bengali, Punjabi, Marathi and Kannada.
-pub fn indian_spotlight(recent: &[ContentItem]) -> Vec<Row> {
-    let languages = "hi|ta|te|ml|bn|pa|mr|kn";
-    let (movies, shows) = std::thread::scope(|s| {
-        let movies = s.spawn(|| discover("movie", &[], &[], Some(languages), &[], 25));
-        let shows = s.spawn(|| discover("tv", &[], &[], Some(languages), &[], 10));
+/// Stable editorial discovery, taste-ordered without forcing any language or
+/// region. Regional titles participate naturally through TMDB's trending
+/// pools and rise only when their content is relevant to the local profile.
+pub fn editorial_for_you(recent: &[ContentItem]) -> Vec<Row> {
+    let Some(key) = api_key() else {
+        return Vec::new();
+    };
+    let (new_movies, new_shows, trending_movies, trending_shows) = std::thread::scope(|scope| {
+        let new_movies = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/movie/now_playing?api_key={key}"))
+            .map(|json| parse_trending(&json, "movie")).unwrap_or_default());
+        let new_shows = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/tv/on_the_air?api_key={key}"))
+            .map(|json| parse_trending(&json, "tv")).unwrap_or_default());
+        let trending_movies = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/trending/movie/week?api_key={key}"))
+            .map(|json| parse_trending(&json, "movie")).unwrap_or_default());
+        let trending_shows = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/trending/tv/week?api_key={key}"))
+            .map(|json| parse_trending(&json, "tv")).unwrap_or_default());
         (
-            movies.join().unwrap_or_default(),
-            shows.join().unwrap_or_default(),
+            new_movies.join().unwrap_or_default(),
+            new_shows.join().unwrap_or_default(),
+            trending_movies.join().unwrap_or_default(),
+            trending_shows.join().unwrap_or_default(),
         )
     });
-    let mut seen = std::collections::HashSet::new();
-    let mut items = Vec::new();
-    let max = movies.len().max(shows.len());
-    for i in 0..max {
-        if let Some(item) = movies.get(i).cloned().filter(|v| seen.insert(v.id.clone())) {
-            items.push(item);
+    let interleave = |movies: Vec<ContentItem>, shows: Vec<ContentItem>| {
+        let mut out = Vec::new();
+        for index in 0..movies.len().max(shows.len()) {
+            if let Some(item) = movies.get(index) { out.push(item.clone()); }
+            if let Some(item) = shows.get(index) { out.push(item.clone()); }
         }
-        if let Some(item) = shows.get(i).cloned().filter(|v| seen.insert(v.id.clone())) {
-            items.push(item);
-        }
+        out
+    };
+    let mut rows = Vec::new();
+    let fresh = interleave(new_movies, new_shows);
+    if fresh.len() >= 4 {
+        rows.push(Row { title: "New & noteworthy".into(), items: fresh });
     }
-    items.truncate(25);
-    if items.is_empty() {
-        return Vec::new();
+    let trending = interleave(trending_movies, trending_shows);
+    if trending.len() >= 4 {
+        rows.push(Row { title: "Trending now".into(), items: trending });
     }
-    let mut rows = vec![Row {
-        title: "Indian Spotlight".into(),
-        items,
-    }];
     personalize(&mut rows, recent);
     rows
 }
@@ -923,24 +931,10 @@ pub fn keyword_ids(text: &str) -> Vec<(i64, String)> {
 /// titles alone are enough to bias ordering). Keyed by lowercase title.
 static TITLE_EMB: LazyLock<Mutex<HashMap<String, Vec<f32>>>> = LazyLock::new(Mutex::default);
 
-fn xorshift01(state: &mut u64) -> f32 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    ((*state >> 40) as f32) / ((1u64 << 24) as f32)
-}
-
-/// Fresh-feeling home: every section is reordered by similarity to what the
-/// user actually consumes (when the on-box embedder is warm) plus a dash of
-/// randomness, so each visit surfaces new finds mixed with familiar ones.
+/// Every section is stably reordered by similarity to what the user actually
+/// consumes when the on-box embedder is warm.
 /// Continue rows (recency) and YouTube rows (upload order) keep their order.
 pub fn personalize(rows: &mut [Row], recent: &[ContentItem]) {
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9e3779b9)
-        | 1;
-
     let profile = if crate::embed::ready() && !recent.is_empty() {
         api_key().and_then(|key| profile_vector(&key, recent))
     } else {
@@ -985,8 +979,7 @@ pub fn personalize(rows: &mut [Row], recent: &[ContentItem]) {
                     (Some(p), Some(v)) => crate::embed::cosine(p, v),
                     _ => 0.0,
                 };
-                // Taste leads, the jitter keeps it from fossilizing.
-                (taste + xorshift01(&mut seed) * 0.25, item)
+                (taste, item)
             })
             .collect();
         drop(cache);

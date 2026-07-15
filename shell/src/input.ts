@@ -56,8 +56,8 @@ const DPAD: [number, NavAction][] = [
 // the edge therefore can't flicker and phantom-scroll.
 const STICK_ENTER = 0.5;
 const STICK_RELEASE = 0.3;
-const REPEAT_DELAY_MS = 400;
-const REPEAT_RATE_MS = 130;
+const REPEAT_DELAY_MS = 250;
+const REPEAT_RATE_MS = 80;
 // 30 Hz is more than enough for a 130 ms navigation repeat cadence and avoids
 // forcing the WebKit renderer to wake at display refresh rate just to sample a
 // controller. Polling stops entirely without a connected pad or while hidden.
@@ -85,6 +85,22 @@ export function useTvInput(onAction: (action: NavAction) => void) {
   handler.current = onAction;
 
   useEffect(() => {
+    let queuedDirection: NavAction | null = null;
+    let directionFrame: number | null = null;
+    const emit = (action: NavAction) => {
+      if (!REPEATABLE[action]) {
+        handler.current(action);
+        return;
+      }
+      queuedDirection = action;
+      if (directionFrame !== null) return;
+      directionFrame = window.requestAnimationFrame(() => {
+        directionFrame = null;
+        const next = queuedDirection;
+        queuedDirection = null;
+        if (next) handler.current(next);
+      });
+    };
     const onKeyDown = (e: KeyboardEvent) => {
       // Form fields (the Settings panel) need care so the d-pad behaves like a
       // TV, not a desktop form:
@@ -113,7 +129,7 @@ export function useTvInput(onAction: (action: NavAction) => void) {
         // Esc doesn't over-push/over-pop the nav stack. Directional keys keep
         // their hold-to-scroll repeat.
         if (e.repeat && !REPEATABLE[action]) return;
-        handler.current(action);
+        emit(action);
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -171,11 +187,11 @@ export function useTvInput(onAction: (action: NavAction) => void) {
       if (direction !== heldDirection) {
         heldDirection = direction;
         if (direction) {
-          handler.current(direction);
+          emit(direction);
           nextRepeatAt = now + REPEAT_DELAY_MS;
         }
       } else if (direction && now >= nextRepeatAt) {
-        handler.current(direction);
+        emit(direction);
         nextRepeatAt = now + REPEAT_RATE_MS;
       }
 
@@ -184,11 +200,11 @@ export function useTvInput(onAction: (action: NavAction) => void) {
       const xDown = pad.buttons[BUTTON_X]?.pressed ?? false;
       const yDown = pad.buttons[BUTTON_Y]?.pressed ?? false;
       const startDown = pad.buttons[BUTTON_START]?.pressed ?? false;
-      if (aDown && !aWasDown) handler.current('confirm');
-      if (bDown && !bWasDown) handler.current('back');
-      if (xDown && !xWasDown) handler.current('enhance');
-      if (yDown && !yWasDown) handler.current('theme');
-      if (startDown && !startWasDown) handler.current('settings');
+      if (aDown && !aWasDown) emit('confirm');
+      if (bDown && !bWasDown) emit('back');
+      if (xDown && !xWasDown) emit('enhance');
+      if (yDown && !yWasDown) emit('theme');
+      if (startDown && !startWasDown) emit('settings');
       aWasDown = aDown;
       bWasDown = bDown;
       xWasDown = xDown;
@@ -225,6 +241,7 @@ export function useTvInput(onAction: (action: NavAction) => void) {
       window.removeEventListener('gamepadconnected', onGamepadConnected);
       window.removeEventListener('gamepaddisconnected', onGamepadDisconnected);
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (directionFrame !== null) window.cancelAnimationFrame(directionFrame);
       stopPolling();
     };
   }, []);

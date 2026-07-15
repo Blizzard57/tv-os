@@ -10,7 +10,7 @@ import {
   fetchInstalls,
   fetchLibrary,
   fetchMeta,
-  recordInteraction,
+  queueInteractions,
   fetchSettings,
   saveSettings,
 } from './api';
@@ -113,16 +113,25 @@ export default function App() {
   const { jobs, refresh: refreshJobs } = useInstallJobs(() => loadLibrary());
 
   // The shelves visible under the active tab: the tab's kind-filtered rows.
-  const shelves = useMemo<Row[]>(() => rowsForTab(activeTab, rows ?? []), [activeTab, rows]);
+  const tabRows = useMemo(() => Object.fromEntries(
+    TABS.map((tab) => [tab.id, rowsForTab(tab.id, rows ?? [])]),
+  ) as Record<TabId, Row[]>, [rows]);
+  const shelves = tabRows[activeTab];
   const featured = useMemo(() => {
-    const preferred = shelves.find((r) => r.purpose === 'top_picks') || shelves.find((r) => r.purpose === 'live_now') || shelves[0];
-    return preferred?.items.slice(0, 6) ?? [];
+    const preferred = shelves.find((r) => r.purpose === 'top_picks') || shelves[0];
+    const items = preferred?.items.filter((item) => activeTab !== 'foryou' || item.kind === 'movie' || item.kind === 'series') ?? [];
+    return items.slice(0, 6);
   }, [shelves]);
   const [featuredIndex, setFeaturedIndex] = useState(0);
+  const lastNavigationAt = useRef(performance.now());
   useEffect(() => setFeaturedIndex(0), [activeTab]);
   useEffect(() => {
     if (featured.length < 2 || overlayOpen) return;
-    const timer = window.setInterval(() => setFeaturedIndex((i) => (i + 1) % featured.length), 12_000);
+    const timer = window.setInterval(() => {
+      if (performance.now() - lastNavigationAt.current >= 8_000) {
+        setFeaturedIndex((i) => (i + 1) % featured.length);
+      }
+    }, 12_000);
     return () => window.clearInterval(timer);
   }, [featured.length, overlayOpen]);
   const featuredItem = featured[featuredIndex] || heroItem;
@@ -142,7 +151,8 @@ export default function App() {
   const settingsActionRef = useRef<((a: NavAction) => void) | null>(null);
   const searchActionRef = useRef<((a: NavAction) => void) | null>(null);
   // The last home control that held focus, restored when an overlay closes.
-  const lastHomeFocus = useRef<HTMLElement | null>(null);
+  const lastHomeFocus = useRef<string | null>(null);
+  const focusDwell = useRef<number>();
   // Mirrors read inside event handlers (avoid stale closures).
   const overlayOpenRef = useRef(overlayOpen);
   overlayOpenRef.current = overlayOpen;
@@ -232,6 +242,13 @@ export default function App() {
     );
     target?.focus();
   }, [rowsRoot]);
+  const focusShelfCard = useCallback((shelfIndex: number, itemIndex: number) => {
+    const cards = rowsRoot()?.querySelectorAll<HTMLElement>(`.card[data-shelf-index="${shelfIndex}"]`);
+    if (!cards?.length) return false;
+    const target = cards[Math.min(itemIndex, cards.length - 1)];
+    target.focus();
+    return true;
+  }, [rowsRoot]);
   const focusActiveTab = useCallback(() => {
     (topbarRoot()?.querySelector<HTMLElement>('.top-tab-active') ??
       topbarRoot()?.querySelector<HTMLElement>('.top-tab'))?.focus();
@@ -241,12 +258,16 @@ export default function App() {
   // spot so returning from an overlay lands where you left.
   const onCardFocus = useCallback((item: ContentItem, el: HTMLElement) => {
     setZone('rows');
-    lastHomeFocus.current = el;
-    recordInteraction({ item_id: item.id, kind: 'focus', context: activeTabRef.current }).catch(() => {});
+    lastHomeFocus.current = el.dataset.focusKey ?? `card:${item.id}`;
+    window.clearTimeout(focusDwell.current);
+    focusDwell.current = window.setTimeout(() => {
+      queueInteractions([{ item_id: item.id, kind: 'focus', context: activeTabRef.current }]);
+    }, 600);
   }, []);
+  useEffect(() => () => window.clearTimeout(focusDwell.current), []);
   const firstItemOfTab = useCallback(
-    (id: TabId) => rowsForTab(id, rows ?? [])[0]?.items[0],
-    [rows],
+    (id: TabId) => tabRows[id][0]?.items[0],
+    [tabRows],
   );
   const onTabFocus = useCallback(
     (id: TabId, el: HTMLElement) => {
@@ -254,7 +275,7 @@ export default function App() {
       switchTab(id);
       setHeroItem(firstItemOfTab(id));
       setZone('topbar');
-      lastHomeFocus.current = el;
+      lastHomeFocus.current = el.dataset.focusKey ?? `tab:${id}`;
     },
     [switchTab, firstItemOfTab],
   );
@@ -262,7 +283,7 @@ export default function App() {
     (el: HTMLElement) => {
       setHeroItem(firstItemOfTab(activeTabRef.current));
       setZone('topbar');
-      lastHomeFocus.current = el;
+      lastHomeFocus.current = el.dataset.focusKey ?? null;
     },
     [firstItemOfTab],
   );
@@ -283,6 +304,7 @@ export default function App() {
 
   const onAction = useCallback(
     (action: NavAction) => {
+      lastNavigationAt.current = performance.now();
       // ---- Overlays own input while open ----
       if (searchOpen) {
         if (action === 'search') setSearchOpen(false);
@@ -323,6 +345,26 @@ export default function App() {
       // returns to the active tab rather than jumping to an arbitrary one.
       const rows = rowsRoot();
       if (!rows) return;
+      const active = document.activeElement as HTMLElement | null;
+      const card = active?.closest<HTMLElement>('.card[data-shelf-index][data-item-index]');
+      if (card) {
+        const shelfIndex = Number(card.dataset.shelfIndex);
+        const itemIndex = Number(card.dataset.itemIndex);
+        if (action === 'left') focusShelfCard(shelfIndex, Math.max(0, itemIndex - 1));
+        else if (action === 'right') focusShelfCard(shelfIndex, itemIndex + 1);
+        else if (action === 'down') focusShelfCard(shelfIndex + 1, itemIndex);
+        else if (action === 'up') {
+          if (shelfIndex > 0) focusShelfCard(shelfIndex - 1, itemIndex);
+          else rows.querySelector<HTMLElement>('.hero-primary')?.focus();
+        }
+        return;
+      }
+      if (active?.closest('.hero-actions')) {
+        if (action === 'down') focusShelfCard(0, 0);
+        else if (action === 'left' || action === 'right') moveFocus(rows, action);
+        else if (action === 'up') focusActiveTab();
+        return;
+      }
       if (action === 'up') {
         if (!moveFocus(rows, 'up')) focusActiveTab();
       } else {
@@ -339,6 +381,7 @@ export default function App() {
       topbarRoot,
       rowsRoot,
       focusFirstCard,
+      focusShelfCard,
       focusActiveTab,
     ],
   );
@@ -354,9 +397,10 @@ export default function App() {
       return;
     }
     if (!rows) return;
-    const el = lastHomeFocus.current;
-    if (el && el.isConnected) el.focus();
-    else focusFirstCard();
+    const key = lastHomeFocus.current;
+    const el = key ? Array.from(appRef.current?.querySelectorAll<HTMLElement>('[data-focus-key]') ?? [])
+      .find((candidate) => candidate.dataset.focusKey === key) : null;
+    if (el) el.focus(); else focusFirstCard();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlayOpen, rows === null, error]);
 
@@ -405,7 +449,7 @@ export default function App() {
           ) : (
             shelves.map((shelf, i) => (
               <Shelf
-                key={`${activeTab}-${i}-${shelf.title}`}
+                key={`${activeTab}-${shelf.id || shelf.title}`}
                 title={shelf.title}
                 rowId={shelf.id}
                 layout={shelf.layout}
@@ -414,6 +458,7 @@ export default function App() {
                 onPick={activateItem}
                 onFocusItem={onCardFocus}
                 jobs={jobs}
+                shelfIndex={i}
               />
             ))
           )}

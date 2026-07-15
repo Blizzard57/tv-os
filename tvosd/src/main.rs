@@ -289,6 +289,7 @@ async fn main() {
         .route("/api/home", get(get_home))
         .route("/api/creators", get(get_creators))
         .route("/api/interactions", post(post_interaction))
+        .route("/api/interactions/batch", post(post_interactions_batch))
         .route("/api/interests", get(get_interests).put(put_interests))
         .route("/api/health", get(get_health))
         .route("/api/sources", get(get_sources))
@@ -541,7 +542,7 @@ async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
             });
 
             r.extend(bcw);
-            r.extend(sources::tmdb::indian_spotlight(&recent));
+            r.extend(sources::tmdb::editorial_for_you(&recent));
 
             // Your installed/owned games → the "Games" row. Non-game library
             // rows are kept ONLY when personal (your watchlist / owned rows);
@@ -658,9 +659,30 @@ async fn get_home(State(app): State<Shared>, Query(q): Query<HomeQuery>) -> Json
                     | model::RowPurpose::Games
             )
         }),
-        _ => rows.retain(|r| !matches!(r.purpose(), model::RowPurpose::Creators)),
+        _ => {
+            filter_rows(&mut rows, |i| matches!(i.kind, model::Kind::Movie | model::Kind::Series));
+            rows.retain(|r| !matches!(r.purpose(), model::RowPurpose::Creators));
+            curate_home_rows(&mut rows);
+        }
     }
     Json(rows)
+}
+
+fn curate_home_rows(rows: &mut Vec<model::Row>) {
+    rows.sort_by_key(|row| match row.purpose() {
+        model::RowPurpose::ContinueWatching => 0,
+        model::RowPurpose::TopPicks => 1,
+        model::RowPurpose::BecauseYouWatched => 2,
+        model::RowPurpose::Discovery if row.title.starts_with("New episodes") => 3,
+        model::RowPurpose::Discovery if row.title.starts_with("New & noteworthy") => 4,
+        _ => 5,
+    });
+    let mut seen = std::collections::HashSet::new();
+    for row in rows.iter_mut() {
+        row.items.retain(|item| seen.insert(item.id.clone()));
+    }
+    rows.retain(|row| !row.items.is_empty());
+    rows.truncate(8);
 }
 
 fn filter_rows(rows: &mut Vec<model::Row>, keep: impl Fn(&model::ContentItem) -> bool + Copy) {
@@ -690,6 +712,20 @@ async fn post_interaction(
         .record(&event)
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))
+}
+
+async fn post_interactions_batch(
+    Json(events): Json<Vec<profile::InteractionEvent>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if events.len() > 256 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "at most 256 interactions per batch".into()));
+    }
+    for event in &events {
+        profile::STORE
+            .record(event)
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_interests() -> Json<serde_json::Value> {
@@ -851,16 +887,28 @@ async fn post_install_cancel(
 /// `<field>_set` booleans so the UI can still show "configured". PUT keeps the
 /// full values; an empty secret on PUT is treated as "unchanged".
 async fn get_settings() -> Json<serde_json::Value> {
-    Json(settings::STORE.get().redacted())
+    Json(settings_response())
 }
 
 async fn put_settings(
     Json(patch): Json<settings::SettingsPatch>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     settings::STORE
         .patch(patch)
-        .map(|()| StatusCode::NO_CONTENT)
+        .map(|()| Json(settings_response()))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, util::scrub_secrets(&e)))
+}
+
+fn settings_response() -> serde_json::Value {
+    let mut value = settings::STORE.get().redacted();
+    if let Some(object) = value.as_object_mut() {
+        let revision = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default();
+        object.insert("_revision".into(), revision.into());
+    }
+    value
 }
 
 /// Tests the saved Steam credentials; runs on a blocking thread (network).
@@ -1574,5 +1622,32 @@ mod tests {
         assert!(
             validate_web_url(&format!("https://example.com/{}", "x".repeat(MAX_URL_LEN))).is_err()
         );
+    }
+
+    #[test]
+    fn home_curation_is_stable_deduplicated_and_capped() {
+        let item = |id: &str| model::ContentItem {
+            id: id.into(),
+            kind: model::Kind::Movie,
+            title: id.into(),
+            art: Some("art".into()),
+            action: model::Action::Play,
+            note: None,
+        };
+        let mut rows = vec![
+            model::Row { title: "Trending now".into(), items: vec![item("shared"), item("trend")] },
+            model::Row { title: "Top picks for you".into(), items: vec![item("shared"), item("pick")] },
+            model::Row { title: "Continue watching".into(), items: vec![item("continue")] },
+        ];
+        for index in 0..8 {
+            rows.push(model::Row { title: format!("Discovery {index}"), items: vec![item(&format!("d{index}"))] });
+        }
+        curate_home_rows(&mut rows);
+        assert_eq!(rows[0].title, "Continue watching");
+        assert_eq!(rows[1].title, "Top picks for you");
+        assert!(rows.len() <= 8);
+        let ids: Vec<_> = rows.iter().flat_map(|row| row.items.iter().map(|item| item.id.as_str())).collect();
+        let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len());
     }
 }

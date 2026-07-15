@@ -106,6 +106,7 @@ const isSecret = (key: string): key is SecretField =>
   (SECRET_FIELDS as readonly string[]).includes(key);
 
 type SettingsCategory = 'profile' | 'accounts' | 'recommendations' | 'live' | 'creators' | 'playback' | 'sources' | 'display' | 'system';
+type SettingsSubpage = 'steam' | 'tmdb' | 'tracking' | 'games' | 'youtube' | 'twitch' | 'addons' | 'providers' | 'diagnostics';
 
 const SETTINGS_CATEGORIES: {
   id: SettingsCategory;
@@ -138,6 +139,9 @@ export function SettingsPanel({
   const [loadError, setLoadError] = useState(false);
   const [version, setVersion] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>('profile');
+  const [settingsPage, setSettingsPage] = useState<'categories' | 'category'>('categories');
+  const [activeSubpage, setActiveSubpage] = useState<SettingsSubpage | null>(null);
+  const [saveNotice, setSaveNotice] = useState('');
   // Which secret fields already have a stored value on the daemon (their value
   // arrives blanked). Drives the "configured/•••" display.
   const [configured, setConfigured] = useState<Record<string, boolean>>({});
@@ -159,6 +163,9 @@ export function SettingsPanel({
   // its value, Enter again commits. Held in a ref (not state) because the DOM
   // select is owned by a child section — we drive it directly.
   const editingSelect = useRef<HTMLSelectElement | null>(null);
+  const formRef = useRef(form);
+  const saveGeneration = useRef(0);
+  formRef.current = form;
 
   useEffect(() => {
     fetchVersion().then(setVersion).catch(() => {});
@@ -212,18 +219,47 @@ export function SettingsPanel({
 
   const enterDetail = useCallback((category: SettingsCategory) => {
     setActiveCategory(category);
+    setActiveSubpage(null);
+    setSettingsPage('category');
     if (enterFrame.current !== null) window.cancelAnimationFrame(enterFrame.current);
     enterFrame.current = window.requestAnimationFrame(() => {
       enterFrame.current = null;
       const detail = panelRef.current?.querySelector<HTMLElement>('.settings-detail-pane');
       if (!detail) return;
-      const controls = focusables(detail);
+      const controls = focusables(detail).filter((control) => !control.hasAttribute('data-settings-back'));
       const remembered = detailFocusByCategory.current[category] ?? 0;
       const target = controls[Math.min(remembered, Math.max(0, controls.length - 1))];
       target?.focus();
       target?.scrollIntoView({ block: 'nearest' });
     });
   }, []);
+
+  const returnToCategories = useCallback(() => {
+    setSettingsPage('categories');
+    window.requestAnimationFrame(() => focusCategory(activeCategory));
+  }, [activeCategory, focusCategory]);
+
+  const focusFirstDetail = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      const detail = panelRef.current?.querySelector<HTMLElement>('.settings-detail-pane');
+      if (!detail) return;
+      focusables(detail).find((control) => !control.hasAttribute('data-settings-back'))?.focus();
+    });
+  }, []);
+
+  const openSubpage = useCallback((subpage: SettingsSubpage) => {
+    setActiveSubpage(subpage);
+    focusFirstDetail();
+  }, [focusFirstDetail]);
+
+  const backSettingsPage = useCallback(() => {
+    if (activeSubpage) {
+      setActiveSubpage(null);
+      focusFirstDetail();
+    } else {
+      returnToCategories();
+    }
+  }, [activeSubpage, focusFirstDetail, returnToCategories]);
 
   useEffect(
     () => () => {
@@ -240,15 +276,13 @@ export function SettingsPanel({
         if (osk) return; // the OSK owns Escape while it's open
         e.stopPropagation();
         if (editingSelect.current) stopEditing();
-        else if ((document.activeElement as HTMLElement | null)?.closest('.settings-detail-pane')) {
-          focusCategory(activeCategory);
-        }
+        else if (settingsPage === 'category') backSettingsPage();
         else onClose();
       }
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, stopEditing, osk, activeCategory, focusCategory]);
+  }, [onClose, stopEditing, osk, settingsPage, backSettingsPage]);
 
   const handleAction = useCallback(
     (action: NavAction) => {
@@ -271,7 +305,7 @@ export function SettingsPanel({
 
       if (action === 'back') {
         if (editing) stopEditing();
-        else if (detail) focusCategory(activeCategory);
+        else if (settingsPage === 'category') backSettingsPage();
         else onClose();
         return;
       }
@@ -312,17 +346,23 @@ export function SettingsPanel({
         } else {
           activateFocused();
         }
+      } else if (detail && (action === 'up' || action === 'down')) {
+        const controls = focusables(detail).filter((control) => !control.hasAttribute('data-settings-back'));
+        const index = controls.indexOf(active as HTMLElement);
+        const next = controls[Math.max(0, Math.min(controls.length - 1, index + (action === 'down' ? 1 : -1)))];
+        next?.focus();
+        next?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
       } else if (detail && action === 'left') {
         // Left still walks controls in the same visual row (button groups,
         // accent swatches). At the row edge it returns to the category rail.
         if (!moveFocus(detail, action)) focusCategory(activeCategory);
-      } else if (detail && (action === 'up' || action === 'down' || action === 'right')) {
+      } else if (detail && action === 'right') {
         moveFocus(detail, action);
       } else if (action === 'up' || action === 'down' || action === 'left' || action === 'right') {
         moveFocus(panel, action);
       }
     },
-    [stopEditing, osk, onClose, activeCategory, enterDetail, focusCategory],
+    [stopEditing, osk, onClose, activeCategory, enterDetail, focusCategory, settingsPage, backSettingsPage],
   );
 
   useEffect(() => {
@@ -344,14 +384,36 @@ export function SettingsPanel({
     );
     initial?.focus();
     initial?.scrollIntoView({ block: 'nearest' });
-  }, [loaded, loadError]);
+  }, [loaded, loadError, settingsPage]);
 
   const refreshAddons = () => fetchAddons().then(setAddons).catch(() => {});
   const refreshManifests = () => fetchSourceManifests().then(setManifests).catch(() => {});
   const update = (patch: Partial<Settings>) => {
     // Any secret in the patch was typed by the user → mark it for sending.
     for (const key of Object.keys(patch)) if (isSecret(key)) touched.current.add(key);
-    setForm((f) => ({ ...f, ...patch }));
+    const previous = formRef.current;
+    const next = { ...previous, ...patch };
+    formRef.current = next;
+    setForm(next);
+
+    // Each generation carries the complete non-secret snapshot, so if an
+    // earlier request loses a race the newest successful save still contains
+    // every visible change. Untouched secrets remain write-only and omitted.
+    const payload: Partial<Settings> = { ...next };
+    for (const key of SECRET_FIELDS) {
+      if (!touched.current.has(key) || !String(payload[key] ?? '').trim()) delete payload[key];
+    }
+    if (!Object.keys(payload).length) return;
+    const generation = ++saveGeneration.current;
+    setSaveNotice('Saving…');
+    saveSettings(payload).then(() => {
+      if (saveGeneration.current === generation) setSaveNotice('Saved');
+    }).catch(() => {
+      if (saveGeneration.current !== generation) return;
+      formRef.current = previous;
+      setForm(previous);
+      setSaveNotice('Could not save — change reverted');
+    });
   };
 
   /** Save the form to the daemon, omitting any secret the user hasn't touched
@@ -382,6 +444,10 @@ export function SettingsPanel({
 
   const activeInfo =
     SETTINGS_CATEGORIES.find((cat) => cat.id === activeCategory) ?? SETTINGS_CATEGORIES[0];
+  const subpageTitle: Partial<Record<SettingsSubpage, string>> = {
+    steam: 'Steam', tmdb: 'Movies & TV', tracking: 'Watch tracking', games: 'Game libraries',
+    youtube: 'YouTube', twitch: 'Twitch', addons: 'Streaming addons', providers: 'Cloud providers', diagnostics: 'Source diagnostics',
+  };
   const playableCloud = manifests.reduce(
     (sum, manifest) => sum + manifest.sources.filter((source) => source.playable).length,
     0,
@@ -410,8 +476,8 @@ export function SettingsPanel({
             <p>Loading…</p>
           </div>
         ) : (
-          <div className="settings-tv-page">
-            <aside className="settings-nav-pane">
+          <div className="settings-tv-page settings-hierarchy-page">
+            {settingsPage === 'categories' ? <section className="settings-nav-pane settings-category-page">
               <div className="settings-brand">
                 <div>
                   <span className="settings-kicker">TV OS</span>
@@ -427,7 +493,7 @@ export function SettingsPanel({
                     key={cat.id}
                     data-settings-category={cat.id}
                     className={`settings-nav-item ${activeCategory === cat.id ? 'settings-nav-active' : ''}`}
-                    onClick={() => setActiveCategory(cat.id)}
+                    onClick={() => enterDetail(cat.id)}
                     onFocus={() => setActiveCategory(cat.id)}
                     aria-current={activeCategory === cat.id ? 'page' : undefined}
                   >
@@ -444,52 +510,59 @@ export function SettingsPanel({
                 <span>TV OS</span>
                 {version && <span>tvosd v{version}</span>}
               </div>
-            </aside>
-
-            <main
+            </section> : <main
               className="settings-detail-pane"
               onFocusCapture={(event) => {
-                const controls = focusables(event.currentTarget);
+                const controls = focusables(event.currentTarget).filter((control) => !control.hasAttribute('data-settings-back'));
                 const index = controls.indexOf(event.target as HTMLElement);
                 if (index >= 0) detailFocusByCategory.current[activeCategory] = index;
               }}
             >
               <div className="settings-detail-head">
-                <span className="settings-kicker">All settings</span>
-                <h2>{activeInfo.label}</h2>
+                <button data-settings-back className="settings-back-button" onClick={backSettingsPage} aria-label="Back">‹</button>
+                <div><span className="settings-kicker">Settings · {activeInfo.label}</span><h2>{activeSubpage ? subpageTitle[activeSubpage] : activeInfo.label}</h2></div>
               </div>
               <div className="settings-detail-scroll">
                 {activeCategory === 'profile' && <ProfileSection />}
-                {activeCategory === 'accounts' && (
+                {activeCategory === 'accounts' && !activeSubpage && <SettingsSubpageMenu items={[
+                  ['steam', 'Steam', 'Owned games and account status'],
+                  ['tmdb', 'Movies & TV', 'Metadata and discovery'],
+                  ['tracking', 'Watch tracking', 'Trakt, AniList and MyAnimeList'],
+                  ['games', 'Game libraries', 'Epic, GOG and local libraries'],
+                ]} onOpen={openSubpage} />}
+                {activeCategory === 'accounts' && activeSubpage && (
                   <>
-                    <SteamSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-                    <TmdbSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-                    <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-                    <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />
+                    {activeSubpage === 'steam' && <SteamSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
+                    {activeSubpage === 'tmdb' && <TmdbSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
+                    {activeSubpage === 'tracking' && <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
+                    {activeSubpage === 'games' && <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />}
                   </>
                 )}
                 {activeCategory === 'recommendations' && (
                   <RecommendationSection />
                 )}
                 {activeCategory === 'live' && <LiveSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
-                {activeCategory === 'creators' && <>
-                  <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-                  <TwitchSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />
-                </>}
+                {activeCategory === 'creators' && !activeSubpage && <SettingsSubpageMenu items={[
+                  ['youtube', 'YouTube', 'Subscriptions, channels and connection'],
+                  ['twitch', 'Twitch', 'Followed streams and account'],
+                ]} onOpen={openSubpage} />}
+                {activeCategory === 'creators' && activeSubpage === 'youtube' && <YouTubeSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
+                {activeCategory === 'creators' && activeSubpage === 'twitch' && <TwitchSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
                 {activeCategory === 'playback' && <PlaybackSection form={form} update={update} submit={submit} />}
-                {activeCategory === 'sources' && (
-                  <>
-                    <SourceHealthPanel
+                {activeCategory === 'sources' && !activeSubpage && <SettingsSubpageMenu items={[
+                  ['addons', 'Streaming addons', 'Installed metadata and stream addons'],
+                  ['providers', 'Cloud providers', 'CloudStream and provider manifests'],
+                  ['diagnostics', 'Diagnostics', 'Source health and availability'],
+                ]} onOpen={openSubpage} />}
+                {activeCategory === 'sources' && activeSubpage === 'diagnostics' && <SourceHealthPanel
                       addons={addons}
                       manifests={manifests}
                       playableCloud={playableCloud}
                       packageCloud={packageCloud}
                       streamAddons={streamAddons}
-                    />
-                    <AddonSection addons={addons} refresh={refreshAddons} reload={reload} openOsk={openOsk} />
-                    <SourceManifestSection manifests={manifests} refresh={refreshManifests} reload={reload} openOsk={openOsk} />
-                  </>
-                )}
+                    />}
+                {activeCategory === 'sources' && activeSubpage === 'addons' && <AddonSection addons={addons} refresh={refreshAddons} reload={reload} openOsk={openOsk} />}
+                {activeCategory === 'sources' && activeSubpage === 'providers' && <SourceManifestSection manifests={manifests} refresh={refreshManifests} reload={reload} openOsk={openOsk} />}
                 {activeCategory === 'display' && (
                   <DisplaySection form={form} update={update} submit={submit} />
                 )}
@@ -506,7 +579,8 @@ export function SettingsPanel({
                   />
                 )}
               </div>
-            </main>
+              <footer className="settings-footer-hints"><span className="settings-save-notice">{saveNotice}</span><span>OK&nbsp; Select</span><span>Back&nbsp; Categories</span></footer>
+            </main>}
           </div>
         )}
       </div>
@@ -525,6 +599,21 @@ export function SettingsPanel({
         />
       )}
     </div>
+  );
+}
+
+function SettingsSubpageMenu({ items, onOpen }: {
+  items: [SettingsSubpage, string, string][];
+  onOpen: (page: SettingsSubpage) => void;
+}) {
+  return (
+    <nav className="settings-subpage-list" aria-label="Settings pages">
+      {items.map(([id, label, detail]) => (
+        <button key={id} className="settings-subpage-row" onClick={() => onOpen(id)}>
+          <span><strong>{label}</strong><small>{detail}</small></span><span aria-hidden>›</span>
+        </button>
+      ))}
+    </nav>
   );
 }
 
@@ -1700,48 +1789,18 @@ function LockedField({
   masked?: boolean;
   placeholder?: string;
 }) {
-  const [editing, setEditing] = useState(false);
-  // Locked when the user has typed something, OR the daemon flags it stored.
   const isSet = value.trim() !== '' || !!configured;
-
-  if (isSet && !editing) {
-    const shown =
-      masked || (configured && value.trim() === '')
-        ? '••••••••••••••••••••  configured'
-        : value.length > 46
-          ? `${value.slice(0, 46)}…`
-          : value;
-    return (
-      <div className="settings-field">
-        <span className="settings-field-label">{label}</span>
-        <div className="locked-row">
-          <span className="locked-value">{shown}</span>
-          <button className="btn" onClick={() => setEditing(true)}>
-            Edit
-          </button>
-        </div>
-      </div>
-    );
-  }
-
+  const shown = isSet
+    ? masked || (configured && value.trim() === '')
+      ? 'Configured'
+      : value.length > 46 ? `${value.slice(0, 46)}…` : value
+    : placeholder || 'Not set';
   return (
     <div className="settings-field">
       <span className="settings-field-label">{label}</span>
-      <div className="locked-row">
-        <input
-          type={masked ? 'password' : 'text'}
-          value={value}
-          autoFocus={editing}
-          onChange={(e) => onChange(e.target.value)}
-          onClick={() => openOsk(label, value, masked, onChange)}
-          placeholder={placeholder}
-        />
-        {editing && (
-          <button className="btn" onClick={() => setEditing(false)}>
-            Done
-          </button>
-        )}
-      </div>
+      <button className="settings-value-button" onClick={() => openOsk(label, value, masked, onChange)}>
+        <span className={isSet ? '' : 'settings-value-empty'}>{shown}</span><span aria-hidden>›</span>
+      </button>
     </div>
   );
 }

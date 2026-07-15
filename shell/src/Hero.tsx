@@ -54,11 +54,11 @@ export function Hero({ item, preview, explanation, onOpen, onFocus }: Props) {
         {sub && <div className="hero-sub">{sub}</div>}
         {preview?.description && <p className="hero-desc">{preview.description}</p>}
         <div className="hero-actions">
-          <button className="hero-primary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
+          <button data-focus-key="hero:primary" className="hero-primary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
             <span className="material-icon" aria-hidden>▶</span>
             {item.action === 'install' ? 'Install' : item.action === 'none' ? 'View details' : 'Watch now'}
           </button>
-          <button className="hero-secondary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
+          <button data-focus-key="hero:details" className="hero-secondary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
             <span className="material-icon" aria-hidden>ⓘ</span> Details
           </button>
         </div>
