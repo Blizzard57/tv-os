@@ -23,7 +23,8 @@ use crate::{launcher, settings, upscale};
 
 const CHANNEL_TTL: Duration = Duration::from_secs(900);
 const SEARCH_TTL: Duration = Duration::from_secs(300);
-const CHANNEL_ROWS: usize = 4; // at most this many channel rows on home
+const CHANNEL_ROWS: usize = 6; // at most this many followed-channel shelves
+const ACCOUNT_FEED_LIMIT: usize = 24;
 const VIDEOS_PER_CHANNEL: usize = 12;
 const SEARCH_LIMIT: usize = 20;
 /// yt-dlp is a network tool — bound every call so a hung request can't
@@ -95,6 +96,20 @@ impl Source for YouTube {
         let url = format!("https://www.youtube.com/watch?v={video}");
         let mode = settings::STORE.get().enhance;
         let profile = upscale::resolve(mode, "youtube");
+        let mut meta = launcher::PlayerMeta::new("YouTube");
+        meta.preference_scope = Some("youtube".into());
+        meta.preference_provider = Some("youtube".into());
+        meta.playback_preference = crate::profile::STORE.playback_preference("youtube", "youtube");
+        meta.quality = meta
+            .playback_preference
+            .as_ref()
+            .and_then(|preference| preference.quality_tier.clone());
+        meta.sponsorblock_segments = crate::sponsorblock::segments(video);
+        meta.content_id = Some(item_id.to_string());
+        meta.track_id = Some(item_id.to_string());
+        meta.domain = Some("youtube".into());
+        meta.autoplay = settings::STORE.get().autoplay;
+        meta.autoplay_delay_seconds = settings::STORE.get().autoplay_delay_seconds.clamp(3, 30);
         launcher::play_video(
             &url,
             &profile,
@@ -102,16 +117,60 @@ impl Source for YouTube {
             "YouTube",
             Some(item_id),
             Some(item_id),
-            Some(&launcher::PlayerMeta::new("YouTube")),
+            Some(&meta),
         )
     }
 }
 
+pub fn play_quality(
+    item_id: &str,
+    title: &str,
+    art: Option<&str>,
+    quality: &str,
+) -> Result<(), String> {
+    let video = item_id
+        .strip_prefix("yt:")
+        .filter(|video| !video.is_empty())
+        .ok_or_else(|| format!("bad YouTube id '{item_id}'"))?;
+    let settings = settings::STORE.get();
+    let profile = upscale::resolve(settings.enhance, "youtube");
+    let mut preference = crate::profile::STORE
+        .playback_preference("youtube", "youtube")
+        .unwrap_or(crate::profile::PlaybackPreference {
+            scope_key: "youtube".into(),
+            provider: "youtube".into(),
+            ..Default::default()
+        });
+    preference.quality_tier = (!quality.eq_ignore_ascii_case("auto")).then(|| quality.to_string());
+    let mut meta = launcher::PlayerMeta::new(title);
+    meta.preference_scope = Some("youtube".into());
+    meta.preference_provider = Some("youtube".into());
+    meta.playback_preference = Some(preference.clone());
+    meta.quality = preference.quality_tier.clone();
+    meta.sponsorblock_segments = crate::sponsorblock::segments(video);
+    meta.content_id = Some(item_id.to_string());
+    meta.track_id = Some(item_id.to_string());
+    meta.art = art.map(str::to_owned);
+    meta.domain = Some("youtube".into());
+    meta.autoplay = settings.autoplay;
+    meta.autoplay_delay_seconds = settings.autoplay_delay_seconds.clamp(3, 30);
+    let result = launcher::play_video(
+        &format!("https://www.youtube.com/watch?v={video}"),
+        &profile,
+        settings.enhance,
+        "youtube",
+        Some(item_id),
+        Some(item_id),
+        Some(&meta),
+    );
+    if result.is_ok() {
+        let _ = crate::profile::STORE.save_playback_preference(&preference);
+    }
+    result
+}
+
 /// Signed-in feeds (yt-dlp aliases; both need account cookies).
-const ACCOUNT_FEEDS: &[(&str, &str)] = &[
-    ("YouTube · For you", ":ytrec"),
-    ("YouTube · Subscriptions", ":ytsubs"),
-];
+const ACCOUNT_FEEDS: &[(&str, &str)] = &[("For you", ":ytrec"), ("Subscriptions", ":ytsubs")];
 
 /// The TV OS browser profile. tvos-app launches Chromium with
 /// --password-store=basic, so yt-dlp can decrypt its cookies without a
@@ -169,7 +228,7 @@ fn feed_row(title: &str, target: &str) -> Option<Row> {
             }
         }
     }
-    let json = flat_playlist_auth(target, VIDEOS_PER_CHANNEL, Some(&profile))?;
+    let json = flat_playlist_auth(target, ACCOUNT_FEED_LIMIT, Some(&profile))?;
     let items = parse_entries(&json);
     CHANNEL_CACHE
         .lock()
@@ -237,7 +296,7 @@ fn channel_row(handle: &str) -> Option<Row> {
 
 fn row_of(name: &str, items: Vec<ContentItem>) -> Option<Row> {
     (!items.is_empty()).then(|| Row {
-        title: format!("YouTube · {name}"),
+        title: name.to_string(),
         items,
     })
 }
@@ -267,6 +326,30 @@ pub fn search(query: &str) -> Vec<ContentItem> {
     }
     cache.insert(cache_key, (Instant::now(), items.clone()));
     items
+}
+
+pub fn autoplay_recommendation(current_id: &str) -> Option<ContentItem> {
+    let settings = settings::STORE.get();
+    if settings.youtube_account {
+        for (_, target) in ACCOUNT_FEEDS {
+            if let Some(row) = feed_row("For you", target) {
+                if let Some(item) = row.items.into_iter().find(|item| item.id != current_id) {
+                    return Some(item);
+                }
+            }
+        }
+    }
+    for handle in channel_handles(&settings.youtube_channels)
+        .into_iter()
+        .take(6)
+    {
+        if let Some(row) = channel_row(&handle) {
+            if let Some(item) = row.items.into_iter().find(|item| item.id != current_id) {
+                return Some(item);
+            }
+        }
+    }
+    None
 }
 
 static META_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Meta)>>> =

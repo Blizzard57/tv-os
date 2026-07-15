@@ -25,7 +25,7 @@ pub enum EnhanceMode {
 /// Persisted user settings. String credentials use "" to mean "unset" so the
 /// settings panel can round-trip them as plain text fields. All fields default,
 /// so older settings.json files keep loading as new ones are added.
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
     #[serde(default)]
     pub enhance: EnhanceMode,
@@ -109,6 +109,30 @@ pub struct Settings {
     pub mal_client_id: String,
     #[serde(default)]
     pub mal_token: String,
+    #[serde(default = "default_true")]
+    pub autoplay: bool,
+    #[serde(default = "default_autoplay_delay")]
+    pub autoplay_delay_seconds: u64,
+    #[serde(default = "default_true")]
+    pub sponsorblock_enabled: bool,
+    #[serde(default = "default_sponsorblock_categories")]
+    pub sponsorblock_categories: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_autoplay_delay() -> u64 {
+    10
+}
+fn default_sponsorblock_categories() -> String {
+    "sponsor".into()
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("empty settings must deserialize")
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -137,6 +161,10 @@ pub struct SettingsPatch {
     pub twitch_token: Option<String>,
     pub mal_client_id: Option<String>,
     pub mal_token: Option<String>,
+    pub autoplay: Option<bool>,
+    pub autoplay_delay_seconds: Option<u64>,
+    pub sponsorblock_enabled: Option<bool>,
+    pub sponsorblock_categories: Option<String>,
 }
 
 impl Settings {
@@ -247,6 +275,10 @@ impl SettingsPatch {
         set_secret!(twitch_token);
         set_plain!(mal_client_id);
         set_secret!(mal_token);
+        set_plain!(autoplay);
+        set_plain!(autoplay_delay_seconds);
+        set_plain!(sponsorblock_enabled);
+        set_plain!(sponsorblock_categories);
         current
     }
 }
@@ -447,6 +479,15 @@ mod tests {
         assert_eq!(normalize_region(""), "US");
         assert_eq!(normalize_region("USA"), "US");
         assert_eq!(normalize_region("1!"), "US");
+    }
+
+    #[test]
+    fn autoplay_and_sponsorblock_have_safe_defaults() {
+        let settings = Settings::default();
+        assert!(settings.autoplay);
+        assert_eq!(settings.autoplay_delay_seconds, 10);
+        assert!(settings.sponsorblock_enabled);
+        assert_eq!(settings.sponsorblock_categories, "sponsor");
     }
 
     #[test]

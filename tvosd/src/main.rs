@@ -33,6 +33,7 @@ mod search;
 mod settings;
 mod shaders;
 mod sources;
+mod sponsorblock;
 mod tracking;
 mod upscale;
 mod util;
@@ -40,7 +41,7 @@ mod util;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, Query, State};
@@ -261,6 +262,7 @@ type Shared = Arc<App>;
 #[tokio::main]
 async fn main() {
     logging::init();
+    launcher::provision_player_runtime();
     let app = Arc::new(App {
         sources: sources::Registry::detect(),
         installs: install::InstallManager::default(),
@@ -324,6 +326,7 @@ async fn main() {
         .route("/api/search/deep", get(get_search_deep))
         .route("/api/similar", get(get_similar))
         .route("/api/youtube/status", get(get_youtube_status))
+        .route("/api/youtube/sponsorblock", get(get_sponsorblock))
         .route("/api/twitch/status", get(get_twitch_status))
         .route("/api/live/status", get(get_live_status))
         .route("/api/enhance/status", get(get_enhance_status))
@@ -339,6 +342,18 @@ async fn main() {
         .route("/api/continue", get(get_continue))
         .route("/api/play", post(post_play))
         .route("/api/player/next", post(post_player_next))
+        .route("/api/player/runtime", get(get_player_runtime))
+        .route(
+            "/api/player/preferences",
+            get(get_player_preferences).put(put_player_preferences),
+        )
+        .route(
+            "/api/player/autoplay/candidate",
+            post(post_autoplay_candidate),
+        )
+        .route("/api/player/autoplay/launch", post(post_autoplay_launch))
+        .route("/api/player/autoplay/cancel", post(post_autoplay_cancel))
+        .route("/api/player/quality", post(post_player_quality))
         .route("/api/playback", get(get_playback))
         .route("/api/open", post(post_open))
         .route("/api/version", get(get_version))
@@ -1353,6 +1368,19 @@ async fn get_youtube_status() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "connected": connected, "detail": detail }))
 }
 
+#[derive(Deserialize)]
+struct SponsorBlockQuery {
+    video_id: String,
+}
+
+async fn get_sponsorblock(Query(q): Query<SponsorBlockQuery>) -> Json<Vec<sponsorblock::Segment>> {
+    Json(
+        tokio::task::spawn_blocking(move || sponsorblock::segments(&q.video_id))
+            .await
+            .unwrap_or_default(),
+    )
+}
+
 async fn get_twitch_status() -> Json<serde_json::Value> {
     Json(
         tokio::task::spawn_blocking(sources::twitch::status)
@@ -1374,6 +1402,323 @@ async fn get_live_status() -> Json<serde_json::Value> {
 
 async fn get_enhance_status() -> Json<serde_json::Value> {
     Json(upscale::capability_status())
+}
+
+async fn get_player_runtime() -> Json<serde_json::Value> {
+    Json(launcher::player_runtime_status())
+}
+
+#[derive(Deserialize)]
+struct PlaybackPreferenceQuery {
+    scope_key: String,
+    provider: String,
+}
+
+async fn get_player_preferences(
+    Query(q): Query<PlaybackPreferenceQuery>,
+) -> Json<serde_json::Value> {
+    profile::STORE
+        .playback_preference(&q.scope_key, &q.provider)
+        .map(|pref| serde_json::to_value(pref).unwrap_or_default())
+        .unwrap_or(serde_json::Value::Null)
+        .into()
+}
+
+async fn put_player_preferences(
+    Json(pref): Json<profile::PlaybackPreference>,
+) -> Result<Json<profile::PlaybackPreference>, (StatusCode, String)> {
+    profile::STORE
+        .save_playback_preference(&pref)
+        .map(Json)
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))
+}
+
+#[derive(Clone, Serialize)]
+struct AutoplayCandidate {
+    token: String,
+    content_id: String,
+    track_id: String,
+    title: String,
+    art: Option<String>,
+    reason: String,
+    domain: String,
+    countdown_seconds: u64,
+}
+
+#[derive(Clone)]
+struct AutoplayLaunch {
+    candidate: AutoplayCandidate,
+    stream: media::Stream,
+    item: model::ContentItem,
+}
+
+static AUTOPLAY: LazyLock<Mutex<HashMap<String, AutoplayLaunch>>> = LazyLock::new(Mutex::default);
+static AUTOPLAY_RECENT: LazyLock<Mutex<Vec<String>>> = LazyLock::new(Mutex::default);
+static AUTOPLAY_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Deserialize)]
+struct AutoplayRequest {
+    content_id: String,
+    track_id: String,
+    next_track_id: Option<String>,
+    title: String,
+    art: Option<String>,
+    domain: Option<String>,
+}
+
+async fn post_autoplay_candidate(Json(req): Json<AutoplayRequest>) -> Json<serde_json::Value> {
+    if !settings::STORE.get().autoplay || req.domain.as_deref() == Some("live") {
+        return Json(serde_json::Value::Null);
+    }
+    let candidate = tokio::task::spawn_blocking(move || resolve_autoplay(req))
+        .await
+        .ok()
+        .flatten();
+    Json(
+        candidate
+            .map(|launch| {
+                let value = serde_json::to_value(&launch.candidate).unwrap_or_default();
+                AUTOPLAY
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(launch.candidate.token.clone(), launch);
+                value
+            })
+            .unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn resolve_autoplay(req: AutoplayRequest) -> Option<AutoplayLaunch> {
+    let delay = settings::STORE.get().autoplay_delay_seconds.clamp(3, 30);
+    let make = |item: model::ContentItem,
+                track_id: String,
+                stream: media::Stream,
+                reason: &str,
+                domain: &str| {
+        let token = format!(
+            "{}-{}",
+            now_epoch(),
+            AUTOPLAY_TOKEN.fetch_add(1, Ordering::Relaxed)
+        );
+        AutoplayLaunch {
+            candidate: AutoplayCandidate {
+                token,
+                content_id: item.id.clone(),
+                track_id,
+                title: item.title.clone(),
+                art: item.art.clone(),
+                reason: reason.into(),
+                domain: domain.into(),
+                countdown_seconds: delay,
+            },
+            stream,
+            item,
+        }
+    };
+    if let Some(track) = req
+        .next_track_id
+        .as_deref()
+        .filter(|track| *track != req.track_id)
+    {
+        if let Ok((kind, id)) = sources::resolve_video(track) {
+            if let Some(stream) = sources::stremio::streams(&kind, &id)
+                .into_iter()
+                .find(|stream| stream.kind != media::StreamKind::External)
+            {
+                let item = tracking::local_item(&req.content_id).unwrap_or(model::ContentItem {
+                    id: req.content_id.clone(),
+                    kind: model::Kind::Series,
+                    title: req.title.clone(),
+                    art: req.art.clone(),
+                    action: model::Action::Play,
+                    note: None,
+                });
+                return Some(make(
+                    item,
+                    track.to_string(),
+                    stream,
+                    "Next episode",
+                    "shows",
+                ));
+            }
+        }
+    }
+    let recent = AUTOPLAY_RECENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let disliked = recommend::LOG.disliked_ids();
+    if req.domain.as_deref() == Some("youtube") || req.content_id.starts_with("yt:") {
+        let item = sources::youtube::autoplay_recommendation(&req.content_id)?;
+        if recent.contains(&item.id) {
+            return None;
+        }
+        let video = item.id.strip_prefix("yt:")?;
+        let stream = media::Stream {
+            kind: media::StreamKind::Youtube,
+            url: format!("https://www.youtube.com/watch?v={video}"),
+            name: "YouTube".into(),
+            title: item.title.clone(),
+            file_idx: None,
+        };
+        return Some(make(
+            item.clone(),
+            item.id.clone(),
+            stream,
+            "Recommended for you",
+            "youtube",
+        ));
+    }
+    for item in similar_for(&req.content_id) {
+        if item.id == req.content_id
+            || recent.contains(&item.id)
+            || disliked.contains(&item.id)
+            || profile::STORE.is_completed(&item.id)
+        {
+            continue;
+        }
+        let Ok((kind, id)) = sources::resolve_video(&item.id) else {
+            continue;
+        };
+        let Some(stream) = sources::stremio::streams(&kind, &id)
+            .into_iter()
+            .find(|stream| stream.kind != media::StreamKind::External)
+        else {
+            continue;
+        };
+        return Some(make(
+            item.clone(),
+            item.id.clone(),
+            stream,
+            "Because you watched this",
+            "media",
+        ));
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct AutoplayToken {
+    token: String,
+}
+
+async fn post_autoplay_launch(
+    Json(req): Json<AutoplayToken>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let launch = AUTOPLAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&req.token)
+        .ok_or((StatusCode::NOT_FOUND, "autoplay candidate expired".into()))?;
+    let mut recent = AUTOPLAY_RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    recent.push(launch.item.id.clone());
+    if recent.len() > 12 {
+        recent.remove(0);
+    }
+    drop(recent);
+    let track = launch.candidate.track_id.clone();
+    let title = launch.candidate.title.clone();
+    sources::stremio::play_stream(
+        &launch.stream,
+        Some(&launch.item.id),
+        Some(&track),
+        Some(&title),
+        None,
+        launch.item.art.as_deref(),
+        &[],
+    )
+    .map(|_| StatusCode::ACCEPTED)
+    .map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+async fn post_autoplay_cancel(Json(req): Json<AutoplayToken>) -> StatusCode {
+    AUTOPLAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&req.token);
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct PlayerQualityRequest {
+    content_id: String,
+    track_id: String,
+    quality: String,
+    position: f64,
+    duration: Option<f64>,
+    title: String,
+    art: Option<String>,
+}
+
+async fn post_player_quality(
+    Json(req): Json<PlayerQualityRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let quality = req.quality.to_ascii_lowercase();
+    let event = profile::InteractionEvent {
+        item_id: req.content_id.clone(),
+        content_id: Some(req.content_id.clone()),
+        track_id: Some(req.track_id.clone()),
+        session_id: Some(format!("quality-{}", now_epoch())),
+        sequence: Some(1),
+        kind: profile::InteractionKind::Progress,
+        position: Some(req.position.max(0.0)),
+        duration: req.duration,
+        context: Some("quality_change".into()),
+        ts: Some(now_epoch() as i64),
+        reason: Some("quality_change".into()),
+    };
+    profile::STORE
+        .record(&event)
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    tokio::task::spawn_blocking(move || {
+        if req.track_id.starts_with("yt:") {
+            return sources::youtube::play_quality(
+                &req.track_id,
+                &req.title,
+                req.art.as_deref(),
+                &req.quality,
+            );
+        }
+        let (kind, id) = sources::resolve_video(&req.track_id)?;
+        let mut streams = sources::stremio::streams(&kind, &id);
+        streams.retain(|stream| stream.kind != media::StreamKind::External);
+        let selected = if quality == "auto" {
+            streams.into_iter().next()
+        } else {
+            streams.drain(..).find(|stream| {
+                let label = format!("{} {}", stream.name, stream.title).to_ascii_lowercase();
+                match quality.as_str() {
+                    "4k" => label.contains("2160p") || label.contains("4k"),
+                    value => label.contains(value),
+                }
+            })
+        }
+        .ok_or_else(|| format!("No healthy {} source is available", req.quality))?;
+        let result = sources::stremio::play_stream(
+            &selected,
+            Some(&req.content_id),
+            Some(&req.track_id),
+            Some(&req.title),
+            None,
+            req.art.as_deref(),
+            &[],
+        );
+        if result.is_ok() && quality == "auto" {
+            sources::stremio::clear_quality_preference(&req.content_id, &selected);
+        }
+        result
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map(|_| StatusCode::ACCEPTED)
+    .map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 /// "More like this" for a details page item. Video items resolve through
@@ -1441,15 +1786,8 @@ fn continue_row() -> Option<model::Row> {
         .into_iter()
         .filter_map(|p| {
             let mut item = tracking::local_item(&p.content_id)?;
-            let progress_note = match (p.season, p.episode, p.remaining_seconds) {
-                (Some(s), Some(e), Some(left)) => {
-                    format!("S{s} E{e} · {} min left", (left / 60.0).ceil() as i64)
-                }
-                (Some(s), Some(e), None) => format!(
-                    "S{s} E{e} · {} min watched",
-                    (p.position_seconds / 60.0).floor() as i64
-                ),
-                (_, _, Some(left)) => format!("{} min left", (left / 60.0).ceil() as i64),
+            let progress_note = match p.remaining_seconds {
+                Some(left) => format!("{} min left", (left / 60.0).ceil() as i64),
                 _ => format!("{} min watched", (p.position_seconds / 60.0).floor() as i64),
             };
             item.note = Some(progress_note);
@@ -1491,6 +1829,9 @@ struct PlayRequest {
     /// show while Trakt/AniList get the exact episode. Defaults to `item.id`.
     track_id: Option<String>,
     next_track_id: Option<String>,
+    /// Episode/source line shown by the player. The canonical item title stays
+    /// separate so Continue cards always show only the series name.
+    display_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1518,12 +1859,16 @@ async fn post_play(
     }
     let stream = req.stream;
     let item_id = req.item.as_ref().map(|i| i.id.clone());
-    let display_title = req.item.as_ref().map(|i| i.title.clone());
+    let canonical_title = req.item.as_ref().map(|i| i.title.clone());
+    let display_title = req
+        .display_title
+        .clone()
+        .or_else(|| canonical_title.clone());
     let track_id = req.track_id.clone();
     let next_track_id = req.next_track_id.clone();
     let label = display_title
         .clone()
-        .or_else(|| req.item.as_ref().map(|i| i.title.clone()))
+        .or_else(|| canonical_title.clone())
         .unwrap_or_else(|| stream.name.replace('\n', " "));
     let (job, status) = app.playback.start("stream", label);
     let worker_app = app.clone();
@@ -1534,6 +1879,7 @@ async fn post_play(
             track_id.as_deref(),
             display_title.as_deref(),
             next_track_id.as_deref(),
+            req.item.as_ref().and_then(|item| item.art.as_deref()),
             req.item
                 .as_ref()
                 .map(|item| item.genres.as_slice())

@@ -33,6 +33,7 @@ import {
   startInstall,
 } from './api';
 import { gameLogo } from './cards';
+import { useArtworkPalette } from './artPalette';
 import { NavAction } from './input';
 import { focusPrimary, useSpatialNav } from './spatialNav';
 
@@ -47,7 +48,7 @@ interface Props {
   actionRef: MutableRefObject<((a: NavAction) => void) | null>;
 }
 
-type Stage = 'actions' | 'episodes' | 'streams';
+type Stage = 'actions' | 'episodes' | 'streams' | 'extras';
 type PrefButton = { action: PreferenceAction; icon: string; label: string; active: boolean };
 
 const isGameId = (id: string) => id.startsWith('steam:') || id.startsWith('gshop:');
@@ -66,6 +67,7 @@ const isShopItem = (id: string) => id.startsWith('gshop:');
 export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Props) {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [stage, setStage] = useState<Stage>('actions');
+  const extrasReturnStage = useRef<Exclude<Stage, 'extras'>>('actions');
   const [season, setSeason] = useState(1);
   const [episode, setEpisode] = useState<Episode | null>(null);
   const [streams, setStreams] = useState<Stream[] | null>(null);
@@ -244,19 +246,23 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     : undefined;
 
   const playChosen = useCallback(
-    (s: Stream) => {
+    (s: Stream, resumeTrackId?: string) => {
+      const effectiveTrackId = resumeTrackId || trackId;
       const playbackItem: ContentItem = {
         ...item,
-        title: episode?.title
-          ? `${meta?.title || item.title} - ${episode.title}`
-          : meta?.title || item.title,
+        // Keep the canonical show title durable for Continue/recommendations.
+        // The richer episode label is sent separately for the player chrome.
+        title: meta?.title || item.title,
         art: meta?.poster || meta?.background || item.art,
       };
+      const displayTitle = episode?.title
+        ? (meta?.title || item.title) + ' · ' + episode.title
+        : meta?.title || item.title;
       // External links just open elsewhere — no loading screen needed.
-      recordInteraction({ item_id: trackId, kind: 'play', context: 'details' }).catch(() => {});
+      recordInteraction({ item_id: effectiveTrackId, kind: 'play', context: 'details' }).catch(() => {});
       if (s.kind === 'external') {
         flash(`Opening ${s.name.split('\n')[0]}…`);
-        playStream(s, playbackItem, trackId, nextTrackId, meta?.genres)
+        playStream(s, playbackItem, effectiveTrackId, resumeTrackId ? undefined : nextTrackId, meta?.genres, displayTitle)
           .then(waitForPlayback)
           .then(onPlayed)
           .catch((e) => flash(`Could not open: ${e.message}`));
@@ -265,7 +271,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
       // The daemon acknowledges quickly, then reports the real start/fail state
       // through /api/playback so slow torrents do not hit the shell timeout.
       setLoading({ label: s.name.split('\n')[0] || meta?.title || item.title, kind: 'stream' });
-      playStream(s, playbackItem, trackId, nextTrackId, meta?.genres)
+      playStream(s, playbackItem, effectiveTrackId, resumeTrackId ? undefined : nextTrackId, meta?.genres, displayTitle)
         .then(waitForPlayback)
         .then(() => {
           setLoading(null);
@@ -369,7 +375,10 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   // B / Esc peels one layer: expanded sources → compact, series streams →
   // episode list, otherwise close the page.
   const handleBack = useCallback(() => {
-    if (stage === 'streams' && showAllSources && canCompactSources) {
+    if (stage === 'extras') {
+      setStage(extrasReturnStage.current);
+      bumpRefocus();
+    } else if (stage === 'streams' && showAllSources && canCompactSources) {
       setShowAllSources(false);
       bumpRefocus();
     } else if (stage === 'streams' && series) {
@@ -394,6 +403,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
 
   const title = meta?.title || item.title;
   const background = meta?.background || item.art;
+  const palette = useArtworkPalette(background, item.id);
   const boxArt = meta?.poster || item.art;
   const titleLogo = !logoFailed ? meta?.logo || gameLogo(item) : null;
   const kindLabel = (meta?.kind ?? item.kind).toUpperCase();
@@ -438,6 +448,16 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const achAll = extras.achievements
     ? [...extras.achievements.unlocked, ...extras.achievements.locked]
     : [];
+  const hasExtras = facts.length > 0 || !!meta?.cast?.length || !!meta?.screenshots?.length || achAll.length > 0;
+  const openExtras = () => {
+    if (stage !== 'extras') extrasReturnStage.current = stage;
+    setStage('extras');
+    bumpRefocus();
+  };
+  const extraTiles = [
+    ...facts.map((fact) => ({ key: 'fact-' + fact.label, title: fact.label, detail: fact.value })),
+    ...(meta?.cast ?? []).map((name) => ({ key: 'cast-' + name, title: name, detail: 'Cast & creator' })),
+  ];
 
   // Which control gets `data-primary` (the focus target after a context reset).
   const primaryKey: string | null = resumeShown
@@ -456,7 +476,9 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
             : bestStream
               ? 'source:best'
               : null
-          : null;
+          : stage === 'extras' && (extraTiles.length > 0 || !!meta?.screenshots?.length || achAll.length > 0)
+            ? 'extra:0'
+            : null;
 
   // Focus wiring shared by every navigable control: makes it a real tab stop,
   // mirrors focus into `focusedKey` for the highlight, and flags the primary.
@@ -469,15 +491,15 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const focusZone = focusedKey?.split(':')[0];
 
   return (
-    <div className="details" ref={rootRef}>
+    <div className="details" ref={rootRef} style={{ '--art-primary': palette.primary, '--art-secondary': palette.secondary } as React.CSSProperties}>
       {background && (
         <div className="details-bg" style={{ backgroundImage: `url(${background})` }} />
       )}
       <div className="details-scrim" />
 
-      <button className="details-back btn" onClick={onClose}>
-        ← Back (B / Esc)
-      </button>
+      <div className="details-toolbar">
+        <button className="details-back btn" onClick={onClose}>← Back</button>
+      </div>
 
       <div className="details-body">
         <div className="details-head">
@@ -567,6 +589,11 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                   <span>{button.label}</span>
                 </button>
               ))}
+              {hasExtras && (
+                <button type="button" className={`details-round-action ${on('extras')}`} {...nav('extras')} onClick={openExtras}>
+                  <span className="round-action-icon">⋯</span><span>Extras</span>
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -593,7 +620,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           <div
             className={`resume-btn ${on('resume')}`}
             {...nav('resume')}
-            onClick={() => playChosen(resume.stream)}
+            onClick={() => playChosen(resume.stream, resume.progress?.track_id)}
           >
             <span className="resume-play">▶</span>
             <span>
@@ -735,6 +762,32 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
               </div>
             )}
           </div>
+        )}
+
+        {stage === 'extras' && (
+          <section className="details-extras-panel" aria-label="Extras">
+            <div className="details-extras-head">Extras</div>
+            <div className="details-extras-strip">
+              {extraTiles.map((extra, index) => (
+                <div key={extra.key} className={`details-extra-tile ${on(`extra:${index}`)}`} {...nav(`extra:${index}`)}>
+                  <strong>{extra.title}</strong><span>{extra.detail}</span>
+                </div>
+              ))}
+              {(meta?.screenshots ?? []).map((src, index) => {
+                const navIndex = extraTiles.length + index;
+                return <img key={src} className={`details-extra-shot ${on(`extra:${navIndex}`)}`} src={src} alt="" {...nav(`extra:${navIndex}`)} />;
+              })}
+              {achAll.map((achievement, index) => {
+                const navIndex = extraTiles.length + (meta?.screenshots?.length ?? 0) + index;
+                return (
+                  <div key={achievement.name + index} className={`details-extra-tile ${achievement.unlocked_at == null ? 'locked' : ''} ${on(`extra:${navIndex}`)}`} {...nav(`extra:${navIndex}`)}>
+                    {achievement.icon && <img src={achievement.icon} alt="" />}
+                    <strong>{achievement.name}</strong><span>{achievement.description || (achievement.unlocked_at == null ? 'Locked' : 'Earned')}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
         )}
 
         {(facts.length > 0 || !!meta?.tags?.length) && (

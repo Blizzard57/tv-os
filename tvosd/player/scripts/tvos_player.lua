@@ -85,6 +85,9 @@ local state = {
   overlay = nil,
   hide_timer = nil,
   layout = nil,
+  upnext = nil,
+  upnext_sel = 1,
+  upnext_timer = nil,
 }
 
 local redraw
@@ -134,6 +137,24 @@ local function read_meta()
 end
 
 local player_meta = read_meta()
+local playback_pref = player_meta.playback_preference or {
+  scope_key = player_meta.preference_scope, provider = player_meta.preference_provider
+}
+local sponsor_undo_pos = nil
+
+local function persist_preference(fields)
+  if not player_meta.preference_scope or not player_meta.preference_provider then return end
+  playback_pref.scope_key = player_meta.preference_scope
+  playback_pref.provider = player_meta.preference_provider
+  for key, value in pairs(fields) do
+    if value == false then playback_pref[key] = nil else playback_pref[key] = value end
+  end
+  local body = utils.format_json(playback_pref)
+  if not body then return end
+  mp.command_native_async({ name = 'subprocess', playback_only = false,
+    args = { 'curl', '--silent', '--max-time', '1', '-X', 'PUT', '-H', 'Content-Type: application/json',
+      '--data', body, 'http://127.0.0.1:8484/api/player/preferences' } }, function() end)
+end
 if player_meta.next_episode_id and player_meta.next_episode_id ~= '' then
   table.insert(BUTTONS, 4, { id = 'next', kind = 'next' })
 end
@@ -211,6 +232,12 @@ end
 local function apply_track(kind, entry)
   local prop = kind == 'audio' and 'aid' or 'sid'
   mp.set_property_native(prop, entry and entry.id or false)
+  if kind == 'sub' then
+    persist_preference(entry and { subtitle_mode = 'language', subtitle_language = entry.lang } or
+      { subtitle_mode = 'off', subtitle_language = false })
+  elseif entry then
+    persist_preference({ audio_language = entry.lang })
+  end
 end
 
 local function load_upscalers()
@@ -234,6 +261,7 @@ local function apply_upscaler(preset)
   end
   mp.set_property_native('glsl-shaders', list)
   mp.osd_message('Enhance: ' .. preset.name, 1.5)
+  persist_preference({ enhance_preset = preset.name })
 end
 
 local open_menu
@@ -244,11 +272,20 @@ local function rows_for_menu(kind)
       { label = 'Captions', sub = active_track('sub') and 'On' or 'Off', apply = function() open_menu('subs') end },
       { label = 'Audio', sub = track_label(tracks('audio')[1] or {}, 1), apply = function() open_menu('audio') end },
       { label = 'Playback speed', sub = tostring(mp.get_property_number('speed') or 1) .. '×', apply = function() open_menu('speed') end },
-      { label = 'Stream quality', sub = player_meta.quality or 'Auto', apply = function() mp.osd_message('Quality follows the selected source', 2) end },
+      { label = 'Stream quality', sub = player_meta.quality or 'Auto', apply = function() open_menu('quality') end },
       { label = 'Enhance', sub = ((load_upscalers().capability or {}).backend or load_upscalers().active or 'Off'), apply = function() open_menu('enhance') end },
     }
+    if sponsor_undo_pos then
+      rows[#rows + 1] = { label = 'Undo SponsorBlock skip', sub = 'Return to skipped segment', apply = function()
+        mp.set_property_number('time-pos', sponsor_undo_pos); sponsor_undo_pos = nil
+      end }
+    end
   elseif kind == 'subs' then
     rows[#rows + 1] = { label = 'Off', selected = not active_track('sub'), apply = function() apply_track('sub', nil) end }
+    rows[#rows + 1] = { label = 'Auto', selected = playback_pref.subtitle_mode == 'auto', apply = function()
+      mp.set_property_native('sid', 'auto')
+      persist_preference({ subtitle_mode = 'auto', subtitle_language = false })
+    end }
     for i, t in ipairs(tracks('sub')) do
       rows[#rows + 1] = {
         label = track_label(t, i),
@@ -257,6 +294,10 @@ local function rows_for_menu(kind)
       }
     end
   elseif kind == 'audio' then
+    rows[#rows + 1] = { label = 'Auto', selected = playback_pref.audio_language == nil, apply = function()
+      mp.set_property_native('aid', 'auto')
+      persist_preference({ audio_language = false })
+    end }
     for i, t in ipairs(tracks('audio')) do
       rows[#rows + 1] = {
         label = track_label(t, i),
@@ -269,7 +310,32 @@ local function rows_for_menu(kind)
       rows[#rows + 1] = {
         label = speed == 1.0 and 'Normal' or (tostring(speed) .. '×'),
         selected = math.abs((mp.get_property_number('speed') or 1) - speed) < 0.01,
-        apply = function() mp.set_property_number('speed', speed) end,
+        apply = function() mp.set_property_number('speed', speed); persist_preference({ speed = speed }) end,
+      }
+    end
+  elseif kind == 'quality' then
+    for _, quality in ipairs({ 'Auto', '4K', '1080p', '720p', '480p' }) do
+      rows[#rows + 1] = {
+        label = quality,
+        selected = (player_meta.quality or 'Auto'):lower() == quality:lower(),
+        apply = function()
+          local body = utils.format_json({
+            content_id = player_meta.content_id or os.getenv('TVOS_CONTENT_ID') or '',
+            track_id = player_meta.track_id or os.getenv('TVOS_ITEM_ID') or '',
+            quality = quality,
+            position = mp.get_property_number('time-pos') or 0,
+            duration = mp.get_property_number('duration'),
+            title = title(),
+            art = player_meta.art,
+          })
+          mp.osd_message('Switching to ' .. quality .. '…', 2)
+          mp.command_native_async({ name = 'subprocess', playback_only = false,
+            args = { 'curl', '--silent', '--show-error', '--max-time', '20', '-X', 'POST',
+              '-H', 'Content-Type: application/json', '--data', body,
+              'http://127.0.0.1:8484/api/player/quality' } }, function(success)
+                if not success then mp.osd_message('That quality is unavailable', 3) end
+              end)
+        end,
       }
     end
   elseif kind == 'enhance' then
@@ -327,7 +393,7 @@ end
 
 local function schedule_hide()
   if state.hide_timer then state.hide_timer:kill(); state.hide_timer = nil end
-  if mp.get_property_native('pause') or state.menu then return end
+  if mp.get_property_native('pause') or state.menu or state.upnext then return end
   state.hide_timer = mp.add_timeout(4, function()
     state.target = 0
     start_fade()
@@ -430,7 +496,7 @@ end
 
 local function text(a, x, y, an, size, hex, alpha, bold, str)
   a:new_event()
-  a:append(string.format('{\\an%d\\pos(%d,%d)\\fs%d\\b%d\\bord0\\shad0%s}%s',
+  a:append(string.format('{\\fnRoboto\\an%d\\pos(%d,%d)\\fs%d\\b%d\\bord0\\shad0%s}%s',
     an, x, y, size, bold and 1 or 0, fill(hex, alpha), esc(str)))
 end
 
@@ -571,7 +637,10 @@ local function layout(w, h)
   L.time_y = L.sy + px(26)
   L.time_fs = px(26)
   -- title
-  L.title_y = edge_y + px(22)
+  -- The Back affordance owns its own toolbar line. Keeping the title below it
+  -- prevents long logos/source labels from colliding with navigation.
+  L.back_y = edge_y + px(20)
+  L.title_y = edge_y + px(92)
   L.title_fs = px(38)
   L.sub_y = L.title_y + px(50)
   L.sub_fs = px(24)
@@ -620,7 +689,11 @@ local function render_controls(a, L)
   scrim(a, w, 0, math.floor(h * 0.24), 0x8E, 0xFF, 18)
   scrim(a, w, math.floor(h * 0.45), h, 0xFF, 0x1C, 22)
 
-  -- title block
+  -- dedicated top toolbar + title block
+  rrect(a, COLORS.surface, 0x36, L.edge_x, L.back_y - math.floor(20 * L.scale),
+    L.edge_x + math.floor(112 * L.scale), L.back_y + math.floor(27 * L.scale), math.floor(23 * L.scale))
+  text(a, L.edge_x + math.floor(22 * L.scale), L.back_y + math.floor(2 * L.scale), 4,
+    math.floor(23 * L.scale), COLORS.text, 0, true, '←  Back')
   text(a, L.edge_x, L.title_y, 7, L.title_fs, COLORS.text, 0, true, title())
   local sub = subtitle_line()
   if sub ~= '' then
@@ -680,12 +753,106 @@ local function render_controls(a, L)
   end
 end
 
+local function cancel_upnext(quit_after)
+  local next = state.upnext
+  if state.upnext_timer then state.upnext_timer:kill(); state.upnext_timer = nil end
+  state.upnext = nil
+  if next and next.token then
+    local body = utils.format_json({ token = next.token })
+    mp.command_native_async({ name = 'subprocess', playback_only = false,
+      args = { 'curl', '--silent', '--max-time', '2', '-X', 'POST', '-H', 'Content-Type: application/json',
+        '--data', body, 'http://127.0.0.1:8484/api/player/autoplay/cancel' } }, function() end)
+  end
+  if quit_after then mp.commandv('quit') else redraw() end
+end
+
+local function launch_upnext()
+  local next = state.upnext
+  if not next or not next.token then return end
+  if state.upnext_timer then state.upnext_timer:kill(); state.upnext_timer = nil end
+  local body = utils.format_json({ token = next.token })
+  next.launching = true
+  redraw()
+  mp.command_native_async({ name = 'subprocess', playback_only = false,
+    args = { 'curl', '--silent', '--show-error', '--max-time', '15', '-X', 'POST',
+      '-H', 'Content-Type: application/json', '--data', body,
+      'http://127.0.0.1:8484/api/player/autoplay/launch' } }, function(success)
+        if success then
+          state.upnext = nil
+          mp.commandv('quit')
+        else
+          next.launching = false
+          next.failed = true
+          next.remaining = 0
+          redraw()
+        end
+      end)
+end
+
+local function render_upnext(a, L)
+  rrect(a, '000000', 0x3C, 0, 0, L.w, L.h, 0)
+  local panel_w = math.floor(math.min(L.w * 0.56, 920 * L.scale))
+  local panel_h = math.floor(330 * L.scale)
+  local x0 = math.floor((L.w - panel_w) / 2)
+  local y0 = math.floor((L.h - panel_h) / 2)
+  local pad = math.floor(38 * L.scale)
+  rrect(a, COLORS.bg, 0x02, x0, y0, x0 + panel_w, y0 + panel_h, math.floor(28 * L.scale))
+  text(a, x0 + pad, y0 + pad, 7, math.floor(22 * L.scale), COLORS.accent, 0, true, 'UP NEXT')
+  text(a, x0 + pad, y0 + pad + math.floor(48 * L.scale), 7, math.floor(38 * L.scale), COLORS.text, 0, true,
+    state.upnext.title or 'Up next')
+  local copy = state.upnext.failed and 'Could not start this video' or
+    (state.upnext.launching and 'Starting…' or
+      string.format('%s  ·  Playing in %d', state.upnext.reason or 'Recommended for you', state.upnext.remaining or 0))
+  text(a, x0 + pad, y0 + pad + math.floor(98 * L.scale), 7, math.floor(24 * L.scale), COLORS.dim, 0, false, copy)
+  local by = y0 + panel_h - math.floor(76 * L.scale)
+  local bw = math.floor(190 * L.scale)
+  local gap = math.floor(22 * L.scale)
+  for i, label in ipairs({ state.upnext.failed and 'Close' or 'Play now', 'Cancel' }) do
+    local bx = x0 + pad + (i - 1) * (bw + gap)
+    local focused = state.upnext_sel == i
+    rrect(a, focused and COLORS.white or COLORS.surface2, focused and 0 or 0x20,
+      bx, by, bx + bw, by + math.floor(54 * L.scale), math.floor(27 * L.scale))
+    text(a, bx + bw / 2, by + math.floor(27 * L.scale), 5, math.floor(23 * L.scale),
+      focused and COLORS.black or COLORS.text, 0, true, label)
+  end
+end
+
+local function request_upnext()
+  if is_live or player_meta.autoplay == false or state.upnext then return end
+  local body = utils.format_json({
+    content_id = player_meta.content_id or os.getenv('TVOS_CONTENT_ID') or '',
+    track_id = player_meta.track_id or os.getenv('TVOS_TRACK_ID') or '',
+    next_track_id = player_meta.next_episode_id,
+    title = title(), art = player_meta.art, domain = player_meta.domain,
+  })
+  mp.command_native_async({ name = 'subprocess', playback_only = false,
+    args = { 'curl', '--silent', '--show-error', '--max-time', '12', '-X', 'POST',
+      '-H', 'Content-Type: application/json', '--data', body,
+      'http://127.0.0.1:8484/api/player/autoplay/candidate' } }, function(success, result)
+        if not success or not result or not result.stdout then return end
+        local candidate = utils.parse_json(result.stdout)
+        if not candidate or not candidate.token then return end
+        candidate.remaining = tonumber(candidate.countdown_seconds) or tonumber(player_meta.autoplay_delay_seconds) or 10
+        state.upnext = candidate
+        state.upnext_sel = 1
+        state.visible = true
+        state.opacity = 1
+        state.target = 1
+        state.upnext_timer = mp.add_periodic_timer(1, function()
+          if not state.upnext or state.upnext.launching or state.upnext.failed then return end
+          state.upnext.remaining = math.max(0, state.upnext.remaining - 1)
+          if state.upnext.remaining <= 0 then launch_upnext() else redraw() end
+        end)
+        redraw()
+      end)
+end
+
 local function render_menu(a, L)
   local w, h = L.w, L.h
   rrect(a, '000000', 0x48, 0, 0, w, h, 0)
 
   local rows = state.menu.rows
-  local title_map = { settings = 'Settings', subs = 'Captions', audio = 'Audio', enhance = 'Enhance', speed = 'Playback speed' }
+  local title_map = { settings = 'Settings', subs = 'Captions', audio = 'Audio', enhance = 'Enhance', speed = 'Playback speed', quality = 'Stream quality' }
   local pw = math.floor(math.min(w * 0.42, 720 * L.scale))
   local px = w - pw - L.edge_x
   local py = L.edge_y + math.floor(20 * L.scale)
@@ -753,7 +920,9 @@ redraw = function()
   local L = layout(w, h)
   state.layout = L
   local a = assdraw.ass_new()
-  if state.menu then
+  if state.upnext then
+    render_upnext(a, L)
+  elseif state.menu then
     render_menu(a, L)
   elseif state.visible then
     render_controls(a, L)
@@ -771,6 +940,16 @@ end
 -- ---------------------------------------------------------------------------
 
 local function on_key(key)
+  if state.upnext then
+    if key == 'LEFT' then state.upnext_sel = 1
+    elseif key == 'RIGHT' then state.upnext_sel = 2
+    elseif key == 'ENTER' or key == 'SPACE' then
+      if state.upnext_sel == 1 and not state.upnext.failed then launch_upnext() else cancel_upnext(true) end
+    elseif key == 'ESC' or key == 'BS' then cancel_upnext(true)
+    end
+    redraw()
+    return
+  end
   if state.menu then
     if key == 'UP' then state.menu_sel = math.max(1, state.menu_sel - 1)
     elseif key == 'DOWN' then state.menu_sel = math.min(#state.menu.rows, state.menu_sel + 1)
@@ -834,7 +1013,30 @@ mp.observe_property('sid', 'native', function() if state.visible then redraw() e
 mp.observe_property('aid', 'native', function() if state.visible then redraw() end end)
 mp.observe_property('osd-dimensions', 'native', redraw)
 
+-- SponsorBlock segments are fetched by the daemon using the privacy-preserving
+-- hash-prefix endpoint. A skipped segment can be restored from Settings.
+local sponsor_seen = {}
+mp.add_periodic_timer(0.25, function()
+  if is_live then return end
+  local pos = mp.get_property_number('time-pos')
+  if not pos then return end
+  for _, segment in ipairs(player_meta.sponsorblock_segments or {}) do
+    local key = tostring(segment.start) .. ':' .. tostring(segment['end'])
+    if not sponsor_seen[key] and pos >= segment.start and pos < segment['end'] - 0.1 then
+      sponsor_seen[key] = true
+      sponsor_undo_pos = math.max(0, segment.start)
+      mp.set_property_number('time-pos', segment['end'])
+      mp.osd_message('Sponsor skipped · Settings to undo', 3)
+      break
+    end
+  end
+end)
+
 mp.register_event('file-loaded', function()
   show()
   mp.add_timeout(1.0, redraw)
+end)
+
+mp.register_event('end-file', function(event)
+  if event and event.reason == 'eof' then request_upnext() end
 end)

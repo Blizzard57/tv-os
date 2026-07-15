@@ -70,6 +70,20 @@ pub struct PlaybackProgress {
     pub episode: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaybackPreference {
+    pub scope_key: String,
+    pub provider: String,
+    pub subtitle_mode: Option<String>,
+    pub subtitle_language: Option<String>,
+    pub audio_language: Option<String>,
+    pub speed: Option<f64>,
+    pub quality_tier: Option<String>,
+    pub enhance_preset: Option<String>,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
 pub struct ProfileStore {
     conn: Mutex<Option<Connection>>,
 }
@@ -112,6 +126,13 @@ impl ProfileStore {
                    position REAL NOT NULL DEFAULT 0, duration REAL NOT NULL DEFAULT 0,
                    completed INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0,
                    season INTEGER, episode INTEGER, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS playback_preferences (
+                   scope_key TEXT NOT NULL, provider TEXT NOT NULL,
+                   subtitle_mode TEXT, subtitle_language TEXT, audio_language TEXT,
+                   speed REAL, quality_tier TEXT, enhance_preset TEXT,
+                   updated_at INTEGER NOT NULL,
+                   PRIMARY KEY(scope_key,provider)
                  );
                  CREATE TABLE IF NOT EXISTS preferences (
                    item_id TEXT PRIMARY KEY, reaction INTEGER NOT NULL DEFAULT 0,
@@ -280,6 +301,11 @@ impl ProfileStore {
         ))
     }
 
+    pub fn is_completed(&self, content_id: &str) -> bool {
+        self.progress(content_id)
+            .is_some_and(|progress| progress.completed)
+    }
+
     pub fn continue_progress(&self) -> Vec<PlaybackProgress> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
@@ -294,6 +320,53 @@ impl ProfileStore {
                 .collect();
             Ok(progress)
         }).unwrap_or_default()
+    }
+
+    pub fn playback_preference(
+        &self,
+        scope_key: &str,
+        provider: &str,
+    ) -> Option<PlaybackPreference> {
+        self.with_conn(|c| c.query_row(
+            "SELECT scope_key,provider,subtitle_mode,subtitle_language,audio_language,speed,quality_tier,enhance_preset,updated_at
+             FROM playback_preferences WHERE scope_key=?1 AND provider=?2",
+            params![scope_key, provider],
+            |row| Ok(PlaybackPreference {
+                scope_key: row.get(0)?, provider: row.get(1)?, subtitle_mode: row.get(2)?,
+                subtitle_language: row.get(3)?, audio_language: row.get(4)?, speed: row.get(5)?,
+                quality_tier: row.get(6)?, enhance_preset: row.get(7)?, updated_at: row.get(8)?,
+            }),
+        ))
+    }
+
+    pub fn save_playback_preference(
+        &self,
+        pref: &PlaybackPreference,
+    ) -> Result<PlaybackPreference, String> {
+        if pref.scope_key.trim().is_empty() || pref.provider.trim().is_empty() {
+            return Err("scope_key and provider are required".into());
+        }
+        if pref
+            .speed
+            .is_some_and(|speed| !(0.25..=4.0).contains(&speed))
+        {
+            return Err("speed must be between 0.25 and 4".into());
+        }
+        let mut saved = pref.clone();
+        saved.updated_at = now();
+        self.with_conn(|c| c.execute(
+            "INSERT INTO playback_preferences
+             (scope_key,provider,subtitle_mode,subtitle_language,audio_language,speed,quality_tier,enhance_preset,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(scope_key,provider) DO UPDATE SET
+               subtitle_mode=excluded.subtitle_mode,subtitle_language=excluded.subtitle_language,
+               audio_language=excluded.audio_language,speed=excluded.speed,
+               quality_tier=excluded.quality_tier,enhance_preset=excluded.enhance_preset,
+               updated_at=excluded.updated_at",
+            params![saved.scope_key, saved.provider, saved.subtitle_mode, saved.subtitle_language,
+                saved.audio_language, saved.speed, saved.quality_tier, saved.enhance_preset, saved.updated_at],
+        )).ok_or_else(|| "personalization database is unavailable".to_string())?;
+        Ok(saved)
     }
 
     /// Import crash-safe mpv sidecars. Re-importing is harmless because the
@@ -446,6 +519,7 @@ mod tests {
             "CREATE TABLE interactions(id INTEGER PRIMARY KEY,item_id TEXT,kind TEXT,position REAL,duration REAL,context TEXT,occurred_at INTEGER);
              CREATE TABLE playback_progress(item_id TEXT PRIMARY KEY,position REAL,duration REAL,completed INTEGER,updated_at INTEGER);
              CREATE TABLE playback_sessions(content_id TEXT PRIMARY KEY,track_id TEXT,session_id TEXT,sequence INTEGER,position REAL,duration REAL,completed INTEGER,paused INTEGER,season INTEGER,episode INTEGER,updated_at INTEGER);
+             CREATE TABLE playback_preferences(scope_key TEXT,provider TEXT,subtitle_mode TEXT,subtitle_language TEXT,audio_language TEXT,speed REAL,quality_tier TEXT,enhance_preset TEXT,updated_at INTEGER,PRIMARY KEY(scope_key,provider));
              CREATE TABLE recommendation_impressions(item_id TEXT,shelf_id TEXT,shown_count INTEGER,last_shown INTEGER,PRIMARY KEY(item_id,shelf_id));",
         ).unwrap();
         ProfileStore {
@@ -499,5 +573,44 @@ mod tests {
         assert_eq!(progress.track_id, "strm:series:tt1:2:1");
         assert_eq!((progress.season, progress.episode), (Some(2), Some(1)));
         assert!(!progress.completed);
+    }
+
+    #[test]
+    fn playback_preferences_roundtrip_and_auto_clears_overrides() {
+        let store = test_store();
+        let saved = store
+            .save_playback_preference(&PlaybackPreference {
+                scope_key: "show:1".into(),
+                provider: "torrentio".into(),
+                subtitle_mode: Some("off".into()),
+                subtitle_language: None,
+                audio_language: Some("jpn".into()),
+                speed: Some(1.25),
+                quality_tier: Some("1080p".into()),
+                enhance_preset: Some("Anime".into()),
+                updated_at: 0,
+            })
+            .unwrap();
+        assert!(saved.updated_at > 0);
+        let loaded = store.playback_preference("show:1", "torrentio").unwrap();
+        assert_eq!(loaded.subtitle_mode.as_deref(), Some("off"));
+        assert_eq!(loaded.audio_language.as_deref(), Some("jpn"));
+        assert_eq!(loaded.speed, Some(1.25));
+
+        store
+            .save_playback_preference(&PlaybackPreference {
+                subtitle_mode: Some("auto".into()),
+                subtitle_language: None,
+                audio_language: None,
+                speed: None,
+                quality_tier: None,
+                enhance_preset: None,
+                ..loaded
+            })
+            .unwrap();
+        let cleared = store.playback_preference("show:1", "torrentio").unwrap();
+        assert_eq!(cleared.subtitle_mode.as_deref(), Some("auto"));
+        assert!(cleared.subtitle_language.is_none());
+        assert!(cleared.audio_language.is_none());
     }
 }

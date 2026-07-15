@@ -276,6 +276,7 @@ pub fn play_stream(
     track_id: Option<&str>,
     display_title: Option<&str>,
     next_track_id: Option<&str>,
+    artwork: Option<&str>,
     genres: &[String],
 ) -> Result<(), String> {
     let mode = settings::STORE.get().enhance;
@@ -285,6 +286,33 @@ pub fn play_stream(
         meta.source = Some(stream.name.replace('\n', " "));
         meta.next_episode_id = next_track_id.map(str::to_owned);
         meta.visual_class = upscale::classify(title, genres, false);
+        let scope = item_id.unwrap_or("video").to_string();
+        let provider = provider_key(&stream.name);
+        meta.playback_preference = crate::profile::STORE.playback_preference(&scope, &provider);
+        meta.preference_scope = Some(scope);
+        meta.preference_provider = Some(provider);
+        meta.quality = stream_quality(&stream.name);
+        meta.art = artwork.map(str::to_owned).or_else(|| {
+            item_id
+                .and_then(crate::tracking::local_item)
+                .and_then(|item| item.art)
+        });
+        meta.content_id = item_id.map(str::to_owned);
+        meta.track_id = track_id.or(item_id).map(str::to_owned);
+        meta.domain = Some(
+            if item_id.is_some_and(|id| id.starts_with("yt:")) {
+                "youtube"
+            } else {
+                "media"
+            }
+            .into(),
+        );
+        let settings = settings::STORE.get();
+        meta.autoplay = settings.autoplay;
+        meta.autoplay_delay_seconds = settings.autoplay_delay_seconds.clamp(3, 30);
+        if let Some(video) = item_id.and_then(|id| id.strip_prefix("yt:")) {
+            meta.sponsorblock_segments = crate::sponsorblock::segments(video);
+        }
         meta
     });
     let track_id = track_id.or(item_id);
@@ -332,10 +360,68 @@ pub fn play_stream(
                 }
             }
             clear_failed_torrent(stream);
+            if let (Some(scope), Some(quality)) = (item_id, stream_quality(&stream.name)) {
+                let provider = provider_key(&stream.name);
+                let mut preference = crate::profile::STORE
+                    .playback_preference(scope, &provider)
+                    .unwrap_or(crate::profile::PlaybackPreference {
+                        scope_key: scope.to_string(),
+                        provider: provider.clone(),
+                        subtitle_mode: None,
+                        subtitle_language: None,
+                        audio_language: None,
+                        speed: None,
+                        quality_tier: None,
+                        enhance_preset: None,
+                        updated_at: 0,
+                    });
+                preference.quality_tier = Some(quality);
+                let _ = crate::profile::STORE.save_playback_preference(&preference);
+            }
         }
         Err(_) => mark_failed_torrent(stream),
     }
     result
+}
+
+fn provider_key(name: &str) -> String {
+    let first = name
+        .lines()
+        .next()
+        .unwrap_or("default")
+        .to_ascii_lowercase();
+    let key: String = first
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if key.is_empty() {
+        "default".into()
+    } else {
+        key
+    }
+}
+
+fn stream_quality(name: &str) -> Option<String> {
+    let value = name.to_ascii_lowercase();
+    [
+        ("2160p", "4K"),
+        ("4k", "4K"),
+        ("1440p", "1440p"),
+        ("1080p", "1080p"),
+        ("720p", "720p"),
+        ("480p", "480p"),
+        ("360p", "360p"),
+    ]
+    .into_iter()
+    .find_map(|(token, label)| value.contains(token).then(|| label.to_string()))
+}
+
+pub fn clear_quality_preference(scope: &str, stream: &Stream) {
+    let provider = provider_key(&stream.name);
+    if let Some(mut preference) = crate::profile::STORE.playback_preference(scope, &provider) {
+        preference.quality_tier = None;
+        let _ = crate::profile::STORE.save_playback_preference(&preference);
+    }
 }
 
 /// How many sources the auto-picker will try before giving up. Each attempt now
@@ -400,7 +486,7 @@ pub fn play_meta_track(
             stream.kind,
             stream.name.replace('\n', " ")
         );
-        match play_stream(stream, item_id, track_id, display_title, None, &[]) {
+        match play_stream(stream, item_id, track_id, display_title, None, None, &[]) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 crate::log_warn!("source failed, trying next: {e}");
@@ -1054,6 +1140,19 @@ mod tests {
         // …but the same letters buried inside a title do not.
         assert_eq!(resolution_height("h4ker the movie"), 600.0);
         assert_eq!(resolution_height("uhded up"), 600.0);
+    }
+
+    #[test]
+    fn stream_quality_normalizes_source_labels() {
+        assert_eq!(
+            stream_quality("Torrentio\n2160p HDR").as_deref(),
+            Some("4K")
+        );
+        assert_eq!(
+            stream_quality("MediaFusion 1080p").as_deref(),
+            Some("1080p")
+        );
+        assert_eq!(stream_quality("Automatic").as_deref(), None);
     }
 
     #[test]

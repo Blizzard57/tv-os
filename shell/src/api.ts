@@ -177,6 +177,10 @@ export type EnhanceMode = 'auto' | 'quality' | 'performance' | 'off';
 // Mirrors tvosd/src/settings.rs (snake_case to match the wire format).
 export interface Settings {
   enhance: EnhanceMode;
+  autoplay: boolean;
+  autoplay_delay_seconds: number;
+  sponsorblock_enabled: boolean;
+  sponsorblock_categories: string;
   steam_api_key: string;
   steam_id: string;
   tmdb_key: string;
@@ -378,6 +382,21 @@ export interface EnhanceStatus {
 export async function fetchEnhanceStatus(): Promise<EnhanceStatus> {
   const res = await apiFetch('/api/enhance/status', undefined, SHORT_TIMEOUT_MS);
   if (!res.ok) throw new ApiError(`enhancement status failed: ${res.status}`, 'http', res.status);
+  return res.json();
+}
+
+export interface PlayerRuntimeStatus {
+  config_dir: string;
+  expected_fingerprint: string;
+  installed_fingerprint: string;
+  current: boolean;
+  overlay_path: string;
+  overlay_exists: boolean;
+}
+
+export async function fetchPlayerRuntime(): Promise<PlayerRuntimeStatus> {
+  const res = await apiFetch('/api/player/runtime', undefined, SHORT_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`player runtime failed: ${res.status}`, 'http', res.status);
   return res.json();
 }
 
@@ -654,12 +673,13 @@ export async function fetchResume(id: string): Promise<ResumeInfo | null> {
 // recommender (with the title/art shown on the details page). `trackId` is the
 // precise watched id — for an episode it carries season:episode so Trakt/
 // AniList scrobble the exact episode, while `item` (the show) drives Continue.
-export const playStream = (stream: Stream, item: ContentItem, trackId?: string, nextTrackId?: string, genres?: string[]): Promise<PlaybackStatus> =>
+export const playStream = (stream: Stream, item: ContentItem, trackId?: string, nextTrackId?: string, genres?: string[], displayTitle?: string): Promise<PlaybackStatus> =>
   postJson('/api/play', {
     stream,
     item: { id: item.id, title: item.title, kind: item.kind, art: item.art, genres },
     track_id: trackId ?? item.id,
     next_track_id: nextTrackId,
+    display_title: displayTitle,
   }, SHORT_TIMEOUT_MS);
 
 export async function fetchPlayback(id: string): Promise<PlaybackStatus> {

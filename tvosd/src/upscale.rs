@@ -105,12 +105,6 @@ pub fn presets() -> Vec<Preset> {
     out
 }
 
-/// The preset name the auto-resolver picks for `target` — what the player
-/// starts on and marks active in the menu.
-pub fn active_preset(mode: EnhanceMode, target: &str) -> String {
-    active_preset_for(mode, target, VisualClass::Unknown)
-}
-
 pub fn active_preset_for(mode: EnhanceMode, target: &str, class: VisualClass) -> String {
     let mode = effective(mode, gpu());
     if mode == EnhanceMode::Off || source_height(target).is_some_and(|h| h >= 2160) {

@@ -10,9 +10,11 @@ import {
   fetchInstalls,
   fetchLibrary,
   fetchMeta,
+  fetchResume,
   queueInteractions,
   fetchSettings,
   saveSettings,
+  playStream,
 } from './api';
 import { DetailsPage } from './DetailsPage';
 import { activateFocused, moveFocus } from './focusNav';
@@ -35,6 +37,10 @@ const ENHANCE_LABELS: Record<EnhanceMode, string> = {
 
 const BLANK_SETTINGS: Settings = {
   enhance: 'auto',
+  autoplay: true,
+  autoplay_delay_seconds: 10,
+  sponsorblock_enabled: true,
+  sponsorblock_categories: 'sponsor',
   steam_api_key: '',
   steam_id: '',
   tmdb_key: '',
@@ -118,7 +124,7 @@ export default function App() {
   const shelves = tabRows[activeTab];
   const defaultHero = useMemo(() => {
     const preferred = shelves.find((r) => r.purpose === 'top_picks') || shelves[0];
-    const items = preferred?.items.filter((item) => activeTab !== 'foryou' || item.kind === 'movie' || item.kind === 'series') ?? [];
+    const items = preferred?.items ?? [];
     return items[0];
   }, [shelves]);
   const rememberedHero = useRef<Partial<Record<TabId, ContentItem>>>({});
@@ -214,6 +220,30 @@ export default function App() {
 
   // Confirm on a card opens its details page.
   const activateItem = useCallback((item: ContentItem) => pushDetails(item), [pushDetails]);
+  const resumeItem = useCallback((item: ContentItem) => {
+    fetchResume(item.id)
+      .then((resume) => {
+        if (!resume) {
+          pushDetails(item);
+          return;
+        }
+        return playStream(
+          resume.stream,
+          item,
+          resume.progress?.track_id ?? item.id,
+          undefined,
+          undefined,
+          item.title,
+        ).then(() => {
+          showToast('Resuming ' + item.title);
+          onPlayed();
+        });
+      })
+      .catch(() => {
+        showToast('Could not resume playback');
+        pushDetails(item);
+      });
+  }, [onPlayed, pushDetails, showToast]);
 
   // ---- Home focus helpers (DOM focus, geometry nav) ----
   const rowsRoot = useCallback(
@@ -430,7 +460,7 @@ export default function App() {
     body = (
       <>
         <div className="home-content">
-        <Hero item={featuredItem} preview={preview} explanation={featuredRow?.explanation} onOpen={activateItem} onFocus={(el) => onCardFocus(featuredItem!, el)} />
+        <Hero item={featuredItem} preview={preview} explanation={featuredRow?.explanation} onOpen={activateItem} onPlay={(item) => item.playback && !item.playback.completed ? resumeItem(item) : activateItem(item)} onFocus={(el) => onCardFocus(featuredItem!, el)} />
         <main className="home-rows">
           {shelves.length === 0 ? (
             <div className="screen-message">{EMPTY_TAB_COPY[activeTab] || 'Nothing here yet.'}</div>
@@ -443,7 +473,7 @@ export default function App() {
                 layout={shelf.layout}
                 explanation={shelf.explanation}
                 items={shelf.items}
-                onPick={activateItem}
+                onPick={shelf.purpose === 'continue_watching' ? resumeItem : activateItem}
                 onFocusItem={onCardFocus}
                 jobs={jobs}
                 shelfIndex={i}

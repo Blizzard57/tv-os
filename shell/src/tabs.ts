@@ -52,7 +52,7 @@ export function rowsForTab(tab: TabId, rows: Row[]): Row[] {
       });
       const channelOnly = items.length > 0 && items.every((item) => item.creator_type === 'channel');
       return { ...row, destination: 'creators' as const, purpose: 'creators' as const, layout: channelOnly ? 'circle' as const : 'landscape' as const, items };
-    }).filter((row) => row.items.length > 0);
+    }).filter((row) => row.items.length > 0).slice(0, 10);
   }
   const kinds = TAB_KINDS[tab];
   const out: Row[] = [];
@@ -71,20 +71,32 @@ function forYouRows(rows: Row[]): Row[] {
     if (/^new episodes/i.test(row.title)) return 3;
     if (/^new & noteworthy/i.test(row.title)) return 4;
     if (row.purpose === 'library' || /watchlist/i.test(row.title)) return 5;
-    return 6;
+    if (row.purpose === 'games') return 6;
+    return 7;
   };
+  const gameCandidates = rows
+    .filter((row) => row.purpose === 'games' || /games/i.test(row.title))
+    .flatMap((row) => row.items)
+    .filter((item) => item.kind === 'game');
+  const featuredGames = gameCandidates.slice(0, 2);
   const seen = new Set<string>();
   return rows
-    .filter((row) => row.purpose !== 'creators' && row.purpose !== 'games' && !row.title.match(/indian spotlight/i))
+    .filter((row) => row.purpose !== 'creators' && row.destination !== 'live' && !row.title.match(/indian spotlight/i))
     .sort((a, b) => priority(a) - priority(b))
-    .map((row) => ({ ...row, items: row.items.filter((item) => {
-      if (item.kind !== 'movie' && item.kind !== 'series') return false;
+    .map((row) => {
+      const candidates = row.purpose === 'top_picks'
+        ? [...row.items.filter((item) => item.kind === 'movie' || item.kind === 'series'), ...featuredGames]
+        : row.purpose === 'games'
+          ? row.items.filter((item) => item.kind === 'game' && !featuredGames.some((game) => game.id === item.id))
+          : row.items.filter((item) => item.kind === 'movie' || item.kind === 'series');
+      return { ...row, title: row.purpose === 'games' ? 'Games for you' : row.title, items: candidates.filter((item) => {
       if (seen.has(item.id)) return false;
       seen.add(item.id);
       return true;
-    }) }))
+    }) };
+    })
     .filter((row) => row.items.length > 0)
-    .slice(0, 8);
+    .slice(0, 10);
 }
 
 /** Does this tab have anything at all? Used to dim empty tabs (Google TV greys

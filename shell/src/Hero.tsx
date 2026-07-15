@@ -1,12 +1,14 @@
 import { useState } from 'react';
 import { ContentItem, Meta } from './api';
 import { gameLogo } from './cards';
+import { useArtworkPalette } from './artPalette';
 
 interface Props {
   item: ContentItem | undefined;
   preview: Meta | null;
   explanation?: string;
   onOpen: (item: ContentItem) => void;
+  onPlay: (item: ContentItem) => void;
   onFocus: (el: HTMLElement) => void;
 }
 
@@ -14,8 +16,9 @@ interface Props {
  *  behind a left-anchored block of logo/title, meta line and synopsis — the
  *  Google-TV "featured" panel. Games show Steam's stylized logo the way movies
  *  show their title treatment. */
-export function Hero({ item, preview, explanation, onOpen, onFocus }: Props) {
+export function Hero({ item, preview, explanation, onOpen, onPlay, onFocus }: Props) {
   const [failedLogos, setFailedLogos] = useState<Set<string>>(() => new Set());
+  const palette = useArtworkPalette(preview?.background || item?.art, item?.id || 'hero-empty');
   if (!item) return <div className="hero hero-empty" />;
 
   const isGame = (preview?.kind ?? item.kind) === 'game';
@@ -35,7 +38,7 @@ export function Hero({ item, preview, explanation, onOpen, onFocus }: Props) {
     .join('  ·  ');
 
   return (
-    <div className="hero">
+    <div className="hero" style={{ '--art-primary': palette.primary, '--art-secondary': palette.secondary } as React.CSSProperties}>
       {bg && <div key={bg} className="hero-bg" style={{ backgroundImage: `url(${bg})` }} />}
       <div className="hero-scrim" />
       <div className="hero-content">
@@ -54,9 +57,9 @@ export function Hero({ item, preview, explanation, onOpen, onFocus }: Props) {
         {sub && <div className="hero-sub">{sub}</div>}
         {preview?.description && <p className="hero-desc">{preview.description}</p>}
         <div className="hero-actions">
-          <button data-focus-key="hero:primary" className="hero-primary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
+          <button data-focus-key="hero:primary" className="hero-primary" onClick={() => onPlay(item)} onFocus={(e) => onFocus(e.currentTarget)}>
             <span className="material-icon" aria-hidden>▶</span>
-            {item.action === 'install' ? 'Install' : item.action === 'none' ? 'View details' : 'Watch now'}
+            {item.playback && !item.playback.completed ? 'Resume' : item.action === 'install' ? 'Install' : item.action === 'none' ? 'View details' : 'Watch now'}
           </button>
           <button data-focus-key="hero:details" className="hero-secondary" onClick={() => onOpen(item)} onFocus={(e) => onFocus(e.currentTarget)}>
             <span className="material-icon" aria-hidden>ⓘ</span> Details

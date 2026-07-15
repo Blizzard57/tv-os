@@ -44,6 +44,17 @@ pub struct PlayerMeta {
     pub source_height: Option<u32>,
     pub expected_fps: Option<f64>,
     pub next_episode_id: Option<String>,
+    pub preference_scope: Option<String>,
+    pub preference_provider: Option<String>,
+    pub playback_preference: Option<crate::profile::PlaybackPreference>,
+    pub sponsorblock_segments: Vec<crate::sponsorblock::Segment>,
+    pub content_id: Option<String>,
+    pub track_id: Option<String>,
+    pub art: Option<String>,
+    pub domain: Option<String>,
+    pub autoplay: bool,
+    pub autoplay_delay_seconds: u64,
+    pub quality: Option<String>,
 }
 
 impl PlayerMeta {
@@ -61,6 +72,17 @@ impl PlayerMeta {
             source_height: None,
             expected_fps: None,
             next_episode_id: None,
+            preference_scope: None,
+            preference_provider: None,
+            playback_preference: None,
+            sponsorblock_segments: Vec::new(),
+            content_id: None,
+            track_id: None,
+            art: None,
+            domain: None,
+            autoplay: false,
+            autoplay_delay_seconds: 10,
+            quality: None,
         }
     }
 
@@ -422,24 +444,16 @@ fn prepare_mpv_home(
     home
 }
 
-/// Player bundle version. Bump it to ship new defaults: on the next launch the
-/// bundled files are rewritten *once*. Otherwise the daemon never touches them
-/// again, so anything you edit under MPV_HOME stays edited (no rebuild needed),
-/// and deleting a file restores its shipped default on the next launch.
-const PLAYER_VERSION: &str = "17";
-
 /// Installs the bundled player into MPV_HOME so the TV overlay is always the UI.
-/// The entire player tree (TV overlay, thumbfast, our scripts and config) is
-/// extracted. Each file is (re)written only when missing or when
-/// PLAYER_VERSION changes, which makes MPV_HOME the live, editable surface: edit
-/// input.conf or scripts/*.lua there and they take effect on the next play;
-/// delete one to restore its shipped default.
+/// Managed files refresh whenever their embedded bytes change. user.conf is
+/// deliberately outside that managed set and is never overwritten.
 fn provision_player(home: &Path) {
     let _ = std::fs::create_dir_all(home);
-    let stamp = home.join(".player-version");
-    let refresh = std::fs::read_to_string(&stamp).unwrap_or_default().trim() != PLAYER_VERSION;
+    let stamp = home.join(".player-fingerprint");
+    let fingerprint = bundle_fingerprint();
+    let refresh = std::fs::read_to_string(&stamp).unwrap_or_default().trim() != fingerprint;
 
-    extract_dir(&PLAYER_FILES, home, refresh);
+    let deployed = extract_dir(&PLAYER_FILES, home, refresh);
 
     // A user override that we create once and then never touch — put personal
     // mpv tweaks here; the generated mpv.conf includes it last so they win.
@@ -468,25 +482,96 @@ fn provision_player(home: &Path) {
         let _ = std::fs::remove_file(home.join("script-opts/modernz.conf"));
         let _ = std::fs::remove_file(home.join("fonts/modernz-icons.ttf"));
         let _ = std::fs::remove_file(home.join(".uosc-version")); // old stamp name
-        let _ = std::fs::write(&stamp, PLAYER_VERSION);
+        if deployed {
+            atomic_write(&stamp, fingerprint.as_bytes());
+        }
+        let _ = std::fs::remove_file(home.join(".player-version"));
     }
 }
 
-/// Recursively writes an embedded dir under `dest`, creating parents. A file is
-/// written when `refresh` is set or it doesn't exist yet (so user edits stick).
-fn extract_dir(dir: &Dir, dest: &Path, refresh: bool) {
+/// Deploy the managed UI at daemon start, not only when the first video opens.
+/// This makes runtime diagnostics truthful and guarantees a theme change is
+/// already on disk before mpv is spawned.
+pub fn provision_player_runtime() {
+    provision_player(&mpv_home());
+}
+
+/// Recursively writes the managed embedded directory. Unmanaged files are
+/// preserved; changed bundled files are replaced atomically.
+fn extract_dir(dir: &Dir, dest: &Path, refresh: bool) -> bool {
+    let mut complete = true;
     for file in dir.files() {
         let path = dest.join(file.path());
         if refresh || !path.exists() {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&path, file.contents());
+            complete &= atomic_write(&path, file.contents());
         }
     }
     for sub in dir.dirs() {
-        extract_dir(sub, dest, refresh);
+        complete &= extract_dir(sub, dest, refresh);
     }
+    complete
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> bool {
+    let file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("asset");
+    let tmp = path.with_file_name(format!(".{file}.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let renamed = std::fs::rename(&tmp, path).is_ok();
+        if !renamed {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return renamed;
+    }
+    false
+}
+
+/// Stable FNV-1a over every managed relative path and byte. Unlike the former
+/// hand-maintained version number this cannot forget a Lua/theme edit.
+fn bundle_fingerprint() -> String {
+    fn hash_dir(dir: &Dir, hash: &mut u64) {
+        let mut files = dir.files().collect::<Vec<_>>();
+        files.sort_by_key(|file| file.path());
+        for file in files {
+            for byte in file
+                .path()
+                .to_string_lossy()
+                .bytes()
+                .chain(file.contents().iter().copied())
+            {
+                *hash ^= u64::from(byte);
+                *hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        let mut dirs = dir.dirs().collect::<Vec<_>>();
+        dirs.sort_by_key(|child| child.path());
+        for child in dirs {
+            hash_dir(child, hash);
+        }
+    }
+    let mut hash = 0xcbf29ce484222325;
+    hash_dir(&PLAYER_FILES, &mut hash);
+    format!("{hash:016x}")
+}
+
+pub fn player_runtime_status() -> serde_json::Value {
+    let home = mpv_home();
+    let expected = bundle_fingerprint();
+    let installed = std::fs::read_to_string(home.join(".player-fingerprint"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let overlay = home.join("scripts/tvos_player.lua");
+    serde_json::json!({
+        "config_dir": home, "expected_fingerprint": expected,
+        "installed_fingerprint": installed, "current": installed == expected,
+        "overlay_path": overlay, "overlay_exists": overlay.exists(),
+    })
 }
 
 /// Writes the per-playback mpv.conf: base 10-foot settings, the TV overlay,
@@ -554,6 +639,41 @@ stream-buffer-size=4MiB
                 conf.push_str(&line);
             }
         }
+        if let Some(pref) = meta.playback_preference.as_ref() {
+            if let Some(speed) = pref.speed {
+                conf.push_str(&format!("speed={speed}\n"));
+            }
+            if let Some(language) = pref.audio_language.as_deref() {
+                if let Some(line) = conf_line("alang", Some(language)) {
+                    conf.push_str(&line);
+                }
+            }
+            if pref.subtitle_mode.as_deref() == Some("off") {
+                conf.push_str("sid=no\n");
+            } else if let Some(language) = pref.subtitle_language.as_deref() {
+                if let Some(line) = conf_line("slang", Some(language)) {
+                    conf.push_str(&line);
+                }
+            }
+        }
+        if meta.domain.as_deref() == Some("youtube") {
+            let cap = meta.quality.as_deref().and_then(|value| {
+                match value.to_ascii_lowercase().as_str() {
+                    "4k" => Some(2160),
+                    "1440p" => Some(1440),
+                    "1080p" => Some(1080),
+                    "720p" => Some(720),
+                    "480p" => Some(480),
+                    "360p" => Some(360),
+                    _ => None,
+                }
+            });
+            if let Some(height) = cap {
+                conf.push_str(&format!(
+                    "ytdl-format=bestvideo[height<={height}]+bestaudio/best[height<={height}]\n"
+                ));
+            }
+        }
     }
     // A real log file (mpv writes nothing to a suppressed terminal) so the
     // actual reason a stream fails is always visible.
@@ -598,6 +718,17 @@ fn write_player_meta(home: &Path, meta: Option<&PlayerMeta>) {
         "source_height": meta.source_height,
         "expected_fps": meta.expected_fps,
         "next_episode_id": meta.next_episode_id,
+        "preference_scope": meta.preference_scope,
+        "preference_provider": meta.preference_provider,
+        "playback_preference": meta.playback_preference,
+        "sponsorblock_segments": meta.sponsorblock_segments,
+        "content_id": meta.content_id,
+        "track_id": meta.track_id,
+        "art": meta.art,
+        "domain": meta.domain,
+        "autoplay": meta.autoplay,
+        "autoplay_delay_seconds": meta.autoplay_delay_seconds,
+        "quality": meta.quality,
         "enhancement": crate::upscale::capability_status(),
     });
     let _ = std::fs::write(path, json.to_string());
@@ -682,7 +813,10 @@ fn conf_safe_value(value: &str) -> String {
 fn write_upscalers(home: &Path, mode: EnhanceMode, hint: &str, meta: Option<&PlayerMeta>) {
     let presets = crate::upscale::presets();
     let class = meta.map(|m| m.visual_class).unwrap_or_default();
-    let mut active = crate::upscale::active_preset_for(mode, hint, class);
+    let mut active = meta
+        .and_then(|m| m.playback_preference.as_ref())
+        .and_then(|pref| pref.enhance_preset.clone())
+        .unwrap_or_else(|| crate::upscale::active_preset_for(mode, hint, class));
     if !presets.iter().any(|p| p.name == active) {
         active = "Off".to_string();
     }
@@ -980,6 +1114,34 @@ mod tests {
         assert!(dir.join("input.conf").exists());
         // The legacy ModernZ OSC is gone — tvos_player.lua is the sole UI.
         assert!(!dir.join("scripts/modernz.lua").exists());
+
+        // Managed assets are content-addressed rather than application-version
+        // gated. A stale overlay is refreshed while user-owned configuration
+        // survives the same deployment.
+        std::fs::write(dir.join("user.conf"), "volume=37\n").unwrap();
+        std::fs::write(dir.join("scripts/tvos_player.lua"), "-- stale\n").unwrap();
+        std::fs::write(dir.join(".player-fingerprint"), "stale").unwrap();
+        prepare_mpv_home(
+            &profile,
+            EnhanceMode::Off,
+            "Movie.1080p.mkv",
+            None,
+            Some(&PlayerMeta::new("Movie")),
+            false,
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("user.conf")).unwrap(),
+            "volume=37\n"
+        );
+        assert!(std::fs::read_to_string(dir.join("scripts/tvos_player.lua"))
+            .unwrap()
+            .contains("TV OS player overlay"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".player-fingerprint"))
+                .unwrap()
+                .trim(),
+            bundle_fingerprint()
+        );
 
         // The upscaler menu has its preset list, with a valid active preset.
         let upscalers = std::fs::read_to_string(dir.join("upscalers.json")).unwrap();

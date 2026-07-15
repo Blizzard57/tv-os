@@ -172,24 +172,6 @@ impl EventLog {
         }
     }
 
-    /// The single "Continue watching" home row — most recent distinct items,
-    /// newest first (see [`continue_rows`]). Actual *recommendations* of new
-    /// titles come from the TMDB recommender (see sources::tmdb::for_you and
-    /// because_you_watched), seeded by [`recent_items`].
-    pub fn rows(&self) -> Vec<Row> {
-        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        let disliked = self.disliked_ids();
-        if disliked.is_empty() {
-            return continue_rows(&events);
-        }
-        let filtered: Vec<Event> = events
-            .iter()
-            .filter(|e| !disliked.contains(&e.item.id))
-            .cloned()
-            .collect();
-        continue_rows(&filtered)
-    }
-
     /// The newest distinct items (newest first), used to seed recommendations.
     pub fn recent_items(&self, n: usize) -> Vec<ContentItem> {
         let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
@@ -500,6 +482,7 @@ fn trim_prefs(prefs: &mut Vec<Preference>) {
 /// distinct items — movies, shows, games and YouTube clips together — newest
 /// first. Returned as a `Vec` (empty when there's nothing) so the caller can
 /// `extend` it into the home rows unchanged.
+#[cfg(test)]
 fn continue_rows(events: &[Event]) -> Vec<Row> {
     let mut seen = Vec::new();
     let mut items: Vec<ContentItem> = Vec::new();

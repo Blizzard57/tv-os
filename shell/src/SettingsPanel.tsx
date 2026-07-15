@@ -13,6 +13,7 @@ import {
   fetchSources,
   fetchLiveStatus,
   fetchEnhanceStatus,
+  fetchPlayerRuntime,
   fetchSteamStatus,
   fetchTrackingStatus,
   fetchTwitchStatus,
@@ -46,6 +47,10 @@ const ENHANCE_OPTIONS: EnhanceMode[] = ['auto', 'quality', 'performance', 'off']
 
 const BLANK: Settings = {
   enhance: 'auto',
+  autoplay: true,
+  autoplay_delay_seconds: 10,
+  sponsorblock_enabled: true,
+  sponsorblock_categories: 'sponsor',
   steam_api_key: '',
   steam_id: '',
   tmdb_key: '',
@@ -671,6 +676,19 @@ function PlaybackSection({ form, update, submit }: Pick<SectionProps, 'form' | '
     }).catch(() => setCapability('Enhancement diagnostics unavailable'));
   }, []);
   const save = (enhance: EnhanceMode) => { update({ enhance }); submit({ enhance }).catch(() => {}); };
+  const savePatch = (patch: Partial<Settings>) => {
+    update(patch);
+    submit(patch).catch(() => {});
+  };
+  const sponsorCategories = new Set(form.sponsorblock_categories.split(',').map((value) => value.trim()).filter(Boolean));
+  const toggleCategory = (category: string) => {
+    const next = new Set(sponsorCategories);
+    if (next.has(category)) next.delete(category); else next.add(category);
+    // Paid sponsors remain the safe default whenever the optional selection
+    // would otherwise be empty.
+    const sponsorblock_categories = [...(next.size ? next : new Set(['sponsor']))].join(',');
+    savePatch({ sponsorblock_categories });
+  };
   return (
     <section className="settings-section">
       <h2>Player</h2>
@@ -678,6 +696,17 @@ function PlaybackSection({ form, update, submit }: Pick<SectionProps, 'form' | '
       <Field label="Enhance"><div className="settings-chips">{ENHANCE_OPTIONS.map((mode) => (
         <button key={mode} className={`settings-chip${form.enhance === mode ? ' active' : ''}`} onClick={() => save(mode)}>{mode[0].toUpperCase() + mode.slice(1)}</button>
       ))}</div></Field>
+      <Field label="Autoplay"><button className={`settings-chip${form.autoplay ? ' active' : ''}`} onClick={() => savePatch({ autoplay: !form.autoplay })}>{form.autoplay ? 'On' : 'Off'}</button></Field>
+      <Field label="Up next delay"><div className="settings-chips">{[5, 10, 15].map((seconds) => (
+        <button key={seconds} className={`settings-chip${form.autoplay_delay_seconds === seconds ? ' active' : ''}`} onClick={() => savePatch({ autoplay_delay_seconds: seconds })}>{seconds}s</button>
+      ))}</div></Field>
+      <Field label="SponsorBlock"><button className={`settings-chip${form.sponsorblock_enabled ? ' active' : ''}`} onClick={() => savePatch({ sponsorblock_enabled: !form.sponsorblock_enabled })}>{form.sponsorblock_enabled ? 'On' : 'Off'}</button></Field>
+      {form.sponsorblock_enabled && <Field label="Skip categories"><div className="settings-chips">{[
+        ['sponsor', 'Paid sponsors'], ['selfpromo', 'Self-promotion'], ['interaction', 'Interaction'],
+        ['intro', 'Intro'], ['outro', 'Outro'], ['preview', 'Preview'], ['filler', 'Filler'],
+      ].map(([id, label]) => (
+        <button key={id} className={`settings-chip${sponsorCategories.has(id) ? ' active' : ''}`} onClick={() => toggleCategory(id)}>{label}</button>
+      ))}</div></Field>}
       <p className="settings-muted">Auto chooses the content-aware shader chain. Subtitle, audio, speed, quality and Enhance controls remain available in the player sheet.</p>
       <div className="settings-status-row"><span>Active capability</span><strong>{capability}</strong></div>
     </section>
@@ -1708,6 +1737,10 @@ function AppearanceSection({
   theme: Theme;
   onToggleTheme: () => void;
 }) {
+  const [runtime, setRuntime] = useState<Awaited<ReturnType<typeof fetchPlayerRuntime>> | null>(null);
+  useEffect(() => {
+    fetchPlayerRuntime().then(setRuntime).catch(() => setRuntime(null));
+  }, []);
   const setEnhance = async (enhance: EnhanceMode) => {
     update({ enhance });
     await submit({ enhance }).catch(() => {});
@@ -1761,6 +1794,15 @@ function AppearanceSection({
           ))}
         </select>
       </Field>
+      <div className="settings-status-row">
+        <span>mpv interface</span>
+        <strong>{runtime ? (runtime.current && runtime.overlay_exists ? 'Current' : 'Refresh required') : 'Unavailable'}</strong>
+      </div>
+      {runtime && <>
+        <div className="settings-status-row"><span>Runtime fingerprint</span><strong>{runtime.installed_fingerprint || 'Not deployed'}</strong></div>
+        <div className="settings-status-row"><span>Config directory</span><strong>{runtime.config_dir}</strong></div>
+        <div className="settings-status-row"><span>Loaded overlay</span><strong>{runtime.overlay_path}</strong></div>
+      </>}
     </section>
   );
 }

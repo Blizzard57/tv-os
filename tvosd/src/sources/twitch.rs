@@ -31,6 +31,11 @@ impl Source for Twitch {
         let value = parts
             .next()
             .ok_or_else(|| format!("bad Twitch id '{item_id}'"))?;
+        if kind == "category" {
+            return launcher::open_external(&format!(
+                "https://www.twitch.tv/directory/category/{value}"
+            ));
+        }
         let url = if kind == "vod" {
             format!("https://www.twitch.tv/videos/{value}")
         } else {
@@ -64,23 +69,62 @@ pub fn creator_rows() -> Vec<Row> {
     let followed = helix(&format!("streams/followed?user_id={user_id}&first=100"))
         .map(|v| stream_items(&v))
         .unwrap_or_default();
-    let popular = helix("streams?first=24")
-        .map(|v| stream_items(&v))
+    let categories = helix("games/top?first=24")
+        .map(|v| category_items(&v))
         .unwrap_or_default();
     let mut rows = Vec::new();
     if !followed.is_empty() {
         rows.push(Row {
-            title: "Twitch · Followed live".into(),
+            title: "Live on Twitch".into(),
             items: followed,
         });
     }
-    if !popular.is_empty() {
+    if !categories.is_empty() {
         rows.push(Row {
-            title: "Twitch · Live creators".into(),
-            items: popular,
+            title: "Twitch categories".into(),
+            items: categories,
         });
     }
     rows
+}
+
+fn category_items(value: &Value) -> Vec<ContentItem> {
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|category| {
+            let name = category.get("name")?.as_str()?;
+            let slug = name
+                .to_ascii_lowercase()
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+                .split('-')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("-");
+            let art = category
+                .get("box_art_url")
+                .and_then(Value::as_str)
+                .map(|url| url.replace("{width}", "440").replace("{height}", "248"));
+            Some(ContentItem {
+                id: format!("twitch:category:{slug}"),
+                kind: Kind::Video,
+                title: name.to_string(),
+                art,
+                action: Action::Play,
+                note: Some("Twitch category".into()),
+            })
+        })
+        .collect()
 }
 
 pub fn search(query: &str) -> Vec<ContentItem> {
