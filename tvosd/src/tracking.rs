@@ -156,7 +156,7 @@ fn sweep_played_marker(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
 }
 
-fn local_item(content_id: &str) -> Option<ContentItem> {
+pub fn local_item(content_id: &str) -> Option<ContentItem> {
     std::fs::read_to_string(local_item_file(content_id))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())

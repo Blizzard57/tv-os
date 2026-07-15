@@ -246,7 +246,7 @@ impl Retro {
                             art,
                             action: Action::Play,
                             note: None,
-                                                })
+                        })
                     })
                     .collect()
             })
@@ -266,7 +266,7 @@ impl Retro {
                 art: c.art.clone(),
                 action: Action::Install,
                 note: None,
-                        })
+            })
             .collect()
     }
 }

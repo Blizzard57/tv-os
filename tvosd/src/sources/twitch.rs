@@ -39,7 +39,9 @@ impl Source for Twitch {
         let mode = settings::STORE.get().enhance;
         let profile = upscale::resolve(mode, "twitch");
         let meta = if kind == "live" {
-            launcher::PlayerMeta::new(value).live()
+            let mut meta = launcher::PlayerMeta::new(value).live();
+            meta.visual_class = crate::upscale::VisualClass::LiveAction;
+            meta
         } else {
             launcher::PlayerMeta::new(value)
         };

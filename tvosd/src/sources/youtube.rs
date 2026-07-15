@@ -383,7 +383,7 @@ fn parse_entries(json: &Value) -> Vec<ContentItem> {
                         art: Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")),
                         action: Action::Play,
                         note: None,
-                                        })
+                    })
                 })
                 .collect()
         })

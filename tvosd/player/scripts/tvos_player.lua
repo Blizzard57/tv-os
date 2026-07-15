@@ -69,12 +69,7 @@ local BUTTONS = {
   { id = 'rewind',  kind = 'seek', delta = -10 },
   { id = 'play',    kind = 'pause' },
   { id = 'forward', kind = 'seek', delta = 10 },
-  { id = 'skip_intro', kind = 'command', command = 'no-osd add chapter 1' },
-  { id = 'next', kind = 'command', command = 'playlist-next force' },
-  { id = 'subs',    kind = 'menu', menu = 'subs' },
-  { id = 'audio',   kind = 'menu', menu = 'audio' },
-  { id = 'speed',   kind = 'menu', menu = 'speed' },
-  { id = 'enhance', kind = 'menu', menu = 'enhance' },
+  { id = 'settings', kind = 'menu', menu = 'settings' },
 }
 local FIRST_SECONDARY = 4
 
@@ -139,6 +134,9 @@ local function read_meta()
 end
 
 local player_meta = read_meta()
+if player_meta.next_episode_id and player_meta.next_episode_id ~= '' then
+  table.insert(BUTTONS, 4, { id = 'next', kind = 'next' })
+end
 -- A live stream (a sports channel, a YouTube live broadcast): no duration to
 -- scrub, so the overlay shows a "● LIVE" marker instead of a seek bar.
 local is_live = player_meta.live == true
@@ -238,9 +236,18 @@ local function apply_upscaler(preset)
   mp.osd_message('Enhance: ' .. preset.name, 1.5)
 end
 
+local open_menu
 local function rows_for_menu(kind)
   local rows = {}
-  if kind == 'subs' then
+  if kind == 'settings' then
+    rows = {
+      { label = 'Captions', sub = active_track('sub') and 'On' or 'Off', apply = function() open_menu('subs') end },
+      { label = 'Audio', sub = track_label(tracks('audio')[1] or {}, 1), apply = function() open_menu('audio') end },
+      { label = 'Playback speed', sub = tostring(mp.get_property_number('speed') or 1) .. '×', apply = function() open_menu('speed') end },
+      { label = 'Stream quality', sub = player_meta.quality or 'Auto', apply = function() mp.osd_message('Quality follows the selected source', 2) end },
+      { label = 'Enhance', sub = ((load_upscalers().capability or {}).backend or load_upscalers().active or 'Off'), apply = function() open_menu('enhance') end },
+    }
+  elseif kind == 'subs' then
     rows[#rows + 1] = { label = 'Off', selected = not active_track('sub'), apply = function() apply_track('sub', nil) end }
     for i, t in ipairs(tracks('sub')) do
       rows[#rows + 1] = {
@@ -334,13 +341,14 @@ local function show()
   schedule_hide()
 end
 
-local function open_menu(kind)
+open_menu = function(kind)
   local rows = rows_for_menu(kind)
   if #rows == 0 then
     mp.osd_message(kind == 'audio' and 'No audio tracks' or kind == 'subs' and 'No subtitles' or 'Nothing to choose', 2)
     return
   end
-  state.menu = { kind = kind, rows = rows }
+  local parent = state.menu and state.menu.kind == 'settings' and state.menu or nil
+  state.menu = { kind = kind, rows = rows, parent = parent }
   state.menu_sel = 1
   for i, row in ipairs(rows) do
     if row.selected then state.menu_sel = i end
@@ -350,7 +358,7 @@ local function open_menu(kind)
 end
 
 local function close_menu()
-  state.menu = nil
+  state.menu = state.menu and state.menu.parent or nil
   schedule_hide()
 end
 
@@ -381,6 +389,16 @@ local function activate()
     mp.commandv('cycle', 'pause')
   elseif b.kind == 'menu' then
     open_menu(b.menu)
+  elseif b.kind == 'next' then
+    mp.commandv('script-message', 'tvos-progress-next')
+    local content = os.getenv('TVOS_CONTENT_ID') or ''
+    local function json(s) return tostring(s or ''):gsub('\\', '\\\\'):gsub('"', '\\"') end
+    local body = string.format('{"content_id":"%s","track_id":"%s","title":"%s"}',
+      json(content), json(player_meta.next_episode_id), json(title()))
+    mp.command_native_async({ name = 'subprocess', playback_only = false,
+      args = { 'curl', '--silent', '--max-time', '8', '-X', 'POST', '-H', 'Content-Type: application/json',
+        '--data', body, 'http://127.0.0.1:8484/api/player/next' } }, function() end)
+    mp.osd_message('Starting next episode…', 2)
   elseif b.kind == 'command' then
     mp.command(b.command)
     mp.osd_message(b.id == 'skip_intro' and 'Skipped chapter' or 'Next episode', 1.2)
@@ -527,6 +545,7 @@ local ICONS = {
   subs = icon_cc,
   audio = icon_audio,
   enhance = icon_enhance,
+  settings = icon_enhance,
 }
 
 -- ---------------------------------------------------------------------------
@@ -644,9 +663,8 @@ local function render_controls(a, L)
     local focused = state.row == 2 and state.col == i
     if focused then disc(a, COLORS.white, 0, b.x, b.y, b.ring) end
     local glyph_col = focused and COLORS.black or COLORS.text
-    if b.id == 'skip_intro' or b.id == 'next' then
-      text(a, b.x, b.y, 5, math.floor(b.glyph * 0.9), glyph_col, 0, true,
-        b.id == 'skip_intro' and 'SKIP' or 'NEXT')
+    if b.id == 'next' then
+      text(a, b.x, b.y, 5, math.floor(b.glyph * 0.78), glyph_col, 0, true, 'NEXT')
     elseif b.id == 'speed' then
       -- Show the live speed (like YouTube) rather than a gauge glyph — clearer
       -- at a glance and doubles as the current value.
@@ -667,7 +685,7 @@ local function render_menu(a, L)
   rrect(a, '000000', 0x48, 0, 0, w, h, 0)
 
   local rows = state.menu.rows
-  local title_map = { subs = 'Subtitles', audio = 'Audio', enhance = 'Enhance', speed = 'Playback speed' }
+  local title_map = { settings = 'Settings', subs = 'Captions', audio = 'Audio', enhance = 'Enhance', speed = 'Playback speed' }
   local pw = math.floor(math.min(w * 0.42, 720 * L.scale))
   local px = w - pw - L.edge_x
   local py = L.edge_y + math.floor(20 * L.scale)
@@ -757,9 +775,10 @@ local function on_key(key)
     if key == 'UP' then state.menu_sel = math.max(1, state.menu_sel - 1)
     elseif key == 'DOWN' then state.menu_sel = math.min(#state.menu.rows, state.menu_sel + 1)
     elseif key == 'ENTER' or key == 'SPACE' then
+      local before = state.menu
       local row = state.menu.rows[state.menu_sel]
       if row and row.apply then row.apply() end
-      close_menu()
+      if state.menu == before then close_menu() end
     elseif key == 'ESC' or key == 'BS' then close_menu()
     end
     show()

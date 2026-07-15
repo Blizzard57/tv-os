@@ -326,6 +326,7 @@ async fn main() {
         .route("/api/youtube/status", get(get_youtube_status))
         .route("/api/twitch/status", get(get_twitch_status))
         .route("/api/live/status", get(get_live_status))
+        .route("/api/enhance/status", get(get_enhance_status))
         .route("/api/live/guide", get(get_live_guide))
         .route("/api/live/resolve", post(post_live_resolve))
         .route("/api/game", get(get_game))
@@ -335,7 +336,9 @@ async fn main() {
         .route("/api/mal/login", get(get_mal_login))
         .route("/api/mal/callback", get(get_mal_callback))
         .route("/api/resume", get(get_resume))
+        .route("/api/continue", get(get_continue))
         .route("/api/play", post(post_play))
+        .route("/api/player/next", post(post_player_next))
         .route("/api/playback", get(get_playback))
         .route("/api/open", post(post_open))
         .route("/api/version", get(get_version))
@@ -490,8 +493,10 @@ fn is_personal_row(title: &str) -> bool {
 /// Personalized rows (Continue / Recommended) come first.
 async fn get_library(State(app): State<Shared>) -> Json<Vec<model::Row>> {
     tracking::sync_local_play_markers();
-    // "Continue" comes from the in-memory event log (instant).
-    let mut rows = recommend::LOG.rows();
+    profile::STORE.import_progress_sidecars();
+    // Continue is canonical session-aware playback state. events.jsonl is
+    // recommendation history only and no longer decides resume ordering.
+    let mut rows = continue_row().into_iter().collect::<Vec<_>>();
     rows.extend(recommend::LOG.preference_rows());
     let local_recent = recommend::LOG.recommendation_seeds(8);
     let disliked = recommend::LOG.disliked_ids();
@@ -660,7 +665,9 @@ async fn get_home(State(app): State<Shared>, Query(q): Query<HomeQuery>) -> Json
             )
         }),
         _ => {
-            filter_rows(&mut rows, |i| matches!(i.kind, model::Kind::Movie | model::Kind::Series));
+            filter_rows(&mut rows, |i| {
+                matches!(i.kind, model::Kind::Movie | model::Kind::Series)
+            });
             rows.retain(|r| !matches!(r.purpose(), model::RowPurpose::Creators));
             curate_home_rows(&mut rows);
         }
@@ -718,7 +725,10 @@ async fn post_interactions_batch(
     Json(events): Json<Vec<profile::InteractionEvent>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if events.len() > 256 {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "at most 256 interactions per batch".into()));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "at most 256 interactions per batch".into(),
+        ));
     }
     for event in &events {
         profile::STORE
@@ -1362,6 +1372,10 @@ async fn get_live_status() -> Json<serde_json::Value> {
     )
 }
 
+async fn get_enhance_status() -> Json<serde_json::Value> {
+    Json(upscale::capability_status())
+}
+
 /// "More like this" for a details page item. Video items resolve through
 /// TMDB recommendations (addon items map IMDb → TMDB first); other kinds
 /// (games) have no similar-content source yet and return empty.
@@ -1404,11 +1418,48 @@ async fn get_resume(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
     match resume::STORE.stream(&q.id) {
         Some(stream) => serde_json::json!({
             "stream": stream,
-            "position": resume::position(&q.id).unwrap_or(0.0),
+            "position": profile::STORE.progress(&q.id).map(|p| p.position_seconds)
+                .or_else(|| resume::position(&q.id)).unwrap_or(0.0),
+            "progress": profile::STORE.progress(&q.id),
         })
         .into(),
         None => serde_json::Value::Null.into(),
     }
+}
+
+async fn get_continue() -> Json<serde_json::Value> {
+    profile::STORE.import_progress_sidecars();
+    continue_row()
+        .map(|row| serde_json::to_value(row).unwrap_or(serde_json::Value::Null))
+        .unwrap_or(serde_json::Value::Null)
+        .into()
+}
+
+fn continue_row() -> Option<model::Row> {
+    let items = profile::STORE
+        .continue_progress()
+        .into_iter()
+        .filter_map(|p| {
+            let mut item = tracking::local_item(&p.content_id)?;
+            let progress_note = match (p.season, p.episode, p.remaining_seconds) {
+                (Some(s), Some(e), Some(left)) => {
+                    format!("S{s} E{e} · {} min left", (left / 60.0).ceil() as i64)
+                }
+                (Some(s), Some(e), None) => format!(
+                    "S{s} E{e} · {} min watched",
+                    (p.position_seconds / 60.0).floor() as i64
+                ),
+                (_, _, Some(left)) => format!("{} min left", (left / 60.0).ceil() as i64),
+                _ => format!("{} min watched", (p.position_seconds / 60.0).floor() as i64),
+            };
+            item.note = Some(progress_note);
+            Some(item)
+        })
+        .collect::<Vec<_>>();
+    (!items.is_empty()).then_some(model::Row {
+        title: "Continue watching".into(),
+        items,
+    })
 }
 
 /// Sources for an item: streams for videos/episodes (ranked best-first), or
@@ -1439,6 +1490,7 @@ struct PlayRequest {
     /// distinct from `item.id` which is the show — so "Continue" surfaces the
     /// show while Trakt/AniList get the exact episode. Defaults to `item.id`.
     track_id: Option<String>,
+    next_track_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1449,6 +1501,8 @@ struct ItemMeta {
     art: Option<String>,
     #[serde(default)]
     action: Option<model::Action>,
+    #[serde(default)]
+    genres: Vec<String>,
 }
 
 /// Plays a stream the user picked on the details page.
@@ -1466,6 +1520,7 @@ async fn post_play(
     let item_id = req.item.as_ref().map(|i| i.id.clone());
     let display_title = req.item.as_ref().map(|i| i.title.clone());
     let track_id = req.track_id.clone();
+    let next_track_id = req.next_track_id.clone();
     let label = display_title
         .clone()
         .or_else(|| req.item.as_ref().map(|i| i.title.clone()))
@@ -1478,6 +1533,11 @@ async fn post_play(
             item_id.as_deref(),
             track_id.as_deref(),
             display_title.as_deref(),
+            next_track_id.as_deref(),
+            req.item
+                .as_ref()
+                .map(|item| item.genres.as_slice())
+                .unwrap_or(&[]),
         );
         let result = if result.is_ok() || stream.kind == media::StreamKind::External {
             result
@@ -1537,6 +1597,30 @@ async fn post_play(
         worker_app.playback.finish(job, result);
     });
     Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+#[derive(Deserialize)]
+struct NextEpisodeRequest {
+    content_id: String,
+    track_id: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+async fn post_player_next(
+    Json(req): Json<NextEpisodeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let (kind, id) =
+        sources::resolve_video(&req.track_id).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    sources::stremio::play_meta_track(
+        &kind,
+        &id,
+        Some(&req.content_id),
+        Some(&req.track_id),
+        req.title.as_deref(),
+    )
+    .map(|_| StatusCode::ACCEPTED)
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
 #[derive(Deserialize)]
@@ -1635,18 +1719,33 @@ mod tests {
             note: None,
         };
         let mut rows = vec![
-            model::Row { title: "Trending now".into(), items: vec![item("shared"), item("trend")] },
-            model::Row { title: "Top picks for you".into(), items: vec![item("shared"), item("pick")] },
-            model::Row { title: "Continue watching".into(), items: vec![item("continue")] },
+            model::Row {
+                title: "Trending now".into(),
+                items: vec![item("shared"), item("trend")],
+            },
+            model::Row {
+                title: "Top picks for you".into(),
+                items: vec![item("shared"), item("pick")],
+            },
+            model::Row {
+                title: "Continue watching".into(),
+                items: vec![item("continue")],
+            },
         ];
         for index in 0..8 {
-            rows.push(model::Row { title: format!("Discovery {index}"), items: vec![item(&format!("d{index}"))] });
+            rows.push(model::Row {
+                title: format!("Discovery {index}"),
+                items: vec![item(&format!("d{index}"))],
+            });
         }
         curate_home_rows(&mut rows);
         assert_eq!(rows[0].title, "Continue watching");
         assert_eq!(rows[1].title, "Top picks for you");
         assert!(rows.len() <= 8);
-        let ids: Vec<_> = rows.iter().flat_map(|row| row.items.iter().map(|item| item.id.as_str())).collect();
+        let ids: Vec<_> = rows
+            .iter()
+            .flat_map(|row| row.items.iter().map(|item| item.id.as_str()))
+            .collect();
         let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len());
     }

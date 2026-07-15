@@ -548,7 +548,7 @@ mod tests {
                 art: None,
                 action: Action::Play,
                 note: None,
-                        },
+            },
         }
     }
 

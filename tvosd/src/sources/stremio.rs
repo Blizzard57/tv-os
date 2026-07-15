@@ -275,18 +275,26 @@ pub fn play_stream(
     item_id: Option<&str>,
     track_id: Option<&str>,
     display_title: Option<&str>,
+    next_track_id: Option<&str>,
+    genres: &[String],
 ) -> Result<(), String> {
     let mode = settings::STORE.get().enhance;
     let hint = describe(stream);
     let meta = display_title.map(|title| {
         let mut meta = launcher::PlayerMeta::new(title);
         meta.source = Some(stream.name.replace('\n', " "));
+        meta.next_episode_id = next_track_id.map(str::to_owned);
+        meta.visual_class = upscale::classify(title, genres, false);
         meta
     });
     let track_id = track_id.or(item_id);
     let result = match stream.kind {
         StreamKind::Direct | StreamKind::Youtube => {
-            let profile = upscale::resolve(mode, &hint);
+            let profile = upscale::resolve_for(
+                mode,
+                &hint,
+                meta.as_ref().map(|m| m.visual_class).unwrap_or_default(),
+            );
             launcher::play_video(
                 &stream.url,
                 &profile,
@@ -299,7 +307,11 @@ pub fn play_stream(
         }
         StreamKind::External => launcher::open_external(&stream.url),
         StreamKind::Torrent => {
-            let profile = upscale::resolve(mode, &hint);
+            let profile = upscale::resolve_for(
+                mode,
+                &hint,
+                meta.as_ref().map(|m| m.visual_class).unwrap_or_default(),
+            );
             launcher::play_torrent(
                 &stream.url,
                 stream.file_idx,
@@ -343,6 +355,16 @@ pub fn play_meta(
     item_id: Option<&str>,
     display_title: Option<&str>,
 ) -> Result<(), String> {
+    play_meta_track(kind, id, item_id, None, display_title)
+}
+
+pub fn play_meta_track(
+    kind: &str,
+    id: &str,
+    item_id: Option<&str>,
+    track_id: Option<&str>,
+    display_title: Option<&str>,
+) -> Result<(), String> {
     let mut found = streams(kind, id);
     if found.is_empty() && kind == "series" && !id.contains(':') {
         found = streams(kind, &format!("{id}:1:1"));
@@ -378,7 +400,7 @@ pub fn play_meta(
             stream.kind,
             stream.name.replace('\n', " ")
         );
-        match play_stream(stream, item_id, None, display_title) {
+        match play_stream(stream, item_id, track_id, display_title, None, &[]) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 crate::log_warn!("source failed, trying next: {e}");
@@ -775,14 +797,36 @@ fn parse_meta(json: &str) -> Option<Meta> {
         .unwrap_or_default();
     episodes.sort_by_key(|e| (e.season, e.episode));
 
-    let cast = m.get("cast").and_then(|v| v.as_array()).map(|values| {
-        values.iter().filter_map(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str)))
-            .take(12).map(str::to_owned).collect()
-    }).unwrap_or_default();
-    let trailers = m.get("trailers").and_then(|v| v.as_array()).into_iter().flatten()
-        .filter_map(|v| v.as_str().or_else(|| v.get("source").and_then(Value::as_str)))
-        .map(|value| if value.starts_with("http") { value.to_string() } else { format!("https://www.youtube.com/watch?v={value}") })
-        .take(4).collect();
+    let cast = m
+        .get("cast")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str)))
+                .take(12)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let trailers = m
+        .get("trailers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            v.as_str()
+                .or_else(|| v.get("source").and_then(Value::as_str))
+        })
+        .map(|value| {
+            if value.starts_with("http") {
+                value.to_string()
+            } else {
+                format!("https://www.youtube.com/watch?v={value}")
+            }
+        })
+        .take(4)
+        .collect();
 
     let id = str_of("id").unwrap_or_default();
     // The stylized title logo is what the details/hero panels want, but Cinemeta

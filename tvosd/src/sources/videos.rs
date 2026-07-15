@@ -92,7 +92,7 @@ fn local_videos() -> Vec<ContentItem> {
                 art: None,
                 action: Action::Play,
                 note: None,
-                        })
+            })
         })
         .collect();
     items.sort_by_key(|item| item.title.to_lowercase());

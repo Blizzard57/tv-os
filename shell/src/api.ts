@@ -66,10 +66,27 @@ export interface ContentItem {
   external_ids?: Record<string, string>;
   images?: { landscape?: string; portrait?: string; background?: string; logo?: string };
   progress?: number;
+  playback?: PlaybackProgress;
   badge?: string;
   release_time?: number;
   creator_type?: 'video' | 'vod' | 'live_stream' | 'channel' | 'category';
   creator_name?: string;
+}
+
+export interface PlaybackProgress {
+  content_id: string;
+  track_id: string;
+  session_id: string;
+  sequence: number;
+  position_seconds: number;
+  duration_seconds: number;
+  remaining_seconds?: number;
+  percentage?: number;
+  updated_at: number;
+  completed: boolean;
+  paused: boolean;
+  season?: number;
+  episode?: number;
 }
 
 export interface Row {
@@ -221,6 +238,11 @@ export interface InteractionEvent {
   duration?: number;
   context?: string;
   ts?: number;
+  content_id?: string;
+  track_id?: string;
+  session_id?: string;
+  sequence?: number;
+  reason?: string;
 }
 
 export async function recordInteraction(event: InteractionEvent): Promise<void> {
@@ -341,6 +363,22 @@ export interface LiveStatus {
   detail: string;
   programmes?: number;
   matches?: number;
+}
+
+export interface EnhanceStatus {
+  gpu: string;
+  backend: string;
+  nvidia_vfx: boolean;
+  vapoursynth: boolean;
+  tensorrt: boolean;
+  shader_presets: number;
+  fallback_reason?: string;
+}
+
+export async function fetchEnhanceStatus(): Promise<EnhanceStatus> {
+  const res = await apiFetch('/api/enhance/status', undefined, SHORT_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(`enhancement status failed: ${res.status}`, 'http', res.status);
+  return res.json();
 }
 
 /** Live-tab state: region, EPG guide load + resolved matches (for the panel). */
@@ -602,6 +640,7 @@ export async function setPreference(
 export interface ResumeInfo {
   stream: Stream;
   position: number; // seconds
+  progress?: PlaybackProgress;
 }
 
 /** The source + position to continue an item from, or null if none saved. */
@@ -615,11 +654,12 @@ export async function fetchResume(id: string): Promise<ResumeInfo | null> {
 // recommender (with the title/art shown on the details page). `trackId` is the
 // precise watched id — for an episode it carries season:episode so Trakt/
 // AniList scrobble the exact episode, while `item` (the show) drives Continue.
-export const playStream = (stream: Stream, item: ContentItem, trackId?: string): Promise<PlaybackStatus> =>
+export const playStream = (stream: Stream, item: ContentItem, trackId?: string, nextTrackId?: string, genres?: string[]): Promise<PlaybackStatus> =>
   postJson('/api/play', {
     stream,
-    item: { id: item.id, title: item.title, kind: item.kind, art: item.art },
+    item: { id: item.id, title: item.title, kind: item.kind, art: item.art, genres },
     track_id: trackId ?? item.id,
+    next_track_id: nextTrackId,
   }, SHORT_TIMEOUT_MS);
 
 export async function fetchPlayback(id: string): Promise<PlaybackStatus> {

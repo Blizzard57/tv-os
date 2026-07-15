@@ -120,6 +120,11 @@ function Card({
             <div className="card-progress-fill" style={{ width: `${Math.max(4, job.progress)}%` }} />
           </div>
         )}
+        {!job && layoutProgress(item) !== undefined && (
+          <div className="watch-progress" aria-label={`${Math.round(layoutProgress(item)!)}% watched`}>
+            <div className="watch-progress-fill" style={{ width: `${layoutProgress(item)}%` }} />
+          </div>
+        )}
       </div>
       <div className="card-label">
         <div className="card-title">{item.title}</div>
@@ -127,4 +132,9 @@ function Card({
       </div>
     </div>
   );
+}
+
+function layoutProgress(item: ContentItem): number | undefined {
+  const value = item.playback?.percentage ?? item.progress;
+  return typeof value === 'number' ? Math.max(0, Math.min(100, value)) : undefined;
 }

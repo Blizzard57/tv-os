@@ -640,14 +640,34 @@ pub fn editorial_for_you(recent: &[ContentItem]) -> Vec<Row> {
         return Vec::new();
     };
     let (new_movies, new_shows, trending_movies, trending_shows) = std::thread::scope(|scope| {
-        let new_movies = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/movie/now_playing?api_key={key}"))
-            .map(|json| parse_trending(&json, "movie")).unwrap_or_default());
-        let new_shows = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/tv/on_the_air?api_key={key}"))
-            .map(|json| parse_trending(&json, "tv")).unwrap_or_default());
-        let trending_movies = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/trending/movie/week?api_key={key}"))
-            .map(|json| parse_trending(&json, "movie")).unwrap_or_default());
-        let trending_shows = scope.spawn(|| fetch(&format!("https://api.themoviedb.org/3/trending/tv/week?api_key={key}"))
-            .map(|json| parse_trending(&json, "tv")).unwrap_or_default());
+        let new_movies = scope.spawn(|| {
+            fetch(&format!(
+                "https://api.themoviedb.org/3/movie/now_playing?api_key={key}"
+            ))
+            .map(|json| parse_trending(&json, "movie"))
+            .unwrap_or_default()
+        });
+        let new_shows = scope.spawn(|| {
+            fetch(&format!(
+                "https://api.themoviedb.org/3/tv/on_the_air?api_key={key}"
+            ))
+            .map(|json| parse_trending(&json, "tv"))
+            .unwrap_or_default()
+        });
+        let trending_movies = scope.spawn(|| {
+            fetch(&format!(
+                "https://api.themoviedb.org/3/trending/movie/week?api_key={key}"
+            ))
+            .map(|json| parse_trending(&json, "movie"))
+            .unwrap_or_default()
+        });
+        let trending_shows = scope.spawn(|| {
+            fetch(&format!(
+                "https://api.themoviedb.org/3/trending/tv/week?api_key={key}"
+            ))
+            .map(|json| parse_trending(&json, "tv"))
+            .unwrap_or_default()
+        });
         (
             new_movies.join().unwrap_or_default(),
             new_shows.join().unwrap_or_default(),
@@ -658,19 +678,29 @@ pub fn editorial_for_you(recent: &[ContentItem]) -> Vec<Row> {
     let interleave = |movies: Vec<ContentItem>, shows: Vec<ContentItem>| {
         let mut out = Vec::new();
         for index in 0..movies.len().max(shows.len()) {
-            if let Some(item) = movies.get(index) { out.push(item.clone()); }
-            if let Some(item) = shows.get(index) { out.push(item.clone()); }
+            if let Some(item) = movies.get(index) {
+                out.push(item.clone());
+            }
+            if let Some(item) = shows.get(index) {
+                out.push(item.clone());
+            }
         }
         out
     };
     let mut rows = Vec::new();
     let fresh = interleave(new_movies, new_shows);
     if fresh.len() >= 4 {
-        rows.push(Row { title: "New & noteworthy".into(), items: fresh });
+        rows.push(Row {
+            title: "New & noteworthy".into(),
+            items: fresh,
+        });
     }
     let trending = interleave(trending_movies, trending_shows);
     if trending.len() >= 4 {
-        rows.push(Row { title: "Trending now".into(), items: trending });
+        rows.push(Row {
+            title: "Trending now".into(),
+            items: trending,
+        });
     }
     personalize(&mut rows, recent);
     rows

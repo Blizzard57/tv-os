@@ -1011,9 +1011,15 @@ fn launch_match(event_id: &str) -> Result<(), String> {
         .ok_or("this match isn't on a channel we can play right now")?;
     match info.target {
         PlayTarget::Iptv(key) => {
-            let reachable = IPTV_STREAMS.lock().unwrap_or_else(|e| e.into_inner())
-                .get(&key).map(|s| stream_reachable(&s.url)).unwrap_or(false);
-            if !reachable { return Err("The mapped channel is currently offline; try again shortly.".into()); }
+            let reachable = IPTV_STREAMS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .map(|s| stream_reachable(&s.url))
+                .unwrap_or(false);
+            if !reachable {
+                return Err("The mapped channel is currently offline; try again shortly.".into());
+            }
             launch_iptv(&key)
         }
         PlayTarget::Yt(video) => launch_youtube(&video),
@@ -1462,10 +1468,17 @@ trait ScheduleProvider: Sync {
 struct TheSportsDb;
 
 impl ScheduleProvider for TheSportsDb {
-    fn events(&self, sport: &str) -> Vec<Value> { fetch_events(sport) }
+    fn events(&self, sport: &str) -> Vec<Value> {
+        fetch_events(sport)
+    }
 }
 
-fn schedule_items(provider: &dyn ScheduleProvider, tsdb_sport: &str, now: i64, matcher: &Matcher) -> Vec<ContentItem> {
+fn schedule_items(
+    provider: &dyn ScheduleProvider,
+    tsdb_sport: &str,
+    now: i64,
+    matcher: &Matcher,
+) -> Vec<ContentItem> {
     let mut items: Vec<(i64, bool, ContentItem)> = Vec::new();
     for ev in provider.events(tsdb_sport) {
         if let Some(item) = event_item(&ev, now, matcher) {

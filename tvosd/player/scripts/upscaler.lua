@@ -268,8 +268,23 @@ end)
 -- ---------- startup hint: which profile the resolver picked ----------
 
 mp.register_event('file-loaded', function()
+  -- Final selection uses the decoded stream rather than a filename guess. A
+  -- native 4K source never receives super-resolution. High-frame-rate sports
+  -- starts on the fast chain to protect the frame budget.
+  local params = mp.get_property_native('video-params') or {}
+  local h = tonumber(params.h or params.dh) or 0
+  local fps = mp.get_property_number('estimated-vf-fps') or mp.get_property_number('container-fps') or 0
+  if h >= 2160 then
+    for _, p in ipairs(config.presets) do if p.shaders == '' then apply(p); break end end
+    mp.osd_message('Enhance: native 4K — super-resolution bypassed', 3)
+  elseif config.visual_class == 'sports' and fps >= 45 then
+    for _, p in ipairs(config.presets) do
+      if p.name == 'Live Action — Fast' then apply(p); break end
+    end
+  end
   mp.add_timeout(1.2, function()
-    mp.osd_message(string.format('Enhance: %s   ·   Y/U menu · X original',
-      config.active or 'Off'), 4)
+    local backend = config.capability and config.capability.backend or 'builtin'
+    mp.osd_message(string.format('Enhance: %s · %s · %dx%d @ %.2g fps',
+      config.active or 'Off', backend, tonumber(params.w or params.dw) or 0, h, fps), 4)
   end)
 end)

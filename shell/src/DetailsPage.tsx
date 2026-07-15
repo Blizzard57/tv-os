@@ -235,6 +235,13 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   // so Trakt/AniList scrobble the exact episode (the show `item` still drives
   // "Continue"). Movies just watch under their own id.
   const trackId = episode ? `strm:series:${episode.id}` : item.id;
+  const nextTrackId = episode && meta?.episodes
+    ? (() => {
+        const ordered = [...meta.episodes].sort((a, b) => a.season - b.season || a.episode - b.episode);
+        const index = ordered.findIndex((candidate) => candidate.id === episode.id);
+        return index >= 0 && ordered[index + 1] ? `strm:series:${ordered[index + 1].id}` : undefined;
+      })()
+    : undefined;
 
   const playChosen = useCallback(
     (s: Stream) => {
@@ -249,7 +256,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
       recordInteraction({ item_id: trackId, kind: 'play', context: 'details' }).catch(() => {});
       if (s.kind === 'external') {
         flash(`Opening ${s.name.split('\n')[0]}…`);
-        playStream(s, playbackItem, trackId)
+        playStream(s, playbackItem, trackId, nextTrackId, meta?.genres)
           .then(waitForPlayback)
           .then(onPlayed)
           .catch((e) => flash(`Could not open: ${e.message}`));
@@ -258,7 +265,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
       // The daemon acknowledges quickly, then reports the real start/fail state
       // through /api/playback so slow torrents do not hit the shell timeout.
       setLoading({ label: s.name.split('\n')[0] || meta?.title || item.title, kind: 'stream' });
-      playStream(s, playbackItem, trackId)
+      playStream(s, playbackItem, trackId, nextTrackId, meta?.genres)
         .then(waitForPlayback)
         .then(() => {
           setLoading(null);
@@ -269,7 +276,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           flash(`Could not play: ${e.message}`);
         });
     },
-    [item, episode, onPlayed, flash, meta, trackId],
+    [item, episode, onPlayed, flash, meta, trackId, nextTrackId],
   );
 
   const runAction = useCallback(async () => {

@@ -10,7 +10,7 @@
 
 import { ContentItem, Kind, Row } from './api';
 
-export type TabId = 'foryou' | 'live' | 'movies' | 'shows' | 'creators' | 'games' | 'library';
+export type TabId = 'foryou' | 'live' | 'movies' | 'shows' | 'creators' | 'games';
 
 export interface TabDef {
   id: TabId;
@@ -24,13 +24,7 @@ export const TABS: TabDef[] = [
   { id: 'shows', label: 'Shows' },
   { id: 'creators', label: 'Creators' },
   { id: 'games', label: 'Games' },
-  { id: 'library', label: 'Library' },
 ];
-
-// Rows whose title marks them as "your stuff" — surfaced under Library
-// alongside your games, the way Google TV's Library gathers what you're part-way
-// through and what you own.
-const LIBRARY_ROW = /^(continue|ready to|watchlist|my )/i;
 
 // Which item kinds belong under each simple content tab. "Library" is
 // special-cased in rowsForTab.
@@ -47,7 +41,6 @@ const TAB_KINDS: Record<'live' | 'movies' | 'shows' | 'games', Kind[]> = {
  *  preserved. */
 export function rowsForTab(tab: TabId, rows: Row[]): Row[] {
   if (tab === 'foryou') return forYouRows(rows);
-  if (tab === 'library') return libraryRows(rows);
   if (tab === 'creators') {
     const seen = new Set<string>();
     return rows.map((row) => {
@@ -77,7 +70,8 @@ function forYouRows(rows: Row[]): Row[] {
     if (row.purpose === 'because_you_watched') return 2;
     if (/^new episodes/i.test(row.title)) return 3;
     if (/^new & noteworthy/i.test(row.title)) return 4;
-    return 5;
+    if (row.purpose === 'library' || /watchlist/i.test(row.title)) return 5;
+    return 6;
   };
   const seen = new Set<string>();
   return rows
@@ -91,21 +85,6 @@ function forYouRows(rows: Row[]): Row[] {
     }) }))
     .filter((row) => row.items.length > 0)
     .slice(0, 8);
-}
-
-/** Library = things you're watching or own: Continue/Ready/Watchlist rows kept
- *  whole (mixed kinds), then every row narrowed to your games. */
-function libraryRows(rows: Row[]): Row[] {
-  const out: Row[] = [];
-  for (const row of rows) {
-    if (LIBRARY_ROW.test(row.title)) {
-      out.push(row);
-      continue;
-    }
-    const games = row.items.filter((i) => i.kind === 'game');
-    if (games.length > 0) out.push({ title: row.title, items: games });
-  }
-  return out;
 }
 
 /** Does this tab have anything at all? Used to dim empty tabs (Google TV greys

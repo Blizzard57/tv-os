@@ -677,7 +677,7 @@ mod tests {
                 art: None,
                 action: Action::Play,
                 note: None,
-                        }],
+            }],
         }];
         let mut owned_titles = HashSet::new();
         let mut owned_apps = HashSet::new();

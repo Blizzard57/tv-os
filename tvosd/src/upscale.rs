@@ -20,6 +20,18 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use crate::settings::EnhanceMode;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualClass {
+    Anime,
+    Cartoon,
+    LiveAction,
+    Sports,
+    #[default]
+    Unknown,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Gpu {
@@ -96,11 +108,21 @@ pub fn presets() -> Vec<Preset> {
 /// The preset name the auto-resolver picks for `target` — what the player
 /// starts on and marks active in the menu.
 pub fn active_preset(mode: EnhanceMode, target: &str) -> String {
+    active_preset_for(mode, target, VisualClass::Unknown)
+}
+
+pub fn active_preset_for(mode: EnhanceMode, target: &str, class: VisualClass) -> String {
     let mode = effective(mode, gpu());
     if mode == EnhanceMode::Off || source_height(target).is_some_and(|h| h >= 2160) {
         return "Off".to_string();
     }
-    let anime = looks_like_anime(target);
+    let anime = matches!(class, VisualClass::Anime | VisualClass::Cartoon)
+        || (class == VisualClass::Unknown && looks_like_anime(target));
+    let mode = if class == VisualClass::Sports {
+        EnhanceMode::Performance
+    } else {
+        mode
+    };
     PRESET_DEFS
         .iter()
         .find(|(_, _, a, m)| *a == anime && *m == mode)
@@ -118,6 +140,10 @@ fn join_paths(chain: &[PathBuf]) -> String {
 }
 
 pub fn resolve(mode: EnhanceMode, target: &str) -> Profile {
+    resolve_for(mode, target, VisualClass::Unknown)
+}
+
+pub fn resolve_for(mode: EnhanceMode, target: &str, class: VisualClass) -> Profile {
     let mode = effective(mode, gpu());
     if mode == EnhanceMode::Off {
         return Profile {
@@ -134,7 +160,13 @@ pub fn resolve(mode: EnhanceMode, target: &str) -> Profile {
         };
     }
 
-    let anime = looks_like_anime(target);
+    let anime = matches!(class, VisualClass::Anime | VisualClass::Cartoon)
+        || (class == VisualClass::Unknown && looks_like_anime(target));
+    let mode = if class == VisualClass::Sports {
+        EnhanceMode::Performance
+    } else {
+        mode
+    };
     let chain = shader_chain(&shader_dir(), mode, anime);
     let name = format!(
         "{}-{}",
@@ -151,6 +183,50 @@ pub fn resolve(mode: EnhanceMode, target: &str) -> Profile {
         args.push(format!("--glsl-shaders={}", join_paths(&chain)));
     }
     Profile { name, args }
+}
+
+pub fn classify(title: &str, genres: &[String], live_sports: bool) -> VisualClass {
+    if live_sports {
+        return VisualClass::Sports;
+    }
+    let text = format!("{} {}", title, genres.join(" ")).to_ascii_lowercase();
+    if text.contains("anime") || text.contains("animation japanese") || text.contains("anilist") {
+        VisualClass::Anime
+    } else if text.contains("animation") || text.contains("cartoon") || text.contains("animated") {
+        VisualClass::Cartoon
+    } else if !title.trim().is_empty() {
+        VisualClass::LiveAction
+    } else {
+        VisualClass::Unknown
+    }
+}
+
+pub fn capability_status() -> serde_json::Value {
+    let vfx = std::env::var("TVOS_NVVFX_LIBRARY")
+        .ok()
+        .is_some_and(|p| Path::new(&p).exists());
+    let vapoursynth = command_exists("vspipe");
+    let tensorrt = command_exists("trtexec");
+    let shaders = presets().len().saturating_sub(1);
+    let backend = if gpu() == Gpu::Nvidia && vfx {
+        "nvidia_vfx_vsr"
+    } else if gpu() == Gpu::Nvidia && vapoursynth && tensorrt {
+        "vs_mlrt_tensorrt"
+    } else if shaders > 0 {
+        "glsl"
+    } else {
+        "builtin"
+    };
+    serde_json::json!({
+        "gpu": format!("{:?}", gpu()).to_ascii_lowercase(), "backend": backend,
+        "nvidia_vfx": vfx, "vapoursynth": vapoursynth, "tensorrt": tensorrt,
+        "shader_presets": shaders,
+        "fallback_reason": if backend == "glsl" { "Optional NVIDIA AI runtime not installed; using realtime portable shaders" } else { "" },
+    })
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new(name).arg("--version").output().is_ok()
 }
 
 /// Env defaults for launching modern games: engine-level upscalers beat any
@@ -406,6 +482,20 @@ mod tests {
         // Substring "anime" inside another word must not false-positive.
         assert!(!looks_like_anime("/media/movies/Reanimated (2020).mkv"));
         assert!(!looks_like_anime("/tv/The Animeals Show/ep.mkv"));
+    }
+
+    #[test]
+    fn visual_class_prefers_metadata_and_live_sports() {
+        assert_eq!(classify("Anything", &[], true), VisualClass::Sports);
+        assert_eq!(
+            classify("Blue Eye Samurai", &["Animation".into()], false),
+            VisualClass::Cartoon
+        );
+        assert_eq!(classify("Anime series", &[], false), VisualClass::Anime);
+        assert_eq!(
+            classify("Heat", &["Crime".into()], false),
+            VisualClass::LiveAction
+        );
     }
 
     #[test]

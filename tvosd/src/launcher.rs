@@ -18,6 +18,7 @@ use include_dir::{include_dir, Dir};
 
 use crate::settings::EnhanceMode;
 use crate::upscale::Profile;
+use crate::upscale::VisualClass;
 
 /// The bundled player (TV overlay + thumbfast + our controller/upscaler scripts and
 /// config), embedded so the daemon always provisions a complete, working UI.
@@ -38,23 +39,35 @@ pub struct PlayerMeta {
     /// HTTP headers some IPTV streams require to serve (passed to mpv).
     pub referrer: Option<String>,
     pub user_agent: Option<String>,
+    pub visual_class: VisualClass,
+    pub source_width: Option<u32>,
+    pub source_height: Option<u32>,
+    pub expected_fps: Option<f64>,
+    pub next_episode_id: Option<String>,
 }
 
 impl PlayerMeta {
     pub fn new(title: impl Into<String>) -> Self {
+        let title = title.into();
         Self {
-            title: title.into(),
+            visual_class: crate::upscale::classify(&title, &[], false),
+            title,
             subtitle: None,
             source: None,
             live: false,
             referrer: None,
             user_agent: None,
+            source_width: None,
+            source_height: None,
+            expected_fps: None,
+            next_episode_id: None,
         }
     }
 
     /// Mark this as a live stream.
     pub fn live(mut self) -> Self {
         self.live = true;
+        self.visual_class = VisualClass::Sports;
         self
     }
 }
@@ -102,7 +115,17 @@ pub fn play_video(
     track_id: Option<&str>,
     meta: Option<&PlayerMeta>,
 ) -> Result<(), String> {
-    let start = item_id.and_then(crate::resume::position);
+    let tracked_item = if meta.is_some_and(|m| m.live) {
+        None
+    } else {
+        item_id
+    };
+    let start = tracked_item.and_then(|id| {
+        crate::profile::STORE
+            .progress(id)
+            .map(|p| p.position_seconds)
+            .or_else(|| crate::resume::position(id))
+    });
     let home = prepare_mpv_home(profile, mode, hint, start, meta, false);
     let mut player = PLAYER.lock().unwrap_or_else(|e| e.into_inner());
     stop(&mut player);
@@ -123,14 +146,7 @@ pub fn play_video(
         .stdout(crate::logging::child_output())
         .stderr(crate::logging::child_output());
     own_process_group(&mut cmd);
-    if let Some(id) = item_id {
-        cmd.env("TVOS_POSITION_FILE", crate::resume::position_file(id));
-        cmd.env("TVOS_CONTENT_ID", id);
-        // resume.lua tags the watched-marker with the *precise* id (an episode
-        // carries season:episode) so the Trakt/AniList scrobbler can resolve
-        // exactly what was watched; the resume position stays keyed by item_id.
-        cmd.env("TVOS_ITEM_ID", track_id.unwrap_or(id));
-    }
+    set_tracking_env(&mut cmd, tracked_item, track_id);
     let child = cmd
         .spawn()
         .map_err(|e| format!("could not start mpv: {e}"))?;
@@ -164,7 +180,17 @@ pub fn play_torrent(
         "Torrent playback needs webtorrent-cli. Install it with `npm install -g webtorrent-cli`, \
          or configure the addon with a debrid service (e.g. RealDebrid) for direct streams.",
     )?;
-    let start = item_id.and_then(crate::resume::position);
+    let tracked_item = if meta.is_some_and(|m| m.live) {
+        None
+    } else {
+        item_id
+    };
+    let start = tracked_item.and_then(|id| {
+        crate::profile::STORE
+            .progress(id)
+            .map(|p| p.position_seconds)
+            .or_else(|| crate::resume::position(id))
+    });
     let home = prepare_mpv_home(profile, mode, hint, start, meta, true);
     let mut player = PLAYER.lock().unwrap_or_else(|e| e.into_inner());
     stop(&mut player);
@@ -228,19 +254,34 @@ pub fn play_torrent(
         .stdout(crate::logging::child_output())
         .stderr(crate::logging::child_output());
     own_process_group(&mut cmd);
-    if let Some(id) = item_id {
-        // webtorrent's mpv inherits these, so resume.lua can save the position
-        // and write the watched-marker — torrents scrobble just like direct
-        // streams (previously the marker was never written for torrents).
-        cmd.env("TVOS_POSITION_FILE", crate::resume::position_file(id));
-        cmd.env("TVOS_CONTENT_ID", id);
-        cmd.env("TVOS_ITEM_ID", track_id.unwrap_or(id));
-    }
+    set_tracking_env(&mut cmd, tracked_item, track_id);
     cmd.env("TVOS_TORRENT_PLAYBACK", "1");
     let child = cmd
         .spawn()
         .map_err(|e| format!("could not start torrent stream: {e}"))?;
     confirm_started(&home, child, true, &mut player)
+}
+
+fn set_tracking_env(cmd: &mut Command, item_id: Option<&str>, track_id: Option<&str>) {
+    let Some(id) = item_id else { return };
+    cmd.env("TVOS_POSITION_FILE", crate::resume::position_file(id));
+    cmd.env("TVOS_CONTENT_ID", id);
+    cmd.env("TVOS_ITEM_ID", track_id.unwrap_or(id));
+    cmd.env("TVOS_PLAYBACK_SESSION", playback_session_id());
+}
+
+fn playback_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    format!(
+        "{}-{stamp}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Waits until playback actually starts before reporting success, so the shell
@@ -376,7 +417,7 @@ fn prepare_mpv_home(
     provision_player(&home);
     write_mpv_wrapper(&home);
     write_mpv_conf(&home, profile, start, meta, torrent);
-    write_upscalers(&home, mode, hint);
+    write_upscalers(&home, mode, hint, meta);
     write_player_meta(&home, meta);
     home
 }
@@ -385,7 +426,7 @@ fn prepare_mpv_home(
 /// bundled files are rewritten *once*. Otherwise the daemon never touches them
 /// again, so anything you edit under MPV_HOME stays edited (no rebuild needed),
 /// and deleting a file restores its shipped default on the next launch.
-const PLAYER_VERSION: &str = "16";
+const PLAYER_VERSION: &str = "17";
 
 /// Installs the bundled player into MPV_HOME so the TV overlay is always the UI.
 /// The entire player tree (TV overlay, thumbfast, our scripts and config) is
@@ -552,6 +593,12 @@ fn write_player_meta(home: &Path, meta: Option<&PlayerMeta>) {
         "subtitle": meta.subtitle,
         "source": meta.source,
         "live": meta.live,
+        "visual_class": meta.visual_class,
+        "source_width": meta.source_width,
+        "source_height": meta.source_height,
+        "expected_fps": meta.expected_fps,
+        "next_episode_id": meta.next_episode_id,
+        "enhancement": crate::upscale::capability_status(),
     });
     let _ = std::fs::write(path, json.to_string());
 }
@@ -632,14 +679,17 @@ fn conf_safe_value(value: &str) -> String {
 
 /// Writes the preset list the in-player upscaler menu reads, marking the one the
 /// resolver chose as active. Switching between them is live (no reload).
-fn write_upscalers(home: &Path, mode: EnhanceMode, hint: &str) {
+fn write_upscalers(home: &Path, mode: EnhanceMode, hint: &str, meta: Option<&PlayerMeta>) {
     let presets = crate::upscale::presets();
-    let mut active = crate::upscale::active_preset(mode, hint);
+    let class = meta.map(|m| m.visual_class).unwrap_or_default();
+    let mut active = crate::upscale::active_preset_for(mode, hint, class);
     if !presets.iter().any(|p| p.name == active) {
         active = "Off".to_string();
     }
     let json = serde_json::json!({
         "active": active,
+        "visual_class": class,
+        "capability": crate::upscale::capability_status(),
         "presets": presets
             .iter()
             .map(|p| serde_json::json!({ "name": p.name, "hint": p.hint, "shaders": p.shaders }))

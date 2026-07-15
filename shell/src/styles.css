@@ -689,13 +689,8 @@ body {
   pointer-events: none;
 }
 
-.shelf--progress .card-thumb::after {
-  content: '';
-  position: absolute;
-  left: 0; right: 35%; bottom: 0;
-  height: 5px;
-  background: var(--accent);
-}
+.watch-progress { position:absolute; left:0; right:0; bottom:0; height:5px; background:rgba(255,255,255,.28); z-index:3; }
+.watch-progress-fill { height:100%; background:var(--accent); }
 
 @media (max-width: 1500px) {
   .top-clock { display: none; }
@@ -1441,18 +1436,41 @@ textarea:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-width: 1160px;
-  /* Keep long lists compact: cap the height and scroll inside instead of
-     stretching the page down forever. Selection scrollIntoView keeps the
-     focused row visible. */
-  max-height: 46vh;
-  overflow-y: auto;
+  max-width: none;
+  max-height: none;
+  overflow: visible;
   scrollbar-width: thin;
   scrollbar-color: var(--overlay-border) transparent;
   /* Room so the focused row's lift + ring isn't clipped by the scroll box. */
   padding: 8px 6px;
   margin-left: -6px;
 }
+
+/* Full-viewport cinematic details. The backdrop owns the opening 62vh; all
+   content rails below it use the television's complete safe width and share a
+   single vertical page scroll. */
+.details-body {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  grid-template-columns: minmax(0, 1fr) clamp(240px, 18vw, 380px);
+  column-gap: clamp(48px, 6vw, 128px);
+  padding-inline: var(--edge);
+}
+.details-head { min-height: clamp(560px, 62vh, 980px); }
+.details-info { max-width: min(980px, 64vw); }
+.details-desc { max-width: 860px; }
+.episodes,
+.streams,
+.details-facts,
+.shots { grid-column: 1 / -1; width: 100%; max-width: none; }
+.episodes,
+.streams { margin-top: clamp(36px, 5vh, 76px); }
+.details-facts { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+.ep-list,
+.stream-list { width: 100%; }
+.ep-item,
+.stream-item { width: 100%; }
 
 .ep-list::-webkit-scrollbar,
 .stream-list::-webkit-scrollbar {

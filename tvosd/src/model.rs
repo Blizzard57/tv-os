@@ -68,6 +68,10 @@ impl Serialize for ContentItem {
         if let Some(note) = &self.note {
             map.serialize_entry("note", note)?;
         }
+        if let Some(progress) = crate::profile::STORE.progress(&self.id) {
+            map.serialize_entry("progress", &progress.percentage)?;
+            map.serialize_entry("playback", &progress)?;
+        }
         let source = self.id.split(':').next().unwrap_or("local");
         map.serialize_entry("source", source)?;
         map.serialize_entry("domain", &domain_for(self))?;

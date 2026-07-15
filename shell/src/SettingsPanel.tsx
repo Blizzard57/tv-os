@@ -12,6 +12,7 @@ import {
   fetchSourceManifests,
   fetchSources,
   fetchLiveStatus,
+  fetchEnhanceStatus,
   fetchSteamStatus,
   fetchTrackingStatus,
   fetchTwitchStatus,
@@ -662,6 +663,13 @@ function RecommendationSection() {
 }
 
 function PlaybackSection({ form, update, submit }: Pick<SectionProps, 'form' | 'update' | 'submit'>) {
+  const [capability, setCapability] = useState('Checking GPU enhancement…');
+  useEffect(() => {
+    fetchEnhanceStatus().then((status) => {
+      const backend = status.backend.replaceAll('_', ' ');
+      setCapability(`${status.gpu.toUpperCase()} · ${backend} · ${status.shader_presets} portable presets`);
+    }).catch(() => setCapability('Enhancement diagnostics unavailable'));
+  }, []);
   const save = (enhance: EnhanceMode) => { update({ enhance }); submit({ enhance }).catch(() => {}); };
   return (
     <section className="settings-section">
@@ -671,6 +679,7 @@ function PlaybackSection({ form, update, submit }: Pick<SectionProps, 'form' | '
         <button key={mode} className={`settings-chip${form.enhance === mode ? ' active' : ''}`} onClick={() => save(mode)}>{mode[0].toUpperCase() + mode.slice(1)}</button>
       ))}</div></Field>
       <p className="settings-muted">Auto chooses the content-aware shader chain. Subtitle, audio, speed, quality and Enhance controls remain available in the player sheet.</p>
+      <div className="settings-status-row"><span>Active capability</span><strong>{capability}</strong></div>
     </section>
   );
 }

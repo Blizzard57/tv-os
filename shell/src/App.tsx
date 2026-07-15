@@ -86,7 +86,6 @@ const EMPTY_TAB_COPY: Record<TabId, string> = {
   shows: 'No shows yet — add a TMDB key in Settings to fill this tab.',
   creators: 'Connect YouTube or Twitch in Settings to see creators you follow.',
   games: 'Connect a game library to see installed and recommended games.',
-  library: 'Your library is empty — connect Steam, Epic or GOG, or start watching to fill it.',
 };
 
 export default function App() {
@@ -117,24 +116,13 @@ export default function App() {
     TABS.map((tab) => [tab.id, rowsForTab(tab.id, rows ?? [])]),
   ) as Record<TabId, Row[]>, [rows]);
   const shelves = tabRows[activeTab];
-  const featured = useMemo(() => {
+  const defaultHero = useMemo(() => {
     const preferred = shelves.find((r) => r.purpose === 'top_picks') || shelves[0];
     const items = preferred?.items.filter((item) => activeTab !== 'foryou' || item.kind === 'movie' || item.kind === 'series') ?? [];
-    return items.slice(0, 6);
+    return items[0];
   }, [shelves]);
-  const [featuredIndex, setFeaturedIndex] = useState(0);
-  const lastNavigationAt = useRef(performance.now());
-  useEffect(() => setFeaturedIndex(0), [activeTab]);
-  useEffect(() => {
-    if (featured.length < 2 || overlayOpen) return;
-    const timer = window.setInterval(() => {
-      if (performance.now() - lastNavigationAt.current >= 8_000) {
-        setFeaturedIndex((i) => (i + 1) % featured.length);
-      }
-    }, 12_000);
-    return () => window.clearInterval(timer);
-  }, [featured.length, overlayOpen]);
-  const featuredItem = featured[featuredIndex] || heroItem;
+  const rememberedHero = useRef<Partial<Record<TabId, ContentItem>>>({});
+  const featuredItem = heroItem || rememberedHero.current[activeTab] || defaultHero;
   const featuredRow = shelves.find((r) => r.items.some((i) => i.id === featuredItem?.id));
 
   // Which tabs currently have anything to show (dims empty tabs in the bar).
@@ -258,6 +246,8 @@ export default function App() {
   // spot so returning from an overlay lands where you left.
   const onCardFocus = useCallback((item: ContentItem, el: HTMLElement) => {
     setZone('rows');
+    rememberedHero.current[activeTabRef.current] = item;
+    setHeroItem(item);
     lastHomeFocus.current = el.dataset.focusKey ?? `card:${item.id}`;
     window.clearTimeout(focusDwell.current);
     focusDwell.current = window.setTimeout(() => {
@@ -266,14 +256,14 @@ export default function App() {
   }, []);
   useEffect(() => () => window.clearTimeout(focusDwell.current), []);
   const firstItemOfTab = useCallback(
-    (id: TabId) => tabRows[id][0]?.items[0],
+    (id: TabId) => tabRows[id].find((row) => row.purpose === 'top_picks')?.items[0] ?? tabRows[id][0]?.items[0],
     [tabRows],
   );
   const onTabFocus = useCallback(
     (id: TabId, el: HTMLElement) => {
       // Moving across the bar switches the tab live (its content previews below).
       switchTab(id);
-      setHeroItem(firstItemOfTab(id));
+      setHeroItem(rememberedHero.current[id] ?? firstItemOfTab(id));
       setZone('topbar');
       lastHomeFocus.current = el.dataset.focusKey ?? `tab:${id}`;
     },
@@ -281,11 +271,10 @@ export default function App() {
   );
   const onChromeFocus = useCallback(
     (el: HTMLElement) => {
-      setHeroItem(firstItemOfTab(activeTabRef.current));
       setZone('topbar');
       lastHomeFocus.current = el.dataset.focusKey ?? null;
     },
-    [firstItemOfTab],
+    [],
   );
 
   // B / Home: from the rows, jump to the active tab; on the bar, fall back to
@@ -304,7 +293,6 @@ export default function App() {
 
   const onAction = useCallback(
     (action: NavAction) => {
-      lastNavigationAt.current = performance.now();
       // ---- Overlays own input while open ----
       if (searchOpen) {
         if (action === 'search') setSearchOpen(false);
@@ -601,7 +589,7 @@ function useHeroPreview(item: ContentItem | undefined): Meta | null {
           setMeta(m);
         })
         .catch(() => {});
-    }, 350);
+    }, 120);
     return () => {
       cancelled = true;
       window.clearTimeout(t);
