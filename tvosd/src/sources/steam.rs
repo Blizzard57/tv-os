@@ -576,6 +576,25 @@ fn scan() -> Vec<ContentItem> {
     items
 }
 
+/// Installed directory for a Steam item. Mod deployment uses Steam's own ACF
+/// metadata instead of guessing the library or folder name.
+pub fn install_dir(item_id: &str) -> Option<PathBuf> {
+    let appid = valid_appid(item_id).ok()?;
+    let root = steam_root()?;
+    for steamapps in library_dirs(&root) {
+        let manifest = steamapps.join(format!("appmanifest_{appid}.acf"));
+        let text = fs::read_to_string(manifest).ok()?;
+        let installdir = quoted_pairs(&text)
+            .find(|(key, _)| key == "installdir")
+            .map(|(_, value)| value)?;
+        let path = steamapps.join("common").join(installdir);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Steam install locations, in order of preference.
 fn steam_root() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;

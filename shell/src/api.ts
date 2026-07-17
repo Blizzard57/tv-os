@@ -317,6 +317,86 @@ export interface GameExtras {
   achievements?: { unlocked: GameAchievement[]; locked: GameAchievement[] } | null;
 }
 
+// ---- Native game mod management -----------------------------------------
+
+export interface ModProviderStatus {
+  id: string;
+  name: string;
+  connected: boolean;
+  available: boolean;
+  mode: string;
+  detail: string;
+  browse_url?: string;
+}
+
+export interface ModRequirement { id: string; required: boolean }
+export interface ProfileIssue { severity: 'error' | 'warning' | string; code: string; message: string; mod_id?: string }
+export interface InstalledMod {
+  id: string; game_id: string; profile_id: string; provider: string; title: string; version: string;
+  artifact_hash: string; enabled: boolean; priority: number; file_count: number;
+  requirements: ModRequirement[]; security: string;
+}
+export interface ModProfile {
+  id: string; game_id: string; name: string; active: boolean; locked: boolean;
+  revision: number; mod_count: number; health: 'ready' | 'warnings' | 'blocked' | string;
+  issues: ProfileIssue[];
+}
+export interface ModJob {
+  id: string; game_id: string; title: string; phase: string; status: string;
+  progress: number; detail: string; updated_at: number;
+}
+export interface GameModsOverview {
+  game_id: string; support_level: string; support_detail: string;
+  providers: ModProviderStatus[]; profiles: ModProfile[]; installed: InstalledMod[]; jobs: ModJob[];
+}
+
+const gamePath = (id: string) => `/api/games/${encodeURIComponent(id)}`;
+
+export async function fetchGameMods(id: string): Promise<GameModsOverview> {
+  const res = await apiFetch(`${gamePath(id)}/mods`, undefined, MEDIUM_TIMEOUT_MS);
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+  return res.json();
+}
+
+export async function createModProfile(gameId: string, name: string, cloneFrom?: string): Promise<ModProfile> {
+  return postJson(`${gamePath(gameId)}/mod-profiles`, { game_id: gameId, name, clone_from: cloneFrom }, MEDIUM_TIMEOUT_MS);
+}
+
+export async function activateModProfile(gameId: string, profileId: string): Promise<ModProfile> {
+  return postJson(`${gamePath(gameId)}/mod-profiles/${encodeURIComponent(profileId)}/activate`, {}, MEDIUM_TIMEOUT_MS);
+}
+
+export async function deployModProfile(gameId: string, profileId: string): Promise<ModProfile> {
+  return postJson(`${gamePath(gameId)}/mod-profiles/${encodeURIComponent(profileId)}/deploy`, {}, LONG_TIMEOUT_MS);
+}
+
+export async function rollbackModProfile(gameId: string, profileId: string): Promise<void> {
+  return post(`${gamePath(gameId)}/mod-profiles/${encodeURIComponent(profileId)}/rollback`, {});
+}
+
+export async function deleteModProfile(gameId: string, profileId: string): Promise<void> {
+  const res = await apiFetch(`${gamePath(gameId)}/mod-profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' });
+  if (!res.ok) throw new ApiError(await res.text(), 'http', res.status);
+}
+
+export async function importGameMod(
+  gameId: string, profileId: string, title: string, source: string, target = '', provider = 'local', version = '1.0.0',
+): Promise<InstalledMod> {
+  return postJson(`${gamePath(gameId)}/mods/install`, {
+    game_id: gameId, profile_id: profileId, title, source, target, provider, version, requirements: [],
+  }, LONG_TIMEOUT_MS);
+}
+
+export async function setGameModEnabled(gameId: string, profileId: string, modId: string, enabled: boolean): Promise<void> {
+  return post(`${gamePath(gameId)}/mods/${enabled ? 'enable' : 'disable'}`, {
+    game_id: gameId, profile_id: profileId, mod_id: modId, enabled,
+  });
+}
+
+export async function removeGameMod(gameId: string, profileId: string, modId: string): Promise<void> {
+  return post(`${gamePath(gameId)}/mods/remove`, { game_id: gameId, profile_id: profileId, mod_id: modId });
+}
+
 export async function fetchGameExtras(id: string): Promise<GameExtras> {
   const res = await apiFetch(`/api/game?id=${encodeURIComponent(id)}`, undefined, MEDIUM_TIMEOUT_MS);
   if (!res.ok) return {};
@@ -504,8 +584,8 @@ async function postJson<T>(path: string, body: unknown, timeoutMs = DEFAULT_TIME
 
 // Launch sends the whole item so the daemon can record it for the
 // recommender's Continue / Recommended rows.
-export const launch = (item: ContentItem): Promise<PlaybackStatus> =>
-  postJson('/api/launch', { id: item.id, title: item.title, kind: item.kind, art: item.art }, SHORT_TIMEOUT_MS);
+export const launch = (item: ContentItem, profileId?: string): Promise<PlaybackStatus> =>
+  postJson('/api/launch', { id: item.id, title: item.title, kind: item.kind, art: item.art, profile_id: profileId }, SHORT_TIMEOUT_MS);
 export const startInstall = (id: string) => post('/api/install', { id });
 
 export interface SourceStatus {

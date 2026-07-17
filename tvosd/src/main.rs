@@ -26,6 +26,7 @@ mod launcher;
 mod logging;
 mod media;
 mod model;
+mod mods;
 mod profile;
 mod recommend;
 mod resume;
@@ -44,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -120,6 +121,7 @@ async fn require_auth(
 struct App {
     sources: sources::Registry,
     installs: install::InstallManager,
+    mods: mods::ModManager,
     started_at: Instant,
     playback: PlaybackStore,
     /// Recent snapshot of the source rows, so search-as-you-type doesn't
@@ -266,6 +268,7 @@ async fn main() {
     let app = Arc::new(App {
         sources: sources::Registry::detect(),
         installs: install::InstallManager::default(),
+        mods: mods::ModManager::open(),
         started_at: Instant::now(),
         playback: PlaybackStore::default(),
         library_cache: Mutex::new(None),
@@ -333,6 +336,40 @@ async fn main() {
         .route("/api/live/guide", get(get_live_guide))
         .route("/api/live/resolve", post(post_live_resolve))
         .route("/api/game", get(get_game))
+        .route("/api/mods/providers/status", get(get_mod_provider_status))
+        .route("/api/games/{id}/mods", get(get_game_mods))
+        .route("/api/games/{id}/mods/search", get(search_game_mods))
+        .route("/api/games/{id}/mods/resolve", post(validate_mod_profile))
+        .route("/api/games/{id}/mods/install", post(install_game_mod))
+        .route("/api/games/{id}/mods/enable", post(enable_game_mod))
+        .route("/api/games/{id}/mods/disable", post(disable_game_mod))
+        .route("/api/games/{id}/mods/remove", post(remove_game_mod))
+        .route(
+            "/api/games/{id}/mod-profiles",
+            get(get_mod_profiles).post(create_mod_profile),
+        )
+        .route(
+            "/api/games/{id}/mod-profiles/{profile_id}",
+            axum::routing::delete(delete_mod_profile),
+        )
+        .route(
+            "/api/games/{id}/mod-profiles/{profile_id}/activate",
+            post(activate_mod_profile),
+        )
+        .route(
+            "/api/games/{id}/mod-profiles/{profile_id}/validate",
+            post(validate_mod_profile_path),
+        )
+        .route(
+            "/api/games/{id}/mod-profiles/{profile_id}/deploy",
+            post(deploy_mod_profile),
+        )
+        .route(
+            "/api/games/{id}/mod-profiles/{profile_id}/rollback",
+            post(rollback_mod_profile),
+        )
+        .route("/api/games/{id}/mod-diagnostics", get(get_mod_diagnostics))
+        .route("/api/mod-jobs", get(get_mod_jobs))
         .route("/api/tracking/status", get(get_tracking_status))
         .route("/api/tracking/sync", post(post_tracking_sync))
         .route("/api/trakt/connect", post(post_trakt_connect))
@@ -1060,6 +1097,8 @@ struct ItemRequest {
     title: Option<String>,
     kind: Option<model::Kind>,
     art: Option<String>,
+    /// Optional native mod profile. When absent, the active profile is used.
+    profile_id: Option<String>,
 }
 
 async fn post_launch(
@@ -1071,7 +1110,18 @@ async fn post_launch(
     let (job, status) = app.playback.start("launch", label);
     let worker_app = app.clone();
     std::thread::spawn(move || {
-        let result = worker_app.sources.launch(&id);
+        let is_game = matches!(req.kind, Some(model::Kind::Game))
+            || id.starts_with("steam:")
+            || id.starts_with("epic:")
+            || id.starts_with("gog:");
+        let result = if is_game {
+            worker_app
+                .mods
+                .prepare_launch(&id, req.profile_id.as_deref())
+                .and_then(|_| worker_app.sources.launch(&id))
+        } else {
+            worker_app.sources.launch(&id)
+        };
         if let Err(e) = &result {
             log_error!("launch '{}' failed: {}", id, util::scrub_secrets(e));
         }
@@ -1302,6 +1352,209 @@ async fn get_game(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
         serde_json::json!({})
     });
     Json(value)
+}
+
+// ---- Native game mod management -----------------------------------------
+
+async fn get_mod_provider_status(State(app): State<Shared>) -> Json<Vec<mods::ProviderStatus>> {
+    Json(app.mods.providers())
+}
+
+async fn get_game_mods(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<mods::GameModsOverview>, (StatusCode, String)> {
+    app.mods.overview(&id).map(Json).map_err(mod_error)
+}
+
+async fn search_game_mods(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<mods::SearchQuery>,
+) -> Result<Json<Vec<mods::InstalledMod>>, (StatusCode, String)> {
+    app.mods
+        .search_installed(&id, q.q.as_deref())
+        .map(Json)
+        .map_err(mod_error)
+}
+
+async fn get_mod_profiles(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<mods::ModProfile>>, (StatusCode, String)> {
+    app.mods.profiles(&id).map(Json).map_err(mod_error)
+}
+
+async fn create_mod_profile(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut req): Json<mods::ProfileCreateRequest>,
+) -> Result<(StatusCode, Json<mods::ModProfile>), (StatusCode, String)> {
+    req.game_id = id;
+    app.mods
+        .create_profile(&req)
+        .map(|p| (StatusCode::CREATED, Json(p)))
+        .map_err(mod_error)
+}
+
+async fn delete_mod_profile(
+    State(app): State<Shared>,
+    AxumPath((id, profile_id)): AxumPath<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    app.mods
+        .delete_profile(&mods::ProfileActionRequest {
+            game_id: id,
+            profile_id,
+        })
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(mod_error)
+}
+
+async fn activate_mod_profile(
+    State(app): State<Shared>,
+    AxumPath((id, profile_id)): AxumPath<(String, String)>,
+) -> Result<Json<mods::ModProfile>, (StatusCode, String)> {
+    app.mods
+        .activate(&mods::ProfileActionRequest {
+            game_id: id,
+            profile_id,
+        })
+        .map(Json)
+        .map_err(mod_error)
+}
+
+async fn validate_mod_profile(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut req): Json<mods::ProfileActionRequest>,
+) -> Result<Json<mods::ModProfile>, (StatusCode, String)> {
+    req.game_id = id;
+    app.mods.validate_profile(&req).map(Json).map_err(mod_error)
+}
+
+async fn validate_mod_profile_path(
+    State(app): State<Shared>,
+    AxumPath((id, profile_id)): AxumPath<(String, String)>,
+) -> Result<Json<mods::ModProfile>, (StatusCode, String)> {
+    app.mods
+        .validate_profile(&mods::ProfileActionRequest {
+            game_id: id,
+            profile_id,
+        })
+        .map(Json)
+        .map_err(mod_error)
+}
+
+async fn deploy_mod_profile(
+    State(app): State<Shared>,
+    AxumPath((id, profile_id)): AxumPath<(String, String)>,
+) -> Result<Json<mods::ModProfile>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || {
+        app.mods.deploy(&mods::ProfileActionRequest {
+            game_id: id,
+            profile_id,
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map(Json)
+    .map_err(mod_error)
+}
+
+async fn rollback_mod_profile(
+    State(app): State<Shared>,
+    AxumPath((id, profile_id)): AxumPath<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || {
+        app.mods.rollback(&mods::ProfileActionRequest {
+            game_id: id,
+            profile_id,
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map(|_| StatusCode::NO_CONTENT)
+    .map_err(mod_error)
+}
+
+async fn install_game_mod(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut req): Json<mods::ImportRequest>,
+) -> Result<(StatusCode, Json<mods::InstalledMod>), (StatusCode, String)> {
+    req.game_id = id;
+    tokio::task::spawn_blocking(move || app.mods.import(req))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(|m| (StatusCode::CREATED, Json(m)))
+        .map_err(mod_error)
+}
+
+async fn enable_game_mod(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut req): Json<mods::ModActionRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    req.game_id = id;
+    req.enabled = Some(true);
+    app.mods
+        .set_enabled(&req)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(mod_error)
+}
+
+async fn disable_game_mod(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut req): Json<mods::ModActionRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    req.game_id = id;
+    req.enabled = Some(false);
+    app.mods
+        .set_enabled(&req)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(mod_error)
+}
+
+async fn remove_game_mod(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+    Json(mut req): Json<mods::ModActionRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    req.game_id = id;
+    app.mods
+        .remove_mod(&req)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(mod_error)
+}
+
+#[derive(Deserialize)]
+struct ModJobsQuery {
+    game_id: Option<String>,
+}
+
+async fn get_mod_jobs(
+    State(app): State<Shared>,
+    Query(q): Query<ModJobsQuery>,
+) -> Result<Json<Vec<mods::ModJob>>, (StatusCode, String)> {
+    app.mods
+        .jobs(q.game_id.as_deref())
+        .map(Json)
+        .map_err(mod_error)
+}
+
+async fn get_mod_diagnostics(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    app.mods.diagnostics(&id).map(Json).map_err(mod_error)
+}
+
+fn mod_error(message: String) -> (StatusCode, String) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        util::scrub_secrets(&message),
+    )
 }
 
 async fn get_tracking_status() -> Json<serde_json::Value> {

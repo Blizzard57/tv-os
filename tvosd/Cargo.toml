@@ -16,6 +16,7 @@ fastembed = "5.17.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1" # gunzip XMLTV EPG guides (.xml.gz)
 rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 
 # Shrink the shipped binary. Keep panic=unwind (default) — no panic=abort.
 [profile.release]

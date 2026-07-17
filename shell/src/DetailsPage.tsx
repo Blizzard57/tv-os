@@ -12,6 +12,7 @@ import {
   ContentItem,
   Episode,
   GameExtras,
+  GameModsOverview,
   Meta,
   PlaybackStatus,
   PreferenceAction,
@@ -19,6 +20,7 @@ import {
   ResumeInfo,
   Stream,
   fetchGameExtras,
+  fetchGameMods,
   fetchMeta,
   fetchPlayback,
   fetchPreference,
@@ -33,6 +35,7 @@ import {
   startInstall,
 } from './api';
 import { gameLogo } from './cards';
+import { GameModsPanel } from './GameModsPanel';
 import { useArtworkPalette } from './artPalette';
 import { NavAction } from './input';
 import { focusPrimary, useSpatialNav } from './spatialNav';
@@ -48,7 +51,7 @@ interface Props {
   actionRef: MutableRefObject<((a: NavAction) => void) | null>;
 }
 
-type Stage = 'actions' | 'episodes' | 'streams' | 'extras';
+type Stage = 'actions' | 'episodes' | 'streams' | 'extras' | 'mods';
 type PrefButton = { action: PreferenceAction; icon: string; label: string; active: boolean };
 
 const isGameId = (id: string) => id.startsWith('steam:') || id.startsWith('gshop:');
@@ -78,6 +81,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const [loading, setLoading] = useState<{ label: string; kind: LoadingKind } | null>(null);
   const [similar, setSimilar] = useState<ContentItem[]>([]);
   const [extras, setExtras] = useState<GameExtras>({});
+  const [modSummary, setModSummary] = useState<GameModsOverview | null>(null);
   const [metaError, setMetaError] = useState(false);
   // Which control the on-screen highlight paints, mirrored from real DOM focus
   // (browser focus is the source of truth; geometry in `moveFocus` drives it).
@@ -128,6 +132,13 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
         .catch(() => setResume(null));
     }
   }, [item.id]);
+
+  useEffect(() => {
+    setModSummary(null);
+    if (item.kind === 'game' && item.action === 'play') {
+      fetchGameMods(item.id).then(setModSummary).catch(() => setModSummary(null));
+    }
+  }, [item.id, item.kind, item.action]);
 
   // "More like this" — arrives lazily; the strip appears when it has items.
   useEffect(() => {
@@ -375,7 +386,10 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   // B / Esc peels one layer: expanded sources → compact, series streams →
   // episode list, otherwise close the page.
   const handleBack = useCallback(() => {
-    if (stage === 'extras') {
+    if (stage === 'mods') {
+      setStage('actions');
+      bumpRefocus();
+    } else if (stage === 'extras') {
       setStage(extrasReturnStage.current);
       bumpRefocus();
     } else if (stage === 'streams' && showAllSources && canCompactSources) {
@@ -454,6 +468,10 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
     setStage('extras');
     bumpRefocus();
   };
+  const openMods = () => {
+    setStage('mods');
+    bumpRefocus();
+  };
   const extraTiles = [
     ...facts.map((fact) => ({ key: 'fact-' + fact.label, title: fact.label, detail: fact.value })),
     ...(meta?.cast ?? []).map((name) => ({ key: 'cast-' + name, title: name, detail: 'Cast & creator' })),
@@ -525,7 +543,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                 ))}
               </div>
             )}
-            {(extras.playtime_minutes != null || extras.hltb || extras.achievements) && (
+            {(extras.playtime_minutes != null || extras.hltb || extras.achievements || modSummary) && (
               <div className="game-stats">
                 {extras.playtime_minutes != null && (
                   <span className="game-stat">
@@ -554,6 +572,12 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                     <span className="game-stat-label">Achievements</span>
                     {extras.achievements.unlocked.length} /{' '}
                     {extras.achievements.unlocked.length + extras.achievements.locked.length}
+                  </span>
+                )}
+                {modSummary && (
+                  <span className="game-stat">
+                    <span className="game-stat-label">Mods</span>
+                    {modSummary.profiles.find((p) => p.active)?.name ?? 'Vanilla'} · {modSummary.profiles.find((p) => p.active)?.mod_count ?? 0}
                   </span>
                 )}
               </div>
@@ -594,6 +618,11 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
                   <span className="round-action-icon">⋯</span><span>Extras</span>
                 </button>
               )}
+              {isGame && item.action === 'play' && (
+                <button type="button" className={`details-round-action ${on('mods')}`} {...nav('mods')} onClick={openMods}>
+                  <span className="round-action-icon">◇</span><span>Mods</span>
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -613,7 +642,23 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
             >
               {item.action === 'install' ? 'Install' : item.id.startsWith('live:sched:') ? 'Check broadcast' : item.action === 'none' ? 'Coming soon' : 'Play'}
             </div>
+            {isGame && item.action === 'play' && modSummary && (
+              <div className={`row-item action-button action-secondary ${on('vanilla')}`} {...nav('vanilla')}
+                onClick={() => {
+                  const vanilla = modSummary.profiles.find((p) => p.name === 'Vanilla');
+                  if (!vanilla) return;
+                  setLoading({ label: `${item.title} · Vanilla`, kind: 'app' });
+                  launch(item, vanilla.id).then(waitForPlayback).then(() => { setLoading(null); onPlayed(); })
+                    .catch((e) => { setLoading(null); flash(`Could not launch Vanilla: ${e.message}`); });
+                }}>
+                Play Vanilla
+              </div>
+            )}
           </div>
+        )}
+
+        {stage === 'mods' && (
+          <GameModsPanel gameId={item.id} gameTitle={title} onChanged={() => fetchGameMods(item.id).then(setModSummary).catch(() => {})} />
         )}
 
         {resumeShown && resume && (
@@ -880,7 +925,7 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           </div>
         )}
 
-        {similar.length > 0 && (
+        {stage !== 'mods' && similar.length > 0 && (
           <div className="shots similar-block">
             <div className={`shots-head ${focusZone === 'sim' ? 'focused' : ''}`}>
               More like this <span className="details-hint">A to open</span>
