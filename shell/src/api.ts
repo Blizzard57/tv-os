@@ -195,6 +195,13 @@ export interface Settings {
   youtube_account: boolean;
   /** Two-letter country code for game store pricing ("" = US). */
   game_region: string;
+  game_region_mode: 'auto' | 'manual' | string;
+  game_currency: string;
+  nexus_client_id: string;
+  modio_client_id: string;
+  github_client_id: string;
+  curseforge_api_key: string;
+  itad_api_key: string;
   /** Two-letter country code for the Live tab's free-to-air channels ("" = IN). */
   live_region: string;
   /** Sports followed on the Live tab, comma/space separated ("" = all). */
@@ -230,6 +237,8 @@ export interface Settings {
   anilist_token_set?: boolean;
   twitch_token_set?: boolean;
   mal_token_set?: boolean;
+  curseforge_api_key_set?: boolean;
+  itad_api_key_set?: boolean;
 }
 
 export type InteractionKind = 'impression' | 'focus' | 'play' | 'pause' | 'progress' |
@@ -320,14 +329,20 @@ export interface GameExtras {
 // ---- Native game mod management -----------------------------------------
 
 export interface ModProviderStatus {
-  id: string;
+  provider: string;
   name: string;
-  connected: boolean;
-  available: boolean;
-  mode: string;
-  detail: string;
-  browse_url?: string;
+  state: 'unavailable' | 'disconnected' | 'authorizing' | 'connected' | 'expired' | 'rate_limited' | 'error';
+  account_name?: string; account_tier?: string; capabilities: string[];
+  expires_at?: number; quota_remaining?: number; quota_reset_at?: number;
+  error?: string; credential_backend: string; requires_app_configuration: boolean;
 }
+export interface LegacyModProviderStatus { id:string; name:string; connected:boolean; available:boolean; mode:string; detail:string; browse_url?:string }
+export interface ModAuthorizationSession { id:string; provider:string; state:string; authorization_url?:string; user_code?:string; verification_url?:string; expires_at:number; interval_seconds:number; error?:string }
+
+export interface Money { amount:number; currency:string; formatted:string }
+export type PriceVerification = 'regional' | 'estimated_foreign' | 'native_foreign';
+export interface StoreOffer { store:string; native:Money; display?:Money; country:string; verification:PriceVerification; discount_percent:number; url:string; drm:string[]; platforms:string[]; checked_at:number; conversion_date?:string; best_regional:boolean }
+export interface PricingContext { country:string; currency:string; region_mode:string; detected_country:string; detected_currency:string }
 
 export interface ModRequirement { id: string; required: boolean }
 export interface ProfileIssue { severity: 'error' | 'warning' | string; code: string; message: string; mod_id?: string }
@@ -347,8 +362,16 @@ export interface ModJob {
 }
 export interface GameModsOverview {
   game_id: string; support_level: string; support_detail: string;
-  providers: ModProviderStatus[]; profiles: ModProfile[]; installed: InstalledMod[]; jobs: ModJob[];
+  providers: LegacyModProviderStatus[]; profiles: ModProfile[]; installed: InstalledMod[]; jobs: ModJob[];
 }
+
+export async function fetchModProviders():Promise<ModProviderStatus[]>{const res=await apiFetch('/api/mods/providers/status');if(!res.ok)throw new ApiError(await res.text(),'http',res.status);return res.json();}
+export const connectModProvider=(provider:string,options?:{api_key?:string;email?:string;security_code?:string;session_id?:string}):Promise<ModAuthorizationSession>=>postJson(`/api/mods/providers/${encodeURIComponent(provider)}/connect`,options ?? {},MEDIUM_TIMEOUT_MS);
+export async function pollModProvider(provider:string,sessionId:string):Promise<ModAuthorizationSession>{const res=await apiFetch(`/api/mods/providers/${encodeURIComponent(provider)}/connect/${encodeURIComponent(sessionId)}`);if(!res.ok)throw new ApiError(await res.text(),'http',res.status);return res.json();}
+export const disconnectModProvider=(provider:string):Promise<void>=>post(`/api/mods/providers/${encodeURIComponent(provider)}/disconnect`,{});
+export const refreshModProvider=(provider:string):Promise<ModProviderStatus>=>postJson(`/api/mods/providers/${encodeURIComponent(provider)}/refresh`,{});
+export async function fetchPricingContext():Promise<PricingContext>{const res=await apiFetch('/api/pricing/context');if(!res.ok)throw new ApiError(await res.text(),'http',res.status);return res.json();}
+export async function fetchGameOffers(id:string):Promise<StoreOffer[]>{const res=await apiFetch(`${gamePath(id)}/offers`,undefined,MEDIUM_TIMEOUT_MS);if(!res.ok)throw new ApiError(await res.text(),'http',res.status);return res.json();}
 
 const gamePath = (id: string) => `/api/games/${encodeURIComponent(id)}`;
 

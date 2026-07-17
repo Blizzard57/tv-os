@@ -3976,6 +3976,26 @@ select.select-editing {
   font-size: 34px;
 }
 
+/* Provider accounts and region-aware store offers. */
+.mod-account-row { align-items: center; }
+.mod-account-row .btn { margin-left: auto; min-width: 108px; }
+.provider-auth-card { display: flex; align-items: center; gap: 14px; padding: 18px 20px; border-radius: 18px; background: color-mix(in srgb, var(--accent) 15%, rgba(255,255,255,.06)); }
+.provider-auth-card p { flex: 1; margin: 0; color: var(--text-dim); }
+.provider-user-code { padding: 8px 16px; border-radius: 10px; background: white; color: #111; font-size: 22px; font-weight: 700; letter-spacing: .12em; }
+.settings-advanced { margin-top: 16px; padding: 14px 18px; border-radius: 16px; background: rgba(255,255,255,.045); }
+.settings-advanced summary { cursor: pointer; color: var(--text-dim); }
+.pricing-setting-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.store-offers .streams-head { display: flex; justify-content: space-between; align-items: baseline; }
+.store-offers .streams-head small { color: var(--text-dim); font-size: 14px; }
+.offer-group { margin-top: 12px; }
+.offer-group h3 { margin: 0 0 8px; color: var(--text-dim); font-size: 13px; font-weight: 500; text-transform: uppercase; letter-spacing: .08em; }
+.store-offer .stream-name { display: flex; justify-content: space-between; gap: 22px; }
+.store-offer .stream-name strong { color: white; font-size: 17px; }
+.offer-verified { background: rgba(86,190,135,.18); color: #9ce5ba; }
+.offer-estimate { background: rgba(235,180,82,.16); color: #f0ce87; }
+.change-region-button { margin-top: 12px; border: 0; border-radius: 999px; padding: 11px 18px; background: rgba(255,255,255,.08); color: var(--text-dim); }
+.change-region-button.selected, .change-region-button:focus-visible { background: white; color: #111; outline: none; }
+
 /* Respect users who ask for less motion. */
 @media (prefers-reduced-motion: reduce) {
   * {

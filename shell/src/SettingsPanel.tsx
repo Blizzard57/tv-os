@@ -5,6 +5,7 @@ import {
   Settings,
   SourceManifest,
   SourceStatus,
+  ModProviderStatus,
   addAddon,
   addSourceManifest,
   fetchAddons,
@@ -19,6 +20,11 @@ import {
   fetchTwitchStatus,
   fetchVersion,
   fetchYouTubeStatus,
+  fetchModProviders,
+  connectModProvider,
+  pollModProvider,
+  disconnectModProvider,
+  refreshModProvider,
   testSourceManifests,
   toggleSource,
   traktConnect,
@@ -60,6 +66,9 @@ const BLANK: Settings = {
   youtube_channels: '',
   youtube_account: false,
   game_region: '',
+  game_region_mode: 'auto',
+  game_currency: '',
+  nexus_client_id: '', modio_client_id: '', github_client_id: '', curseforge_api_key: '', itad_api_key: '',
   live_region: '',
   live_sports: '',
   live_leagues: '',
@@ -81,6 +90,7 @@ const GAME_REGIONS = [
   'US', 'CA', 'GB', 'DE', 'FR', 'ES', 'IT', 'NL', 'SE', 'PL',
   'BR', 'MX', 'AR', 'IN', 'JP', 'KR', 'AU', 'NZ', 'TR', 'ZA',
 ];
+const GAME_CURRENCIES = ['USD','EUR','GBP','INR','JPY','CAD','AUD','NZD','CHF','SEK','NOK','DKK','PLN','BRL','MXN','KRW','CNY','ZAR','TRY'];
 
 /** Regions for the Live tab (which country's free-to-air sports channels to
  *  surface first). India leads — it's the default. */
@@ -101,6 +111,8 @@ const SECRET_FIELDS = [
   'anilist_token',
   'twitch_token',
   'mal_token',
+  'curseforge_api_key',
+  'itad_api_key',
 ] as const;
 type SecretField = (typeof SECRET_FIELDS)[number];
 
@@ -112,7 +124,7 @@ const isSecret = (key: string): key is SecretField =>
   (SECRET_FIELDS as readonly string[]).includes(key);
 
 type SettingsCategory = 'profile' | 'accounts' | 'recommendations' | 'live' | 'creators' | 'playback' | 'sources' | 'display' | 'system';
-type SettingsSubpage = 'steam' | 'tmdb' | 'tracking' | 'games' | 'youtube' | 'twitch' | 'addons' | 'providers' | 'diagnostics';
+type SettingsSubpage = 'steam' | 'tmdb' | 'tracking' | 'games' | 'mod_accounts' | 'youtube' | 'twitch' | 'addons' | 'providers' | 'diagnostics';
 
 const SETTINGS_CATEGORIES: {
   id: SettingsCategory;
@@ -451,7 +463,7 @@ export function SettingsPanel({
   const activeInfo =
     SETTINGS_CATEGORIES.find((cat) => cat.id === activeCategory) ?? SETTINGS_CATEGORIES[0];
   const subpageTitle: Partial<Record<SettingsSubpage, string>> = {
-    steam: 'Steam', tmdb: 'Movies & TV', tracking: 'Watch tracking', games: 'Game libraries',
+    steam: 'Steam', tmdb: 'Movies & TV', tracking: 'Watch tracking', games: 'Game libraries', mod_accounts: 'Mod providers',
     youtube: 'YouTube', twitch: 'Twitch', addons: 'Streaming addons', providers: 'Cloud providers', diagnostics: 'Source diagnostics',
   };
   const playableCloud = manifests.reduce(
@@ -535,6 +547,7 @@ export function SettingsPanel({
                   ['tmdb', 'Movies & TV', 'Metadata and discovery'],
                   ['tracking', 'Watch tracking', 'Trakt, AniList and MyAnimeList'],
                   ['games', 'Game libraries', 'Epic, GOG and local libraries'],
+                  ['mod_accounts', 'Mod providers', 'Nexus Mods, Workshop, mod.io and repositories'],
                 ]} onOpen={openSubpage} />}
                 {activeCategory === 'accounts' && activeSubpage && (
                   <>
@@ -542,6 +555,7 @@ export function SettingsPanel({
                     {activeSubpage === 'tmdb' && <TmdbSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
                     {activeSubpage === 'tracking' && <TrackingSection form={form} update={update} reload={reload} submit={submit} configured={configured} openOsk={openOsk} />}
                     {activeSubpage === 'games' && <GameLibrariesSection form={form} update={update} submit={submit} openOsk={openOsk} />}
+                    {activeSubpage === 'mod_accounts' && <ModProviderAccounts form={form} update={update} submit={submit} openOsk={openOsk} />}
                   </>
                 )}
                 {activeCategory === 'recommendations' && (
@@ -1177,6 +1191,7 @@ function GameLibrariesSection({
   form,
   update,
   submit,
+  openOsk,
 }: {
   form: Settings;
   update: (patch: Partial<Settings>) => void;
@@ -1197,6 +1212,7 @@ function GameLibrariesSection({
         install and launch right from the couch.
       </p>
       <GameRegionField form={form} update={update} submit={submit} />
+      <details className="settings-advanced"><summary>Advanced price providers</summary><LockedField label="IsThereAnyDeal API key" value={form.itad_api_key} configured={!!form.itad_api_key_set} masked openOsk={openOsk} onChange={(next) => { update({itad_api_key:next}); void submit({itad_api_key:next}); }} /></details>
       <div className="lib-list">
         <LibRow
           name="Steam"
@@ -1220,6 +1236,56 @@ function GameLibrariesSection({
   );
 }
 
+function ModProviderAccounts({ form, update, submit, openOsk }: Pick<SectionProps,'form'|'update'|'submit'|'openOsk'>) {
+  const [providers, setProviders] = useState<ModProviderStatus[]>([]);
+  const [session, setSession] = useState<{ provider:string; id:string; url?:string; code?:string; interval:number } | null>(null);
+  const [message, setMessage] = useState('');
+  const reload = useCallback(() => fetchModProviders().then(setProviders).catch((e) => setMessage((e as Error).message)), []);
+  useEffect(() => { void reload(); }, [reload]);
+  useEffect(() => {
+    if (!session) return;
+    const timer = window.setInterval(() => {
+      pollModProvider(session.provider, session.id).then((next) => {
+        if (next.state === 'connected') { setSession(null); setMessage(`${session.provider} connected`); void reload(); }
+        else if (next.state === 'error' || next.state === 'expired') { setSession(null); setMessage(next.error ?? 'Authorization expired'); }
+      }).catch((e) => setMessage((e as Error).message));
+    }, Math.max(3, session.interval) * 1000);
+    return () => window.clearInterval(timer);
+  }, [session, reload]);
+  const connect = (provider: ModProviderStatus, email?:string) => {
+    if(provider.provider === 'modio' && !email){openOsk('mod.io account email','',false,(value)=>connect(provider,value));return;}
+    const options = provider.provider === 'curseforge' ? {api_key:form.curseforge_api_key} : provider.provider === 'modio' ? {email} : undefined;
+    connectModProvider(provider.provider, options).then((next) => {
+      if (next.state === 'connected') { setMessage(`${provider.name} connected`); void reload(); return; }
+      if (next.state === 'awaiting_code') { setSession({provider:provider.provider,id:next.id,interval:0});openOsk('mod.io security code','',false,(code)=>connectModProvider('modio',{session_id:next.id,security_code:code}).then(()=>{setSession(null);setMessage('mod.io connected');void reload();}).catch((e)=>setMessage((e as Error).message)));return; }
+      setSession({ provider:provider.provider, id:next.id, url:next.authorization_url ?? next.verification_url, code:next.user_code, interval:next.interval_seconds });
+      if (next.authorization_url) void openUrl(next.authorization_url);
+    }).catch((e) => setMessage((e as Error).message));
+  };
+  const configured = (provider:string) => providers.find((p) => p.provider === provider)?.state !== 'unavailable';
+  const advanced = [
+    ['nexus_client_id','Nexus client ID',form.nexus_client_id],['modio_client_id','mod.io client ID',form.modio_client_id],['github_client_id','GitHub client ID',form.github_client_id],
+  ] as const;
+  return <section className="settings-section mod-provider-settings">
+    <h2>Mod providers</h2><p className="settings-muted">Connect accounts once. Tokens remain in Secret Service or an owner-only fallback and are never returned to this screen.</p>
+    <div className="lib-list">
+      {providers.map((provider) => <div className="lib-row mod-account-row" key={provider.provider}>
+        <div><span className="lib-name">{provider.name}</span><span className={`lib-status ${provider.state === 'connected' ? 'lib-on' : ''}`}>{provider.account_name ?? provider.state.replace('_',' ')}{provider.account_tier ? ` · ${provider.account_tier}` : ''}{provider.quota_remaining != null ? ` · ${provider.quota_remaining} requests left` : ''} · {provider.capabilities.join(', ')}</span><small>{provider.credential_backend === 'owner_only_file' ? 'Owner-only credential file' : 'Linux Secret Service'}</small></div>
+        {provider.state === 'connected'
+          ? <><button className="btn" onClick={() => refreshModProvider(provider.provider).then(reload).catch((e) => setMessage((e as Error).message))}>Check</button><button className="btn" onClick={() => disconnectModProvider(provider.provider).then(reload).catch((e) => setMessage((e as Error).message))}>Disconnect</button></>
+          : <button className="btn" disabled={provider.state === 'unavailable' || provider.state === 'authorizing'} onClick={() => connect(provider)}>{provider.state === 'expired' ? 'Reconnect' : 'Connect'}</button>}
+      </div>)}
+    </div>
+    {session && <div className="provider-auth-card"><strong>Finish connecting {session.provider}</strong>{session.code && <span className="provider-user-code">{session.code}</span>}<p>Approve in the browser, then return here. This screen checks automatically.</p>{session.url && <button className="btn" onClick={() => openUrl(session.url!).catch(() => {})}>Open authorization</button>}<button className="btn" onClick={() => setSession(null)}>Cancel</button></div>}
+    <details className="settings-advanced"><summary>Advanced application configuration</summary>
+      <p className="settings-muted">Normal releases provide these identifiers. Developer builds can override them here.</p>
+      {advanced.map(([key,label,value]) => <LockedField key={key} label={label} value={value} configured={configured(key.split('_')[0])} openOsk={openOsk} onChange={(next) => { update({[key]:next}); void submit({[key]:next}); }} />)}
+      <LockedField label="CurseForge API key" value={form.curseforge_api_key} configured={!!form.curseforge_api_key_set} masked openOsk={openOsk} onChange={(next) => { update({curseforge_api_key:next}); void submit({curseforge_api_key:next}); }} />
+    </details>
+    {message && <p className="settings-status">{message}</p>}
+  </section>;
+}
+
 /// Store region for game pricing ("Games for you" + Where-to-buy pages).
 /// Driven by the shared form (#5) so it never clobbers unsaved edits; saves
 /// immediately via the guarded submit so a change reprices on the next look.
@@ -1234,26 +1300,30 @@ function GameRegionField({
 }) {
   const region = form.game_region?.trim().toUpperCase() || 'US';
   const options = GAME_REGIONS.includes(region) ? GAME_REGIONS : [region, ...GAME_REGIONS];
+  const mode = form.game_region_mode === 'manual' ? 'manual' : 'auto';
+  const currency = form.game_currency?.trim().toUpperCase() || 'AUTO';
 
   const change = (next: string) => {
-    update({ game_region: next });
+    const patch = next === 'AUTO' ? { game_region_mode:'auto' } : { game_region_mode:'manual', game_region:next };
+    update(patch);
     // Persist just this change through the guarded save (omits untouched
     // secrets, keeps the rest of the user's in-progress form intact).
-    submit({ game_region: next }).catch(() => {
+    submit(patch).catch(() => {
       /* daemon unreachable — the select still shows the choice */
     });
   };
 
   return (
-    <Field label="Store region (game prices — Games for you & Where to buy)">
-      <select value={region} onChange={(e) => change(e.target.value)}>
+    <div className="pricing-setting-grid"><Field label="Pricing country">
+      <select value={mode === 'auto' ? 'AUTO' : region} onChange={(e) => change(e.target.value)}>
+        <option value="AUTO">Automatic from Linux locale</option>
         {options.map((r) => (
           <option key={r} value={r}>
             {r}
           </option>
         ))}
       </select>
-    </Field>
+    </Field><Field label="Display currency"><select value={currency} onChange={(e) => { const next=e.target.value==='AUTO'?'':e.target.value;update({game_currency:next});void submit({game_currency:next}); }}><option value="AUTO">Automatic for country</option>{GAME_CURRENCIES.map((code)=><option key={code} value={code}>{code}</option>)}</select></Field></div>
   );
 }
 

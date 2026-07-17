@@ -60,6 +60,26 @@ pub struct Settings {
     /// Two-letter country code for game store pricing ("" = US).
     #[serde(default)]
     pub game_region: String,
+    /// `auto` derives the pricing country from the Linux locale; `manual`
+    /// keeps `game_region` as an explicit override.
+    #[serde(default = "default_region_mode")]
+    pub game_region_mode: String,
+    /// ISO-4217 display currency. Empty means the currency associated with the
+    /// effective pricing country.
+    #[serde(default)]
+    pub game_currency: String,
+    /// Optional developer/release application identifiers for mod providers.
+    /// Release builds normally receive these from provider-clients.json.
+    #[serde(default)]
+    pub nexus_client_id: String,
+    #[serde(default)]
+    pub modio_client_id: String,
+    #[serde(default)]
+    pub github_client_id: String,
+    #[serde(default)]
+    pub curseforge_api_key: String,
+    #[serde(default)]
+    pub itad_api_key: String,
     /// Two-letter country code for the Live tab: which region's free-to-air
     /// sports channels to surface first and which fixtures to prioritise
     /// ("" = IN, India — the default).
@@ -125,6 +145,9 @@ fn default_true() -> bool {
 fn default_autoplay_delay() -> u64 {
     10
 }
+fn default_region_mode() -> String {
+    "auto".into()
+}
 fn default_sponsorblock_categories() -> String {
     "sponsor".into()
 }
@@ -147,6 +170,13 @@ pub struct SettingsPatch {
     pub youtube_channels: Option<String>,
     pub youtube_account: Option<bool>,
     pub game_region: Option<String>,
+    pub game_region_mode: Option<String>,
+    pub game_currency: Option<String>,
+    pub nexus_client_id: Option<String>,
+    pub modio_client_id: Option<String>,
+    pub github_client_id: Option<String>,
+    pub curseforge_api_key: Option<String>,
+    pub itad_api_key: Option<String>,
     pub live_region: Option<String>,
     pub live_sports: Option<String>,
     pub live_leagues: Option<String>,
@@ -171,7 +201,7 @@ impl Settings {
     /// References to the write-only secret fields, in a fixed order shared with
     /// [`Self::secret_fields_mut`] and [`SECRET_FIELD_NAMES`] so the redacted
     /// read view and the "empty means unchanged" merge stay in sync.
-    fn secret_fields(&self) -> [&String; 7] {
+    fn secret_fields(&self) -> [&String; 9] {
         [
             &self.steam_api_key,
             &self.tmdb_key,
@@ -180,6 +210,8 @@ impl Settings {
             &self.anilist_token,
             &self.twitch_token,
             &self.mal_token,
+            &self.curseforge_api_key,
+            &self.itad_api_key,
         ]
     }
 
@@ -213,7 +245,7 @@ impl Settings {
         }
     }
 
-    fn secret_fields_mut(&mut self) -> [&mut String; 7] {
+    fn secret_fields_mut(&mut self) -> [&mut String; 9] {
         [
             &mut self.steam_api_key,
             &mut self.tmdb_key,
@@ -222,6 +254,8 @@ impl Settings {
             &mut self.anilist_token,
             &mut self.twitch_token,
             &mut self.mal_token,
+            &mut self.curseforge_api_key,
+            &mut self.itad_api_key,
         ]
     }
 }
@@ -261,6 +295,13 @@ impl SettingsPatch {
             current.youtube_account = value;
         }
         set_plain!(game_region);
+        set_plain!(game_region_mode);
+        set_plain!(game_currency);
+        set_plain!(nexus_client_id);
+        set_plain!(modio_client_id);
+        set_plain!(github_client_id);
+        set_secret!(curseforge_api_key);
+        set_secret!(itad_api_key);
         set_plain!(live_region);
         set_plain!(live_sports);
         set_plain!(live_leagues);
@@ -284,7 +325,7 @@ impl SettingsPatch {
 }
 
 /// Names of the write-only secret fields (must match `secret_fields`).
-const SECRET_FIELD_NAMES: [&str; 7] = [
+const SECRET_FIELD_NAMES: [&str; 9] = [
     "steam_api_key",
     "tmdb_key",
     "trakt_client_secret",
@@ -292,6 +333,8 @@ const SECRET_FIELD_NAMES: [&str; 7] = [
     "anilist_token",
     "twitch_token",
     "mal_token",
+    "curseforge_api_key",
+    "itad_api_key",
 ];
 
 /// Normalizes a 2-letter country code, falling back to `default` for anything
@@ -308,6 +351,17 @@ fn normalize_country(raw: &str, default: &str) -> String {
 /// Store region for game pricing, defaulting to "US".
 fn normalize_region(raw: &str) -> String {
     normalize_country(raw, "US")
+}
+
+fn normalize_currency(raw: &str) -> String {
+    let value = raw.trim();
+    if value.is_empty() {
+        String::new()
+    } else if value.len() == 3 && value.chars().all(|c| c.is_ascii_alphabetic()) {
+        value.to_ascii_uppercase()
+    } else {
+        String::new()
+    }
 }
 
 /// Live-tab region, defaulting to "IN" (India).
@@ -328,7 +382,22 @@ impl SettingsStore {
         let path = config_dir().join("settings.json");
         let current = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .and_then(|text| {
+                let raw: serde_json::Value = serde_json::from_str(&text).ok()?;
+                let had_region = raw
+                    .get("game_region")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.trim().is_empty());
+                let had_mode = raw.get("game_region_mode").is_some();
+                let mut parsed: Settings = serde_json::from_value(raw).ok()?;
+                // Before region modes existed, a saved country was necessarily
+                // an explicit choice. Preserve it instead of silently switching
+                // that user back to locale detection.
+                if had_region && !had_mode {
+                    parsed.game_region_mode = "manual".into();
+                }
+                Some(parsed)
+            })
             .unwrap_or_default();
         Self {
             path,
@@ -351,7 +420,13 @@ impl SettingsStore {
             let current = self.current.lock().unwrap_or_else(|e| e.into_inner());
             settings.merge_secrets_from(&current);
         }
+        settings.game_region_mode = if settings.game_region_mode == "manual" {
+            "manual".into()
+        } else {
+            "auto".into()
+        };
         settings.game_region = normalize_region(&settings.game_region);
+        settings.game_currency = normalize_currency(&settings.game_currency);
         settings.live_region = normalize_live_region(&settings.live_region);
 
         if let Some(dir) = self.path.parent() {
@@ -479,6 +554,8 @@ mod tests {
         assert_eq!(normalize_region(""), "US");
         assert_eq!(normalize_region("USA"), "US");
         assert_eq!(normalize_region("1!"), "US");
+        assert_eq!(normalize_currency(" eur "), "EUR");
+        assert_eq!(normalize_currency("EURO"), "");
     }
 
     #[test]
@@ -518,6 +595,7 @@ mod tests {
         assert_eq!(v["steam_api_key"], "");
         assert_eq!(v["steam_api_key_set"], true);
         assert_eq!(v["anilist_token_set"], false);
+        assert_eq!(v["curseforge_api_key_set"], false);
         // Non-secret fields pass through untouched.
         assert_eq!(v["steam_id"], "76561");
     }

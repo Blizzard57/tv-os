@@ -18,9 +18,13 @@ import {
   PreferenceAction,
   PreferenceStatus,
   ResumeInfo,
+  StoreOffer,
+  PricingContext,
   Stream,
   fetchGameExtras,
   fetchGameMods,
+  fetchGameOffers,
+  fetchPricingContext,
   fetchMeta,
   fetchPlayback,
   fetchPreference,
@@ -33,6 +37,7 @@ import {
   resolveLive,
   setPreference,
   startInstall,
+  openUrl,
 } from './api';
 import { gameLogo } from './cards';
 import { GameModsPanel } from './GameModsPanel';
@@ -74,6 +79,8 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const [season, setSeason] = useState(1);
   const [episode, setEpisode] = useState<Episode | null>(null);
   const [streams, setStreams] = useState<Stream[] | null>(null);
+  const [offers, setOffers] = useState<StoreOffer[] | null>(null);
+  const [pricing, setPricing] = useState<PricingContext | null>(null);
   // Sources are compact by default (auto-chosen best pick + a toggle); this
   // expands the full ranked list.
   const [showAllSources, setShowAllSources] = useState(false);
@@ -205,7 +212,15 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
   const loadStreams = useCallback((id: string) => {
     const token = ++streamToken.current;
     setStreams(null);
+    setOffers(null);
     setShowAllSources(false);
+    if (isShopItem(id)) {
+      Promise.all([fetchGameOffers(id), fetchPricingContext()]).then(([nextOffers,context]) => {
+        if (token !== streamToken.current) return;
+        setOffers(nextOffers); setPricing(context); setStreams([]); bumpRefocus();
+      }).catch(() => { if (token === streamToken.current) { setOffers([]); setStreams([]); } });
+      return;
+    }
     fetchStreams(id)
       .then((s) => {
         if (token !== streamToken.current) return; // a newer load won
@@ -487,7 +502,9 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           ? 'ep:0'
           : null
         : stage === 'streams'
-          ? sourcesExpanded
+          ? isShopItem(item.id)
+            ? offers && offers.length > 0 ? 'offer:0' : 'offer:region'
+            : sourcesExpanded
             ? streams && streams.length > 0
               ? 'source:0'
               : null
@@ -714,7 +731,27 @@ export function DetailsPage({ item, onClose, onOpen, onPlayed, actionRef }: Prop
           </div>
         )}
 
-        {stage === 'streams' && (
+        {stage === 'streams' && isShopItem(item.id) && (
+          <div className="streams store-offers">
+            <div className="streams-head"><span>Where to buy</span><small>{pricing ? `${pricing.country} · ${pricing.currency}` : 'Detecting your region…'}</small></div>
+            {offers === null && <div className="details-hint">Comparing regional store prices…</div>}
+            {offers?.length === 0 && <div className="details-hint">No store offers found for this game right now.</div>}
+            {(['regional','estimate'] as const).map((group) => {
+              const rows=(offers ?? []).filter((offer) => group === 'regional' ? offer.verification === 'regional' : offer.verification !== 'regional');
+              if (!rows.length) return null;
+              return <section className="offer-group" key={group}><h3>{group === 'regional' ? 'Available in your region' : 'Other store estimates'}</h3><div className="stream-list">{rows.map((offer) => {
+                const globalIndex=(offers ?? []).indexOf(offer);const display=offer.display ?? offer.native;const estimated=offer.verification !== 'regional';
+                return <div key={`${offer.store}-${offer.url}`} className={`stream-item store-offer ${on(`offer:${globalIndex}`)}`} {...nav(`offer:${globalIndex}`)} onClick={() => openUrl(offer.url).catch((e) => flash(`Could not open store: ${e.message}`))}>
+                  <span className={`stream-badge ${estimated ? 'offer-estimate' : 'offer-verified'}`}>{estimated ? 'ESTIMATE' : offer.best_regional ? 'BEST' : 'REGIONAL'}</span>
+                  <div className="stream-text"><div className="stream-name">{offer.store}<strong>{estimated ? '≈ ' : ''}{display.formatted}</strong></div><div className="stream-detail">{estimated ? `${offer.native.formatted} foreign price · checkout may differ${offer.conversion_date ? ` · ECB ${offer.conversion_date}` : ''}` : `Verified for ${offer.country}${offer.discount_percent ? ` · ${offer.discount_percent}% off` : ''}`}</div></div>
+                </div>;
+              })}</div></section>;
+            })}
+            <button className={`change-region-button ${on('offer:region')}`} {...nav('offer:region')} onClick={() => flash('Change pricing country and currency in Settings → Accounts → Game libraries')}>Change region</button>
+          </div>
+        )}
+
+        {stage === 'streams' && !isShopItem(item.id) && (
           <div className="streams">
             <div className="streams-head">
               {isShopItem(item.id)

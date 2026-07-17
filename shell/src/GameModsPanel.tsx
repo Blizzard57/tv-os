@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   GameModsOverview,
+  ModProviderStatus,
   ModProfile,
   activateModProfile,
   createModProfile,
   deployModProfile,
   fetchGameMods,
+  fetchModProviders,
+  connectModProvider,
+  pollModProvider,
+  disconnectModProvider,
   importGameMod,
   openUrl,
   removeGameMod,
@@ -40,15 +45,19 @@ export function GameModsPanel({ gameId, gameTitle, onChanged }: Props) {
   const [modSource, setModSource] = useState('');
   const [modTarget, setModTarget] = useState('');
   const [armedRemove, setArmedRemove] = useState('');
+  const [providers, setProviders] = useState<ModProviderStatus[]>([]);
+  const [providerSession, setProviderSession] = useState<{provider:string;id:string;interval:number}|null>(null);
 
-  const reload = () => fetchGameMods(gameId).then((next) => {
+  const reload = () => Promise.all([fetchGameMods(gameId), fetchModProviders()]).then(([next, connections]) => {
     setData(next);
+    setProviders(connections);
     setSelectedProfile((current) => current || next.profiles.find((p) => p.active)?.id || next.profiles[0]?.id || '');
   }).catch((error) => setMessage(error instanceof Error ? error.message : String(error)));
 
   useEffect(() => {
     void reload();
   }, [gameId]);
+  useEffect(() => { if(!providerSession)return;const timer=window.setInterval(()=>pollModProvider(providerSession.provider,providerSession.id).then((session)=>{if(session.state==='connected'){setProviderSession(null);setMessage(`${providerSession.provider} connected`);void reload();}else if(session.state==='error'||session.state==='expired'){setProviderSession(null);setMessage(session.error ?? 'Authorization expired');}}).catch((error)=>setMessage(error instanceof Error?error.message:String(error))),Math.max(3,providerSession.interval)*1000);return()=>window.clearInterval(timer); }, [providerSession]);
 
   const profile = data?.profiles.find((p) => p.id === selectedProfile)
     ?? data?.profiles.find((p) => p.active);
@@ -108,7 +117,7 @@ export function GameModsPanel({ gameId, gameTitle, onChanged }: Props) {
             </article>
             <article className="mods-summary-card">
               <span className="mods-eyebrow">Sources</span>
-              <strong>{data.providers.filter((p) => p.connected).length} connected</strong>
+              <strong>{providers.filter((p) => p.state === 'connected').length} connected</strong>
               <span>Nexus, Workshop, Thunderstore and local packages share one profile engine.</span>
               <button tabIndex={0} onClick={() => setSection('browse')}>Browse providers</button>
             </article>
@@ -118,12 +127,13 @@ export function GameModsPanel({ gameId, gameTitle, onChanged }: Props) {
         {section === 'browse' && (
           <div className="mods-browse-layout">
             <div className="mods-provider-list">
-              {data.providers.map((provider) => (
-                <article className="mods-provider-row" key={provider.id}>
-                  <span className={`provider-dot ${provider.connected ? 'connected' : ''}`} />
-                  <div><strong>{provider.name}</strong><span>{provider.detail}</span></div>
-                  <span className="mods-provider-mode">{provider.mode.replace('_', ' ')}</span>
-                  {provider.browse_url && <button tabIndex={0} onClick={() => openUrl(provider.browse_url!)}>Open</button>}
+              {providers.map((provider) => (
+                <article className="mods-provider-row" key={provider.provider}>
+                  <span className={`provider-dot ${provider.state === 'connected' ? 'connected' : ''}`} />
+                  <div><strong>{provider.name}</strong><span>{provider.error ?? provider.capabilities.join(' · ')}</span></div>
+                  <span className="mods-provider-mode">{provider.state.replace('_', ' ')}</span>
+                  {provider.state === 'connected' ? <button tabIndex={0} onClick={() => perform('Disconnecting provider', () => disconnectModProvider(provider.provider))}>Disconnect</button>
+                    : <button tabIndex={0} disabled={provider.state === 'unavailable'} onClick={() => {setMessage('Starting authorization');connectModProvider(provider.provider).then(async(session)=>{if(session.authorization_url)await openUrl(session.authorization_url);if(session.state==='connected')void reload();else setProviderSession({provider:provider.provider,id:session.id,interval:session.interval_seconds});}).catch((error)=>setMessage(error instanceof Error?error.message:String(error)));}}>Connect</button>}
                 </article>
               ))}
             </div>

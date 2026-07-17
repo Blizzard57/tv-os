@@ -242,10 +242,6 @@ impl ModManager {
         })
     }
 
-    pub fn providers(&self) -> Vec<ProviderStatus> {
-        provider_statuses()
-    }
-
     pub fn search_installed(
         &self,
         game_id: &str,

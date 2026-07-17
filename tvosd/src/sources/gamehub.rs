@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::addons::http_get_quick;
@@ -33,8 +34,50 @@ static CHARTS_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<(i64, String, 
 /// Cache of Steam store-search top-seller appid lists, keyed by request URL.
 static TOPSELLER_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<i64>)>>> =
     LazyLock::new(Mutex::default);
-static OFFERS_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<Stream>)>>> =
+static OFFERS_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<StoreOffer>)>>> =
     LazyLock::new(Mutex::default);
+static RATES_CACHE: LazyLock<Mutex<Option<(Instant, String, HashMap<String, f64>)>>> =
+    LazyLock::new(Mutex::default);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Money {
+    pub amount: f64,
+    pub currency: String,
+    pub formatted: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceVerification {
+    Regional,
+    EstimatedForeign,
+    NativeForeign,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreOffer {
+    pub store: String,
+    pub native: Money,
+    pub display: Option<Money>,
+    pub country: String,
+    pub verification: PriceVerification,
+    pub discount_percent: i64,
+    pub url: String,
+    pub drm: Vec<String>,
+    pub platforms: Vec<String>,
+    pub checked_at: i64,
+    pub conversion_date: Option<String>,
+    pub best_regional: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PricingContext {
+    pub country: String,
+    pub currency: String,
+    pub region_mode: String,
+    pub detected_country: String,
+    pub detected_currency: String,
+}
 /// appid → (name, art) once verified; art is the portrait capsule when the
 /// CDN actually has it, the wide header otherwise. "" name = known-bad app.
 static BRIEF_CACHE: LazyLock<Mutex<HashMap<i64, (String, String)>>> = LazyLock::new(Mutex::default);
@@ -92,13 +135,95 @@ impl Source for GameShop {
     }
 }
 
-/// Two-letter store region from settings ("US" default).
+pub fn pricing_context(
+    country_override: Option<&str>,
+    currency_override: Option<&str>,
+) -> PricingContext {
+    let settings = settings::STORE.get();
+    let detected_country = locale_country();
+    let detected_currency = currency_for_country(&detected_country).to_string();
+    let manual = settings.game_region_mode == "manual";
+    let country = country_override
+        .and_then(valid_country)
+        .or_else(|| manual.then(|| settings.game_region.clone()))
+        .and_then(|v| valid_country(&v))
+        .unwrap_or_else(|| detected_country.clone());
+    let currency = currency_override
+        .and_then(valid_currency)
+        .or_else(|| valid_currency(&settings.game_currency))
+        .unwrap_or_else(|| currency_for_country(&country).into());
+    PricingContext {
+        country,
+        currency,
+        region_mode: if country_override.is_some() {
+            "request".into()
+        } else if manual {
+            "manual".into()
+        } else {
+            "auto".into()
+        },
+        detected_country,
+        detected_currency,
+    }
+}
+
 fn region() -> String {
-    let r = settings::STORE.get().game_region.trim().to_uppercase();
-    if r.len() == 2 {
-        r
-    } else {
-        "US".to_string()
+    pricing_context(None, None).country
+}
+fn valid_country(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 2 && value.chars().all(|c| c.is_ascii_alphabetic()))
+        .then(|| value.to_ascii_uppercase())
+}
+fn valid_currency(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 3 && value.chars().all(|c| c.is_ascii_alphabetic()))
+        .then(|| value.to_ascii_uppercase())
+}
+fn locale_country() -> String {
+    ["LC_ALL", "LC_MONETARY", "LANG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find_map(|raw| {
+            let clean = raw
+                .split('.')
+                .next()
+                .unwrap_or(&raw)
+                .split('@')
+                .next()
+                .unwrap_or(&raw);
+            clean
+                .split_once('_')
+                .or_else(|| clean.split_once('-'))
+                .and_then(|(_, country)| valid_country(country))
+        })
+        .unwrap_or_else(|| "US".into())
+}
+fn currency_for_country(country: &str) -> &'static str {
+    match country {
+        "AT" | "BE" | "CY" | "DE" | "EE" | "ES" | "FI" | "FR" | "GR" | "HR" | "IE" | "IT"
+        | "LT" | "LU" | "LV" | "MT" | "NL" | "PT" | "SI" | "SK" => "EUR",
+        "GB" => "GBP",
+        "IN" => "INR",
+        "JP" => "JPY",
+        "CA" => "CAD",
+        "AU" => "AUD",
+        "NZ" => "NZD",
+        "CH" => "CHF",
+        "SE" => "SEK",
+        "NO" => "NOK",
+        "DK" => "DKK",
+        "PL" => "PLN",
+        "CZ" => "CZK",
+        "HU" => "HUF",
+        "RO" => "RON",
+        "BR" => "BRL",
+        "MX" => "MXN",
+        "KR" => "KRW",
+        "CN" => "CNY",
+        "ZA" => "ZAR",
+        "TR" => "TRY",
+        _ => "USD",
     }
 }
 
@@ -394,8 +519,58 @@ fn charts(region: &str) -> Vec<(i64, String, String)> {
 /// details page can list. Steam and GOG are priced for the region;
 /// CheapShark's US aggregate joins in when the region is US.
 pub fn offers(appid: &str) -> Vec<Stream> {
-    let region = region();
-    let cache_key = format!("{appid}:{region}");
+    offers_structured(appid, None, None)
+        .into_iter()
+        .map(|offer| {
+            let price = offer.display.as_ref().unwrap_or(&offer.native);
+            let estimate = match offer.verification {
+                PriceVerification::Regional => {
+                    if offer.discount_percent > 0 {
+                        format!(
+                            "-{}% · verified for {}",
+                            offer.discount_percent, offer.country
+                        )
+                    } else {
+                        format!("Verified for {}", offer.country)
+                    }
+                }
+                PriceVerification::EstimatedForeign => format!(
+                    "Estimate from {} · checkout may differ",
+                    offer.native.formatted
+                ),
+                PriceVerification::NativeForeign => format!("Foreign price · checkout may differ"),
+            };
+            external(
+                &format!(
+                    "{} · {}{}",
+                    offer.store,
+                    if offer.verification == PriceVerification::Regional {
+                        ""
+                    } else {
+                        "≈ "
+                    },
+                    price.formatted
+                ),
+                &estimate,
+                &offer.url,
+            )
+        })
+        .collect()
+}
+
+pub fn offers_structured(
+    appid: &str,
+    country_override: Option<&str>,
+    currency_override: Option<&str>,
+) -> Vec<StoreOffer> {
+    let context = pricing_context(country_override, currency_override);
+    let region = context.country.clone();
+    let cache_key = format!(
+        "{appid}:{}:{}:{}",
+        region,
+        context.currency,
+        pricing_revision()
+    );
     if let Some((at, offers)) = OFFERS_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -406,7 +581,7 @@ pub fn offers(appid: &str) -> Vec<Stream> {
         }
     }
 
-    let mut priced: Vec<(f64, Stream)> = Vec::new();
+    let mut priced: Vec<StoreOffer> = Vec::new();
     let mut title = String::new();
 
     // Steam — official regional pricing, and the canonical title.
@@ -424,7 +599,15 @@ pub fn offers(appid: &str) -> Vec<Stream> {
                     .to_string();
                 let page = format!("https://store.steampowered.com/app/{appid}");
                 if data.get("is_free").and_then(|f| f.as_bool()) == Some(true) {
-                    priced.push((0.0, external("Steam · Free", "", &page)));
+                    priced.push(regional_offer(
+                        "Steam",
+                        0.0,
+                        &context.currency,
+                        "Free",
+                        &region,
+                        0,
+                        page,
+                    ));
                 } else if let Some(p) = data.get("price_overview") {
                     let amount =
                         p.get("final").and_then(|f| f.as_i64()).unwrap_or(0) as f64 / 100.0;
@@ -436,14 +619,12 @@ pub fn offers(appid: &str) -> Vec<Stream> {
                         .get("discount_percent")
                         .and_then(|d| d.as_i64())
                         .unwrap_or(0);
-                    let detail = if discount > 0 {
-                        format!("-{discount}% right now")
-                    } else {
-                        String::new()
-                    };
-                    priced.push((
-                        amount,
-                        external(&format!("Steam · {label}"), &detail, &page),
+                    let currency = p
+                        .get("currency")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&context.currency);
+                    priced.push(regional_offer(
+                        "Steam", amount, currency, label, &region, discount, page,
                     ));
                 }
             }
@@ -454,39 +635,83 @@ pub fn offers(appid: &str) -> Vec<Stream> {
     // handed those over run the two branches concurrently rather than back to
     // back (each is several serial HTTP calls).
     if !title.is_empty() {
-        let (gog, cheap) = std::thread::scope(|scope| {
+        let (gog, itad, cheap) = std::thread::scope(|scope| {
             // GOG — regional pricing (DRM-free).
             let gog = scope.spawn(|| {
                 let (gog_id, slug) = gog_lookup(&title)?;
                 let (amount, label) = gog_price(gog_id, &region)?;
-                Some((
+                let currency = label.split_whitespace().last().unwrap_or(&context.currency);
+                Some(regional_offer(
+                    "GOG",
                     amount,
-                    external(
-                        &format!("GOG · {label}"),
-                        "DRM-free",
-                        &format!("https://www.gog.com/en/game/{slug}"),
-                    ),
+                    currency,
+                    &label,
+                    &region,
+                    0,
+                    format!("https://www.gog.com/en/game/{slug}"),
                 ))
             });
-            // CheapShark — the multi-store aggregate (Epic, Fanatical, Humble,
-            // GMG, Battle.net, EA, Ubisoft, …). Prices are USD; outside the US
-            // they're still shown (a real number beats a "check price" link).
-            let cheap = scope.spawn(|| cheapshark(&title, &region));
-            (gog.join().ok().flatten(), cheap.join().unwrap_or_default())
+            let itad = scope.spawn(|| isthereanydeal(appid, &region, &context.currency));
+            let cheap = scope.spawn(|| cheapshark_offers(&title, &context));
+            (
+                gog.join().ok().flatten(),
+                itad.join().unwrap_or_default(),
+                cheap.join().unwrap_or_default(),
+            )
         });
-        priced.extend(gog);
+        if let Some(gog) = gog {
+            priced.push(gog);
+        }
+        priced.extend(itad);
         priced.extend(cheap);
     }
 
-    priced.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let offers: Vec<Stream> = priced.into_iter().map(|(_, s)| s).collect();
+    let rates = exchange_rates();
+    for offer in &mut priced {
+        if offer.native.currency == context.currency {
+            offer.display = Some(offer.native.clone());
+        } else if let Some((date, amount)) = convert(
+            offer.native.amount,
+            &offer.native.currency,
+            &context.currency,
+            rates.as_ref(),
+        ) {
+            offer.display = Some(money(amount, &context.currency, ""));
+            offer.conversion_date = Some(date);
+        }
+    }
+    let mut seen_stores = HashSet::new();
+    priced.retain(|offer| seen_stores.insert(offer.store.to_ascii_lowercase().replace(' ', "")));
+    priced.sort_by(|a, b| {
+        let group = |offer: &StoreOffer| {
+            if offer.verification == PriceVerification::Regional {
+                0
+            } else {
+                1
+            }
+        };
+        group(a)
+            .cmp(&group(b))
+            .then_with(|| match (a.display.as_ref(), b.display.as_ref()) {
+                (Some(a), Some(b)) => a.amount.total_cmp(&b.amount),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+    });
+    if let Some(best) = priced
+        .iter_mut()
+        .find(|offer| offer.verification == PriceVerification::Regional)
+    {
+        best.best_regional = true;
+    }
 
     let mut cache = OFFERS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() > 64 {
         cache.clear();
     }
-    cache.insert(cache_key, (Instant::now(), offers.clone()));
-    offers
+    cache.insert(cache_key, (Instant::now(), priced.clone()));
+    priced
 }
 
 fn external(name: &str, detail: &str, url: &str) -> Stream {
@@ -497,6 +722,214 @@ fn external(name: &str, detail: &str, url: &str) -> Stream {
         title: detail.to_string(),
         file_idx: None,
     }
+}
+
+fn money(amount: f64, currency: &str, formatted: &str) -> Money {
+    Money {
+        amount,
+        currency: currency.to_ascii_uppercase(),
+        formatted: if formatted.trim().is_empty() {
+            format!("{amount:.2} {}", currency.to_ascii_uppercase())
+        } else {
+            formatted.into()
+        },
+    }
+}
+fn regional_offer(
+    store: &str,
+    amount: f64,
+    currency: &str,
+    formatted: &str,
+    country: &str,
+    discount: i64,
+    url: String,
+) -> StoreOffer {
+    StoreOffer {
+        store: store.into(),
+        native: money(amount, currency, formatted),
+        display: None,
+        country: country.into(),
+        verification: PriceVerification::Regional,
+        discount_percent: discount,
+        url,
+        drm: vec![],
+        platforms: vec!["Linux".into(), "Windows".into()],
+        checked_at: unix_now(),
+        conversion_date: None,
+        best_regional: false,
+    }
+}
+fn pricing_revision() -> String {
+    let settings = settings::STORE.get();
+    format!(
+        "{}:{}:{}:{}",
+        settings.game_region_mode,
+        settings.game_region,
+        settings.game_currency,
+        !settings.itad_api_key.is_empty()
+    )
+}
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn cheapshark_offers(title: &str, context: &PricingContext) -> Vec<StoreOffer> {
+    cheapshark(title, &context.country)
+        .into_iter()
+        .map(|(amount, stream)| StoreOffer {
+            store: stream
+                .name
+                .split('·')
+                .next()
+                .unwrap_or("Store")
+                .trim()
+                .into(),
+            native: money(amount, "USD", &format!("${amount:.2}")),
+            display: None,
+            country: "US".into(),
+            verification: if context.country == "US" {
+                PriceVerification::Regional
+            } else {
+                PriceVerification::EstimatedForeign
+            },
+            discount_percent: 0,
+            url: stream.url,
+            drm: vec![],
+            platforms: vec!["Windows".into()],
+            checked_at: unix_now(),
+            conversion_date: None,
+            best_regional: false,
+        })
+        .collect()
+}
+
+fn isthereanydeal(appid: &str, country: &str, currency: &str) -> Vec<StoreOffer> {
+    let key = settings::STORE.get().itad_api_key;
+    if key.is_empty() {
+        return Vec::new();
+    }
+    let lookup = format!(
+        "https://api.isthereanydeal.com/lookup/id/shop/61/{appid}/v1?key={}",
+        percent_encode(&key)
+    );
+    let Some(id) = http_get_quick(&lookup)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|value| {
+            value
+                .get("game")
+                .and_then(|v| v.get("id"))
+                .or_else(|| value.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    else {
+        return Vec::new();
+    };
+    let url = format!(
+        "https://api.isthereanydeal.com/games/prices/v3?key={}&country={}&currency={}",
+        percent_encode(&key),
+        country,
+        currency
+    );
+    let response = (|| -> Option<Value> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .ok()?;
+        let body = serde_json::to_vec(&serde_json::json!([id])).ok()?;
+        let text = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .ok()?
+            .text()
+            .ok()?;
+        serde_json::from_str(&text).ok()
+    })();
+    response
+        .and_then(|v| v.as_array().and_then(|a| a.first()).cloned())
+        .and_then(|v| v.get("deals").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|deal| {
+            let store = deal.get("shop")?.get("name")?.as_str()?;
+            let price = deal.get("price")?;
+            let amount = price.get("amount")?.as_f64()?;
+            let curr = price.get("currency")?.as_str()?;
+            let url = deal.get("url")?.as_str()?;
+            Some(StoreOffer {
+                store: store.into(),
+                native: money(amount, curr, ""),
+                display: None,
+                country: country.into(),
+                verification: PriceVerification::Regional,
+                discount_percent: deal.get("cut").and_then(|v| v.as_i64()).unwrap_or(0),
+                url: url.into(),
+                drm: deal
+                    .get("drm")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect(),
+                platforms: deal
+                    .get("platforms")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect(),
+                checked_at: unix_now(),
+                conversion_date: None,
+                best_regional: false,
+            })
+        })
+        .collect()
+}
+
+fn exchange_rates() -> Option<(String, HashMap<String, f64>)> {
+    if let Some((at, date, rates)) = &*RATES_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+        if at.elapsed() < Duration::from_secs(24 * 3600) {
+            return Some((date.clone(), rates.clone()));
+        }
+    }
+    let xml =
+        http_get_quick("https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml").ok()?;
+    let date = between(&xml, "time='", "'").or_else(|| between(&xml, "time=\"", "\""))?;
+    let mut rates = HashMap::from([("EUR".into(), 1.0)]);
+    for chunk in xml.split("<Cube ") {
+        let currency =
+            between(chunk, "currency='", "'").or_else(|| between(chunk, "currency=\"", "\""));
+        let rate = between(chunk, "rate='", "'")
+            .or_else(|| between(chunk, "rate=\"", "\""))
+            .and_then(|v| v.parse::<f64>().ok());
+        if let (Some(currency), Some(rate)) = (currency, rate) {
+            rates.insert(currency, rate);
+        }
+    }
+    *RATES_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((Instant::now(), date.clone(), rates.clone()));
+    Some((date, rates))
+}
+fn convert(
+    amount: f64,
+    from: &str,
+    to: &str,
+    rates: Option<&(String, HashMap<String, f64>)>,
+) -> Option<(String, f64)> {
+    let (date, rates) = rates?;
+    let from = *rates.get(&from.to_ascii_uppercase())?;
+    let to = *rates.get(&to.to_ascii_uppercase())?;
+    Some((date.clone(), amount / from * to))
+}
+fn between(text: &str, start: &str, end: &str) -> Option<String> {
+    let after = text.split_once(start)?.1;
+    Some(after.split_once(end)?.0.to_string())
 }
 
 /// GOG product for a title via their catalog API, guarded by similar_title
@@ -691,5 +1124,59 @@ mod tests {
         }
         assert!(owned_apps.contains("620"));
         assert!(owned_titles.contains("portal 2"));
+    }
+
+    #[test]
+    fn country_currency_mapping_covers_selected_regions() {
+        assert_eq!(currency_for_country("NL"), "EUR");
+        assert_eq!(currency_for_country("GB"), "GBP");
+        assert_eq!(currency_for_country("IN"), "INR");
+        assert_eq!(currency_for_country("US"), "USD");
+    }
+
+    #[test]
+    fn ecb_cross_conversion_uses_euro_base() {
+        let rates = HashMap::from([
+            ("EUR".into(), 1.0),
+            ("USD".into(), 1.2),
+            ("INR".into(), 100.0),
+        ]);
+        let converted = convert(12.0, "USD", "INR", Some(&("2026-01-01".into(), rates))).unwrap();
+        assert!((converted.1 - 1000.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn estimates_never_start_as_best_regional() {
+        let context = PricingContext {
+            country: "NL".into(),
+            currency: "EUR".into(),
+            region_mode: "manual".into(),
+            detected_country: "NL".into(),
+            detected_currency: "EUR".into(),
+        };
+        let offer = cheapshark_offers_from_fixture(&context, 10.0);
+        assert_eq!(offer.verification, PriceVerification::EstimatedForeign);
+        assert!(!offer.best_regional);
+    }
+
+    fn cheapshark_offers_from_fixture(context: &PricingContext, amount: f64) -> StoreOffer {
+        StoreOffer {
+            store: "Example".into(),
+            native: money(amount, "USD", "$10.00"),
+            display: None,
+            country: "US".into(),
+            verification: if context.country == "US" {
+                PriceVerification::Regional
+            } else {
+                PriceVerification::EstimatedForeign
+            },
+            discount_percent: 0,
+            url: "https://example.com".into(),
+            drm: vec![],
+            platforms: vec![],
+            checked_at: 0,
+            conversion_date: None,
+            best_regional: false,
+        }
     }
 }

@@ -25,6 +25,7 @@ mod install;
 mod launcher;
 mod logging;
 mod media;
+mod mod_auth;
 mod model;
 mod mods;
 mod profile;
@@ -122,6 +123,7 @@ struct App {
     sources: sources::Registry,
     installs: install::InstallManager,
     mods: mods::ModManager,
+    mod_auth: mod_auth::ModAuthManager,
     started_at: Instant,
     playback: PlaybackStore,
     /// Recent snapshot of the source rows, so search-as-you-type doesn't
@@ -269,6 +271,7 @@ async fn main() {
         sources: sources::Registry::detect(),
         installs: install::InstallManager::default(),
         mods: mods::ModManager::open(),
+        mod_auth: mod_auth::ModAuthManager::open(),
         started_at: Instant::now(),
         playback: PlaybackStore::default(),
         library_cache: Mutex::new(None),
@@ -336,7 +339,29 @@ async fn main() {
         .route("/api/live/guide", get(get_live_guide))
         .route("/api/live/resolve", post(post_live_resolve))
         .route("/api/game", get(get_game))
+        .route("/api/pricing/context", get(get_pricing_context))
+        .route("/api/games/{id}/offers", get(get_game_offers))
         .route("/api/mods/providers/status", get(get_mod_provider_status))
+        .route(
+            "/api/mods/providers/{provider}/connect",
+            post(post_mod_provider_connect),
+        )
+        .route(
+            "/api/mods/providers/{provider}/connect/{session_id}",
+            get(get_mod_provider_session),
+        )
+        .route(
+            "/api/mods/providers/{provider}/callback",
+            get(get_mod_provider_callback),
+        )
+        .route(
+            "/api/mods/providers/{provider}/disconnect",
+            post(post_mod_provider_disconnect),
+        )
+        .route(
+            "/api/mods/providers/{provider}/refresh",
+            post(post_mod_provider_refresh),
+        )
         .route("/api/games/{id}/mods", get(get_game_mods))
         .route("/api/games/{id}/mods/search", get(search_game_mods))
         .route("/api/games/{id}/mods/resolve", post(validate_mod_profile))
@@ -1356,8 +1381,113 @@ async fn get_game(Query(q): Query<IdQuery>) -> Json<serde_json::Value> {
 
 // ---- Native game mod management -----------------------------------------
 
-async fn get_mod_provider_status(State(app): State<Shared>) -> Json<Vec<mods::ProviderStatus>> {
-    Json(app.mods.providers())
+#[derive(Deserialize)]
+struct OffersQuery {
+    country: Option<String>,
+    currency: Option<String>,
+}
+
+async fn get_pricing_context() -> Json<sources::gamehub::PricingContext> {
+    Json(sources::gamehub::pricing_context(None, None))
+}
+
+async fn get_game_offers(
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<OffersQuery>,
+) -> Result<Json<Vec<sources::gamehub::StoreOffer>>, (StatusCode, String)> {
+    let appid = id
+        .strip_prefix("gshop:")
+        .or_else(|| id.strip_prefix("steam:"))
+        .unwrap_or(&id)
+        .to_string();
+    if !appid.chars().all(|c| c.is_ascii_digit()) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "game does not have a Steam store identity".into(),
+        ));
+    }
+    let country = query.country.clone();
+    let currency = query.currency.clone();
+    let offers = tokio::task::spawn_blocking(move || {
+        sources::gamehub::offers_structured(&appid, country.as_deref(), currency.as_deref())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(offers))
+}
+
+async fn get_mod_provider_status(
+    State(app): State<Shared>,
+) -> Json<Vec<mod_auth::ModProviderConnection>> {
+    Json(app.mod_auth.statuses())
+}
+
+async fn post_mod_provider_connect(
+    State(app): State<Shared>,
+    AxumPath(provider): AxumPath<String>,
+    Json(req): Json<mod_auth::ConnectRequest>,
+) -> Result<Json<mod_auth::ModAuthorizationSession>, (StatusCode, String)> {
+    let provider_for_task = provider.clone();
+    tokio::task::spawn_blocking(move || app.mod_auth.connect(&provider_for_task, req))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        .map_err(mod_error)
+}
+
+async fn get_mod_provider_session(
+    State(app): State<Shared>,
+    AxumPath((provider, session_id)): AxumPath<(String, String)>,
+) -> Result<Json<mod_auth::ModAuthorizationSession>, (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || app.mod_auth.poll(&provider, &session_id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        .map_err(mod_error)
+}
+
+async fn get_mod_provider_callback(
+    State(app): State<Shared>,
+    AxumPath(provider): AxumPath<String>,
+    Query(query): Query<mod_auth::CallbackQuery>,
+) -> axum::response::Html<String> {
+    let result = tokio::task::spawn_blocking(move || app.mod_auth.callback(&provider, query)).await;
+    let message = match result {
+        Ok(Ok(message)) => message,
+        Ok(Err(error)) => format!("Connection failed: {}", util::scrub_secrets(&error)),
+        Err(error) => format!("Connection failed: {error}"),
+    };
+    axum::response::Html(format!("<!doctype html><meta name=viewport content='width=device-width'><style>body{{background:#101114;color:white;font:24px sans-serif;padding:10vh}}</style><h1>TV OS</h1><p>{}</p>", html_escape(&message)))
+}
+
+async fn post_mod_provider_disconnect(
+    State(app): State<Shared>,
+    AxumPath(provider): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    app.mod_auth
+        .disconnect(&provider)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(mod_error)
+}
+
+async fn post_mod_provider_refresh(
+    State(app): State<Shared>,
+    AxumPath(provider): AxumPath<String>,
+) -> Result<Json<mod_auth::ModProviderConnection>, (StatusCode, String)> {
+    let provider_for_task = provider.clone();
+    tokio::task::spawn_blocking(move || app.mod_auth.refresh(&provider_for_task))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        .map_err(mod_error)
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn get_game_mods(
